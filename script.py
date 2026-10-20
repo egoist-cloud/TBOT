@@ -1291,6 +1291,52 @@ async def unlink(i):
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
 
 
+@bot.tree.command(name="admlink", description="Привязать SteamID пользователю (админ)")
+@app_commands.describe(user="Участник Discord", steam_id="SteamID64 (17 цифр)")
+@app_commands.default_permissions(administrator=True)
+async def admlink(i, user: discord.Member, steam_id: str):
+    if not await _admin_guard(i):
+        return
+    await i.response.defer(ephemeral=False)
+    steam_id = steam_id.strip()
+    if not (steam_id.isdigit() and len(steam_id) == 17 and steam_id.startswith("7656119")):
+        await safe_send(i.followup, "❌ Неверный SteamID (ожидается SteamID64 из 17 цифр, "
+                                    "начинающийся с 7656119).", ephemeral=False)
+        return
+    try:
+        if user.bot:
+            await safe_send(i.followup, "❌ Нельзя привязать бота.", ephemeral=False)
+            return
+        # Проверяем, есть ли уже привязка (для информативного лога).
+        was_linked = await links_repo.get_link(user.id)
+        await links_repo.add_link(user.id, steam_id)
+
+        embed = discord.Embed(
+            title="🔗 /admlink",
+            color=0x57F287,
+            timestamp=now_utc(),
+        )
+        embed.add_field(name="Пользователь", value=user.mention, inline=True)
+        embed.add_field(name="Steam ID", value=f"`{steam_id}`", inline=True)
+        embed.add_field(name="Действие",
+                        value="Привязка обновлена" if was_linked else "Привязка создана",
+                        inline=False)
+        embed.set_footer(text=f"Выполнил: {i.user.display_name}")
+
+        await safe_send(i.followup,
+            f"✅ Пользователь {user.mention} успешно привязан к Steam ID: `{steam_id}`.",
+            ephemeral=False
+        )
+        await safe_send(i.followup, embed=embed, ephemeral=False)
+        await log_to_channel(i.client,
+            f"🔗 /admlink: {user.mention} ({user.id}) "
+            f"{'обновлён' if was_linked else 'привязан'} → `{steam_id}` "
+            f"от {i.user.mention}")
+    except Exception as e:
+        await log_error(i.client, "/admlink", e)
+        await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
+
+
 @bot.tree.command(name="sync_all", description="Синхронизировать всех")
 async def sync_all(i):
     if not await _admin_guard(i):
