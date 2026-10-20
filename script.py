@@ -375,11 +375,25 @@ async def run_with_timeout(coro, timeout: float, fallback_msg: str,
 # API: cs2red / Steam
 # ============================================================
 class API:
+    # Интервал между запросами к cs2red (анти-DDoS Cloudflare).
+    RATE_LIMIT_SECONDS = 2.5
+    # При 5xx: максимальное число повторов подряд.
+    RETRY_MAX = 3
+    # При 429 ждём столько же.
+    RATE_LIMIT_429_WAIT = 300
+    # При 5xx ждём между повторами.
+    RETRY_5xx_WAIT = 10
+
     def __init__(self):
         self.session: aiohttp.ClientSession | None = None
         self.sem = asyncio.Semaphore(4)
         self._clans_cache = {"ts": 0.0, "data": None}
         self.last_status: int | None = None
+        # Анти-DDoS: последовательный крановой протокол к cs2red.
+        self._rate_lock = asyncio.Lock()
+        self._last_cs2red_ts = 0.0
+        # Причина блокировки, если сработала защита (429/403/5xx исчерпаны).
+        self.blocked_reason = ""
 
     async def start(self):
         connector = aiohttp.TCPConnector(
@@ -398,27 +412,68 @@ class API:
         if self.session and not self.session.closed:
             await self.session.close()
 
+    async def _acquire_rate_slot(self):
+        """Обеспечивает не более 1 запроса к cs2red в RATE_LIMIT_SECONDS."""
+        async with self._rate_lock:
+            now = time.time()
+            wait = self.RATE_LIMIT_SECONDS - (now - self._last_cs2red_ts)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_cs2red_ts = time.time()
+            return
+
     async def _get_json(self, url, params=None):
         if not self.session:
             return None
-        for attempt in range(2):
+        is_cs2red = "cs2red.ru" in url
+
+        # 5xx-ретраи: если подряд падаем, останавливаем cs2red-поток.
+        consecutive_5xx = 0
+        for attempt in range(self.RETRY_MAX + 1):
             try:
+                # Rate-limit только для cs2red (Steam API не трогаем).
+                if is_cs2red:
+                    await self._acquire_rate_slot()
+
                 async with self.sem:
                     async with self.session.get(url, params=params) as r:
                         self.last_status = r.status
+
+                        # 403 — авторизация сломана: останавливаемся окончательно.
                         if r.status == 403:
-                            log(f"🔴 403 на {url}")
+                            self.blocked_reason = "403"
+                            log(f"🔴 403 на {url} — авторизация на cs2red. Проверьте куки.")
                             return None
+
+                        # 429 — Cloudflare/Discord прижал: пауза 5 минут, потом стоп.
                         if r.status == 429:
-                            await asyncio.sleep(2)
+                            self.blocked_reason = "429"
+                            log(f"🐢 429 на {url} — cs2red временно блокирует запросы "
+                                f"(429). Пауза {self.RATE_LIMIT_429_WAIT} сек.")
+                            await asyncio.sleep(self.RATE_LIMIT_429_WAIT)
+                            # После паузы 429 всё равно стоп (не рискуем уронить сайт).
+                            return None
+
+                        # 5xx — временный сбой сервера: ретраи с паузой, до RETRY_MAX.
+                        if r.status >= 500:
+                            consecutive_5xx += 1
+                            log(f"⚠️ {r.status} на {url} ({attempt + 1}-я попытка из "
+                                f"{self.RETRY_MAX + 1})")
+                            if consecutive_5xx > self.RETRY_MAX:
+                                self.blocked_reason = f"{r.status}"
+                                return None
+                            await asyncio.sleep(self.RETRY_5xx_WAIT)
                             continue
+
+                        consecutive_5xx = 0
                         r.raise_for_status()
                         return await r.json(content_type=None)
             except NET_ERRORS as e:
-                if attempt < 1:
-                    await asyncio.sleep(1.5)
-                    continue
                 log(f"⚠️ GET {url}: сетевой сбой: {e}")
+                if attempt < self.RETRY_MAX:
+                    await asyncio.sleep(self.RETRY_5xx_WAIT)
+                    continue
+                self.blocked_reason = "network"
                 return None
             except Exception as e:
                 log(f"⚠️ GET {url}: {e}")
@@ -1614,11 +1669,18 @@ async def auto_link(i):
         return
 
     # Проверочный запрос: убеждаемся, что авторизация работает.
+    api.blocked_reason = ""
     probe = await api.cs2red_search_by_nick("__probe__", limit=1)
     if probe is None:
-        if getattr(api, "last_status", None) == 403:
+        if api.blocked_reason == "403" or getattr(api, "last_status", None) == 403:
             await safe_send(i.followup,
-                            "❌ Ошибка авторизации на cs2red. Проверьте куки.",
+                            "❌ Ошибка авторизации (403). Проверьте куки на cs2red.",
+                            ephemeral=False)
+            return
+        if api.blocked_reason == "429":
+            await safe_send(i.followup,
+                            "❌ Сайт cs2red временно заблокировал запросы (429). "
+                            "Подождите 5 минут.",
                             ephemeral=False)
             return
         await safe_send(i.followup,
@@ -1659,8 +1721,27 @@ async def auto_link(i):
             try:
                 users = await api.cs2red_search_by_nick(nick)
                 if users is None:
-                    if getattr(api, "last_status", None) == 403:
+                    reason = api.blocked_reason
+                    if reason == "403" or getattr(api, "last_status", None) == 403:
                         errors.append("403: авторизация на cs2red (куки) — команда прервана")
+                        await safe_send(i.followup,
+                                        "❌ Ошибка авторизации (403). Проверьте куки.",
+                                        ephemeral=False)
+                        break
+                    if reason == "429":
+                        errors.append("429: сайт cs2red временно заблокировал запросы")
+                        await safe_send(
+                            i.followup,
+                            "❌ Сайт cs2red временно заблокировал запросы (429). "
+                            "Подождите 5 минут.",
+                            ephemeral=False)
+                        break
+                    if reason:
+                        errors.append(f"{reason}: ошибка сервера cs2red — команда прервана")
+                        await safe_send(i.followup,
+                                        f"❌ Ошибка сервера cs2red ({reason}). "
+                                        "Повторите позже.",
+                                        ephemeral=False)
                         break
                     errors.append(f"{m.display_name}: cs2red не ответил")
                     continue
@@ -1678,7 +1759,7 @@ async def auto_link(i):
                 errors.append(f"{m.display_name}: {e}")
 
             # задержка, чтобы не забанили за флуд запросами
-            await asyncio.sleep(1)
+            await asyncio.sleep(api.RATE_LIMIT_SECONDS)
 
             if processed - last_progress >= 20:
                 last_progress = processed
