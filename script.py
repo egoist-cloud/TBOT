@@ -31,6 +31,7 @@ from quantum.repositories import links as links_repo
 from quantum.repositories import players as players_repo
 from quantum.repositories import users as users_repo
 from quantum.repositories import moderation as moderation_repo
+from quantum.repositories import applications as applications_repo
 from quantum.ai import AIService
 from quantum.ai.cache import count_cache, clear_cache
 
@@ -1085,6 +1086,13 @@ async def _vote(interaction, kind):
         if member:
             await log_to_channel(interaction.client,
                 f"{'✅' if kind == 'accept' else '❌'} {member.mention}")
+        # Закрываем активную заявку в БД (анти-дубликат освобождается).
+        if tid:
+            try:
+                await applications_repo.finalize_application(
+                    tid, "accepted" if kind == "accept" else "rejected")
+            except Exception as e:
+                log(f"⚠️ Не финализировал заявку: {e}")
         if isinstance(interaction.channel, discord.Thread):
             await close_application_thread(interaction.channel, interaction.user, status)
     else:
@@ -1236,6 +1244,17 @@ class QuestionnaireModal(discord.ui.Modal, title="Заявка в клан"):
         if blocked:
             await safe_send(i.followup, rt, ephemeral=True)
             return
+
+        # Анти-дубликат: если у пользователя уже есть активная заявка — не создаём новую.
+        existing = await applications_repo.get_active_application(i.user.id)
+        if existing:
+            await safe_send(
+                i.followup,
+                "❌ У вас уже есть заявка на рассмотрении. Дождитесь её завершения.",
+                ephemeral=True,
+            )
+            return
+
         m = re.search(r"\d{17}", self.steam_input.value.strip())
         sid = m.group(0) if m else None
         if sid:
@@ -1262,6 +1281,7 @@ class QuestionnaireModal(discord.ui.Modal, title="Заявка в клан"):
         e.set_footer(text=f"{CLAN_NAME} • {utc_stamp()}")
 
         ch = i.guild.get_channel(APPLICATIONS_CHANNEL_ID) if APPLICATIONS_CHANNEL_ID else None
+        msg = None
         if ch:
             try:
                 view = ApplicationManagement()
@@ -1272,6 +1292,18 @@ class QuestionnaireModal(discord.ui.Modal, title="Заявка в клан"):
                     await msg.edit(view=view)
             except Exception as ex:
                 log(f"⚠️ Канал заявок: {ex}")
+
+        # Фиксируем заявку в БД (анти-дубликат + ссылка на сообщение заявки).
+        try:
+            await applications_repo.upsert_application(
+                i.user.id,
+                clan_name=self.clan_name,
+                status="pending",
+                message_id=str(msg.id) if msg else "",
+                channel_id=str(ch.id) if ch else "",
+            )
+        except Exception as ex:
+            log(f"⚠️ Не сохранил заявку в БД: {ex}")
 
         await safe_send(i.followup, "✅ Ваша заявка отправлена на рассмотрение!", ephemeral=True)
         asyncio.create_task(_create_application_thread(i, e))
@@ -1315,9 +1347,11 @@ class ClanSelect(discord.ui.Select):
     def __init__(self):
         super().__init__(placeholder="Выберите клан", min_values=1, max_values=1,
                          options=[discord.SelectOption(label=CLAN_NAME,
-                                                        description=f"Клан {CLAN_NAME}")])
+                                                         description=f"Клан {CLAN_NAME}")])
 
     async def callback(self, i):
+        # Отвечаем мгновенно (modal), чтобы не получить 10062 Unknown interaction.
+        # Проверку дубликатов делаем внутри модального окна (on_submit).
         await i.response.send_modal(QuestionnaireModal(self.values[0]))
 
 

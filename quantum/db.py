@@ -84,6 +84,16 @@ async def init_db() -> None:
             expires_at INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS applications (
+            user_id     TEXT PRIMARY KEY,
+            status      TEXT NOT NULL DEFAULT 'pending',
+            clan_name   TEXT,
+            message_id  TEXT,
+            channel_id  TEXT,
+            created_at  TEXT,
+            updated_at  TEXT
+        );
+
         CREATE INDEX IF NOT EXISTS idx_ai_cache_expires ON ai_cache (expires_at);
         """
     )
