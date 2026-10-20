@@ -23,6 +23,17 @@ from dotenv import load_dotenv
 from flask import Flask
 from bs4 import BeautifulSoup
 
+from quantum.db import init_db, close_db
+from quantum.migrations import import_json_to_sqlite
+from quantum.repositories import votes as votes_repo
+from quantum.repositories import seen as seen_repo
+from quantum.repositories import links as links_repo
+from quantum.repositories import players as players_repo
+from quantum.repositories import users as users_repo
+from quantum.repositories import moderation as moderation_repo
+from quantum.ai import AIService
+from quantum.ai.cache import count_cache, clear_cache
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
@@ -152,54 +163,8 @@ CLANS_CACHE_TTL = 300
 
 
 # ============================================================
-# ХРАНИЛИЩЕ JSON
+# ХРАНИЛИЩЕ БД (SQLite через quantum.repositories)
 # ============================================================
-class JsonStore:
-    def __init__(self, path, default):
-        self.path = Path(path)
-        self.default = default
-        self.lock = asyncio.Lock()
-
-    def _load(self):
-        if not self.path.exists():
-            return self.default() if callable(self.default) else self.default
-        try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return self.default() if callable(self.default) else self.default
-
-    def _dump(self, data):
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.path)
-
-    def read(self):
-        return self._load()
-
-    async def get(self):
-        async with self.lock:
-            return self._load()
-
-    async def save(self, data):
-        async with self.lock:
-            self._dump(data)
-
-    async def update(self, fn):
-        async with self.lock:
-            data = self._load()
-            result = fn(data)
-            self._dump(data)
-            return result
-
-
-links_store = JsonStore(data_path("links.json"), dict)
-players_store = JsonStore(data_path("players_db.json"), dict)
-bans_store = JsonStore(data_path("users_db.json"), dict)
-moders_store = JsonStore(data_path("moderators.json"), list)
-votes_store = JsonStore(data_path("votes.json"), dict)
-seen_store = JsonStore(data_path("seen.json"), dict)
 
 
 def _write_error_to_file(context: str, exc):
@@ -482,8 +447,8 @@ api = API()
 # ============================================================
 # ДОСТУП / ХЕЛПЕРЫ
 # ============================================================
-def is_moderator(user_id: int, guild: discord.Guild) -> bool:
-    if user_id in moders_store.read():
+async def is_moderator(user_id: int, guild: discord.Guild) -> bool:
+    if await moderation_repo.is_moderator(user_id):
         return True
     member = guild.get_member(user_id)
     return bool(member and member.guild_permissions.administrator)
@@ -520,9 +485,8 @@ def collect_reviewer_ids(guild: discord.Guild) -> set:
     return ids
 
 
-def is_user_blocked(discord_id: int):
-    db = bans_store.read()
-    entry = db.get(str(discord_id))
+async def is_user_blocked(discord_id: int):
+    entry = await users_repo.get_user(discord_id)
     if isinstance(entry, str) or not isinstance(entry, dict):
         return False, ""
     typ = entry.get("type", "temp")
@@ -542,7 +506,7 @@ def is_user_blocked(discord_id: int):
             rem = until - now
             h, m = int(rem.seconds // 3600), int((rem.seconds % 3600) // 60)
             return True, f"🚫 Вам **запрещено** подавать заявки. Через **{h} ч. {m} мин.**" + suffix
-        asyncio.ensure_future(bans_store.update(lambda d: d.pop(str(discord_id), None)))
+        await users_repo.remove_user(discord_id)
     return False, ""
 
 
@@ -578,8 +542,8 @@ def build_activity_bar(hours: float, goal: float = 8.0, length: int = 10) -> str
     return f"`{'█' * filled}{'░' * (length - filled)}` {hours:.1f} / {goal:.0f} ч. - {e} {s}{extra}"
 
 
-def get_player_activity(steam_id: str) -> float:
-    entry = players_store.read().get(steam_id, {})
+async def get_player_activity(steam_id: str) -> float:
+    entry = await players_repo.get_player(steam_id)
     a = entry.get("activity", {})
     if not isinstance(a, dict):
         return 0.0
@@ -611,7 +575,7 @@ async def build_player_profile(guild, discord_id, steam_id=None):
         profile["discord_name"] = member.display_name
         profile["discord_joined"] = member.joined_at.isoformat() if member.joined_at else None
     if not steam_id:
-        steam_id = links_store.read().get(str(discord_id))
+        steam_id = await links_repo.get_link(discord_id)
     if not steam_id:
         return profile
     profile["steamid64"] = steam_id
@@ -628,7 +592,7 @@ async def build_player_profile(guild, discord_id, steam_id=None):
         if inner:
             profile["cs2red_nick"] = inner.get("nick", profile.get("cs2red_nick"))
             profile["cs2red_role_id"] = inner.get("roleId", profile.get("cs2red_role_id"))
-    profile["activity_hours"] = get_player_activity(steam_id)
+    profile["activity_hours"] = await get_player_activity(steam_id)
     summ = await api.steam_summary(steam_id)
     if summ:
         profile["steam_avatar"] = summ.get("avatarfull")
@@ -854,12 +818,12 @@ async def close_application_thread(thread, closed_by, reason):
 # ============================================================
 # ГОЛОСА
 # ============================================================
-def _get_votes(mid):
-    return votes_store.read().get(str(mid)) or {"accept": 0, "deny": 0, "voters": []}
+async def _get_votes(mid):
+    return await votes_repo.get_votes(mid)
 
 
 async def _save_votes(mid, st):
-    await votes_store.update(lambda d: d.update({str(mid): st}))
+    await votes_repo.save_votes(mid, st)
 
 
 async def _vote(interaction, kind):
@@ -867,7 +831,7 @@ async def _vote(interaction, kind):
     if not user_can_review(interaction.user):
         await safe_send(interaction.followup, "❌ Нет прав.", ephemeral=True)
         return
-    st = _get_votes(interaction.message.id)
+    st = await _get_votes(interaction.message.id)
     if interaction.user.id in st["voters"] and not user_can_spam_vote(interaction.user):
         await safe_send(interaction.followup, "Вы уже голосовали.", ephemeral=True)
         return
@@ -877,7 +841,7 @@ async def _vote(interaction, kind):
     await _save_votes(interaction.message.id, st)
 
     view = ApplicationManagement()
-    view.update_labels(interaction.message.id)
+    await view.update_labels(interaction.message.id)
     if st[kind] >= VOTES_REQUIRED:
         embed = interaction.message.embeds[0]
         status = "Принят" if kind == "accept" else "Отклонен"
@@ -918,8 +882,8 @@ class ApplicationManagement(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    def update_labels(self, mid):
-        st = _get_votes(mid)
+    async def update_labels(self, mid):
+        st = await _get_votes(mid)
         for c in self.children:
             if c.custom_id == "accept_btn":
                 c.label = f"Принять {st['accept']}/{VOTES_REQUIRED}"
@@ -975,8 +939,8 @@ class ApplicationManagement(discord.ui.View):
         if not tid:
             await safe_send(i.followup, "❌", ephemeral=True)
             return
-        await bans_store.update(lambda d: d.update({str(tid): {
-            "type": "perm", "until": None, "reason": f"Выдал {i.user}"}}))
+        await users_repo.save_user(tid, {
+            "type": "perm", "until": None, "reason": f"Выдал {i.user}"})
         await safe_send(i.followup, f"⛔ <@{tid}> перм. запрет")
         await log_to_channel(i.client, f"⛔ perm <@{tid}> от {i.user.mention}")
 
@@ -991,15 +955,16 @@ class ApplicationManagement(discord.ui.View):
         if not tid:
             await safe_send(i.followup, "❌", ephemeral=True)
             return
-        r = await bans_store.update(lambda d: d.pop(str(tid), None))
-        await safe_send(i.followup, f"✅ снят с <@{tid}>" if r is not None else "ℹ️ нет")
-        if r is not None:
+        had = await users_repo.get_user(tid)
+        await users_repo.remove_user(tid)
+        await safe_send(i.followup, f"✅ снят с <@{tid}>" if had else "ℹ️ нет")
+        if had:
             await log_to_channel(i.client, f"✅ unban <@{tid}> от {i.user.mention}")
 
     @discord.ui.button(label="👥 0", style=discord.ButtonStyle.secondary,
                        custom_id="voted_list_btn", row=1)
     async def voted_list(self, i, b):
-        st = _get_votes(i.message.id)
+        st = await _get_votes(i.message.id)
         if not st["voters"]:
             await i.response.send_message("Пусто", ephemeral=True)
             return
@@ -1025,8 +990,8 @@ class TempBanModal(discord.ui.Modal, title="Запрет"):
             await i.response.send_message("❌ число", ephemeral=True)
             return
         until = (now_utc() + datetime.timedelta(hours=hours)).isoformat()
-        await bans_store.update(lambda d: d.update({str(self.tid): {
-            "type": "temp", "until": until, "reason": self.reason.value.strip() or "-"}}))
+        await users_repo.save_user(self.tid, {
+            "type": "temp", "until": until, "reason": self.reason.value.strip() or "-"})
         await i.response.send_message(f"🚫 <@{self.tid}> запрет на {hours} ч.")
         await log_to_channel(i.client, f"🚫 temp <@{self.tid}> {hours}ч от {i.user.mention}")
 
@@ -1048,7 +1013,7 @@ class QuestionnaireModal(discord.ui.Modal, title="Заявка в клан"):
 
     async def on_submit(self, i):
         await i.response.defer(ephemeral=False)
-        blocked, rt = is_user_blocked(i.user.id)
+        blocked, rt = await is_user_blocked(i.user.id)
         if blocked:
             await safe_send(i.followup, rt, ephemeral=True)
             return
@@ -1084,7 +1049,7 @@ class QuestionnaireModal(discord.ui.Modal, title="Заявка в клан"):
                 msg = await safe_send(ch, content=f"🔔 Новая заявка от {i.user.mention}",
                                       embed=e, view=view)
                 if msg:
-                    view.update_labels(msg.id)
+                    await view.update_labels(msg.id)
                     await msg.edit(view=view)
             except Exception as ex:
                 log(f"⚠️ Канал заявок: {ex}")
@@ -1121,7 +1086,7 @@ async def _create_application_thread(i, e):
         msg = await safe_send(t, content=f"{i.user.mention}, ваша заявка на рассмотрении.",
                               embed=e, view=view)
         if msg:
-            view.update_labels(msg.id)
+            await view.update_labels(msg.id)
             await msg.edit(view=view)
     except Exception as ex:
         log(f"⚠️ Ветка: {ex}")
@@ -1146,7 +1111,7 @@ class ClanView(discord.ui.View):
 # ============================================================
 # БОТ
 # ============================================================
-PUBLIC_COMMANDS = {"link", "unlink", "ping", "health", "lookup"}
+PUBLIC_COMMANDS = {"link", "unlink", "ping", "health", "lookup", "ask", "rules"}
 
 
 class MyBot(commands.Bot):
@@ -1160,7 +1125,7 @@ class MyBot(commands.Bot):
         cmd = getattr(i, "command", None)
         if cmd is None or cmd.name in PUBLIC_COMMANDS:
             return True
-        if not is_moderator(i.user.id, i.guild) and not i.response.is_done():
+        if not await is_moderator(i.user.id, i.guild) and not i.response.is_done():
             await i.response.send_message("❌ Нет доступа.", ephemeral=True)
             return False
         return True
@@ -1168,8 +1133,23 @@ class MyBot(commands.Bot):
     async def setup_hook(self):
         try:
             log("🔧 setup_hook: начало")
+            await init_db()
+            await import_json_to_sqlite(DATA_DIR)
+            log("✅ SQLite готов (init_db + миграция)")
             await api.start()
             log("✅ API session ready")
+
+            global ai_service
+            ai_service = AIService(api.session, data_dir=str(DATA_DIR))
+            n_providers = len(ai_service.providers)
+            if n_providers == 0:
+                # Ключей нет — бот работает, но ИИ-команды сообщат о недоступности.
+                log("⚠️ AI провайдеры не настроены: задайте GEMINI_API_KEY, "
+                    "OPENROUTER_API_KEY или LLM7_API_KEY.")
+            else:
+                n_rules = ai_service.ensure_rules()
+                log(f"✅ AI-сервис готов (провайдеров: {n_providers}, "
+                    f"правил: {n_rules})")
 
             if not GUILD_ID:
                 log("❌ GUILD_ID = 0 — синхронизация команд не выполнится!")
@@ -1194,10 +1174,14 @@ class MyBot(commands.Bot):
 
     async def close(self):
         await api.close()
+        await close_db()
         await super().close()
 
 
 bot = MyBot()
+
+# ИИ-сервис (каскад провайдеров + кэш + RAG). Инициализируется в setup_hook.
+ai_service: AIService | None = None
 
 
 @bot.tree.error
@@ -1246,8 +1230,7 @@ async def link(i, steam_id: str):
         return
     await i.response.defer(ephemeral=False)
     try:
-        existing = links_store.read()
-        owner = next((d for d, s in existing.items() if s == steam_id), None)
+        owner = await links_repo.get_owner_of(steam_id)
         if owner and int(owner) != i.user.id:
             await safe_send(i.followup, "❌ SteamID занят.", ephemeral=False)
             return
@@ -1265,7 +1248,7 @@ async def link(i, steam_id: str):
             await safe_send(i.followup, f"❌ Игрок `{steam_id}` не найден на cs2red.", ephemeral=False)
             return
 
-        await links_store.update(lambda d: d.update({str(i.user.id): steam_id}))
+        await links_repo.add_link(i.user.id, steam_id)
         await safe_send(i.followup,
             f"✅ Привязано: `{steam_id}` (ник **{u.get('nick', '-')}**)",
             ephemeral=False
@@ -1285,7 +1268,7 @@ async def link(i, steam_id: str):
 async def unlink(i):
     await i.response.defer(ephemeral=False)
     try:
-        rid = await links_store.update(lambda d: d.pop(str(i.user.id), None))
+        rid = await links_repo.remove_link(i.user.id)
         if rid is None:
             await safe_send(i.followup, "ℹ️ Не привязан.", ephemeral=False)
             return
@@ -1314,7 +1297,7 @@ async def sync_all(i):
         return
     await i.response.defer(ephemeral=False)
     try:
-        links = links_store.read()
+        links = await links_repo.get_all_links()
         if not links:
             await safe_send(i.followup, "ℹ️ Пусто.", ephemeral=False)
             return
@@ -1336,7 +1319,7 @@ async def sync_all(i):
 
 
 async def linked_member_autocomplete(i, current):
-    links = links_store.read()
+    links = await links_repo.get_all_links()
     if not links:
         return []
     ch = []
@@ -1410,8 +1393,8 @@ async def link_all(i):
                 processed += 1
                 continue
 
-            existing = links_store.read()
-            if existing.get(str(did)) == sid:
+            current_link = await links_repo.get_link(did)
+            if current_link == sid:
                 already.append(f"`{did}` → `{sid}`")
                 processed += 1
                 continue
@@ -1422,7 +1405,7 @@ async def link_all(i):
                 processed += 1
                 continue
 
-            owner = next((d for d, s in existing.items() if s == sid), None)
+            owner = await links_repo.get_owner_of(sid)
             if owner and owner != str(did):
                 other.append(f"{m.display_name}: SteamID занят <@{owner}>")
                 processed += 1
@@ -1434,7 +1417,7 @@ async def link_all(i):
                 processed += 1
                 continue
 
-            await links_store.update(lambda d: d.update({str(did): sid}))
+            await links_repo.add_link(did, sid)
             added.append(f"✅ {m.display_name} → `{sid}` (cs2red: {user.get('nick', '-')})")
             processed += 1
 
@@ -1483,7 +1466,7 @@ async def export_members(i):
         return
     await i.response.defer(ephemeral=False)
     try:
-        links = links_store.read()
+        links = await links_repo.get_all_links()
         if not links:
             await safe_send(i.followup, "ℹ️ Нет привязанных.", ephemeral=False)
             return
@@ -1533,15 +1516,12 @@ async def player_info(i, member: discord.Member):
             await safe_send(i.followup, "❌ Нет SteamID", ephemeral=False)
             return
 
-        def _merge(db):
-            old = db.get(profile["steamid64"], {})
-            for k in ("activity", "notes"):
-                if k in old:
-                    profile[k] = old[k]
-            profile["activity_hours"] = get_player_activity(profile["steamid64"])
-            db[profile["steamid64"]] = profile
-            return None
-        await players_store.update(_merge)
+        old = await players_repo.get_player(profile["steamid64"])
+        for k in ("activity", "notes"):
+            if k in old:
+                profile[k] = old[k]
+        profile["activity_hours"] = await get_player_activity(profile["steamid64"])
+        await players_repo.save_player(profile["steamid64"], profile)
 
         await send_player_report(i.client, profile)
 
@@ -1561,17 +1541,17 @@ async def player_note(i, member: discord.Member, note: str):
         return
     await i.response.defer(ephemeral=False)
     try:
-        sid = links_store.read().get(str(member.id))
+        sid = await links_repo.get_link(member.id)
         if not sid:
             await safe_send(i.followup, "❌ Нет SteamID", ephemeral=False)
             return
 
         async def _make():
             return await build_player_profile(i.guild, member.id, sid)
-        profile = players_store.read().get(sid) or await _make()
+        profile = await players_repo.get_player(sid) or await _make()
         profile["notes"] = note
         profile["updated_at"] = now_utc().isoformat()
-        await players_store.update(lambda d: d.update({sid: profile}))
+        await players_repo.save_player(sid, profile)
         await safe_send(i.followup, f"✅ Заметка для {member.mention}", ephemeral=False)
         await send_player_report(i.client, profile)
     except Exception as e:
@@ -1585,11 +1565,11 @@ async def player_list(i):
         return
     await i.response.defer(ephemeral=False)
     try:
-        db = players_store.read()
+        db = await players_repo.get_all_players()
         if not db:
             await safe_send(i.followup, "ℹ️ Пусто", ephemeral=False)
             return
-        links = links_store.read()
+        links = await links_repo.get_all_links()
         rev = {s: d for d, s in links.items()}
         lines = []
         for sid, p in db.items():
@@ -1612,7 +1592,7 @@ async def player_list(i):
 async def lookup(i, member: discord.Member):
     await i.response.defer(ephemeral=False)
     try:
-        sid = links_store.read().get(str(member.id))
+        sid = await links_repo.get_link(member.id)
         if not sid:
             await safe_send(i.followup, "❌ Не привязан", ephemeral=False)
             return
@@ -1768,12 +1748,12 @@ async def health(i: discord.Interaction):
             add("🎮", "Steam API", f"❌ {e}", False)
 
     for name, data in [
-        ("links.json", links_store.read()),
-        ("players_db.json", players_store.read()),
-        ("users_db.json", bans_store.read()),
-        ("moderators.json", moders_store.read()),
-        ("votes.json", votes_store.read()),
-        ("seen.json", seen_store.read()),
+        ("links.json", await links_repo.count_all()),
+        ("players_db.json", await players_repo.count_all()),
+        ("users_db.json", await users_repo.count_all()),
+        ("moderators.json", await moderation_repo.count_all()),
+        ("votes.json", await votes_repo.count_all()),
+        ("seen.json", await seen_repo.count_all()),
     ]:
         try:
             size = len(data) if hasattr(data, "__len__") else "?"
@@ -1836,6 +1816,25 @@ async def health(i: discord.Interaction):
             add("📢", f"Канал `{name}`",
                 f"`#{ch.name}` ({cid}), send: {'✅' if perm_ok else '❌'}", perm_ok)
 
+    # ---------- ИИ-каскад ----------
+    if ai_service is None:
+        add("🤖", "AI-сервис", "не инициализирован", False)
+    else:
+        for prov in ai_service.providers:
+            ok = prov.last_error == ""
+            add("🤖", f"AI ({prov.name.title()})", prov.status_line(), ok)
+        # Не настроенные провайдеры (без ключа) не попадают в список,
+        # поэтому явно покажем, что их нет.
+        configured = {p.name for p in ai_service.providers}
+        for name in ("gemini", "openrouter", "llm7"):
+            if name not in configured:
+                add("🤖", f"AI ({name.title()})", "Не настроен (нет ключа)", False)
+        try:
+            cache_count = await count_cache()
+            add("🗃️", "AI Cache", f"записей в БД — {cache_count}", True)
+        except Exception as e:
+            add("🗃️", "AI Cache", f"❌ {e}", False)
+
     last_status = getattr(api, "last_status", None)
     add("📡", "Последний HTTP-статус cs2red",
         f"`{last_status}`" if last_status else "нет данных", last_status == 200)
@@ -1876,7 +1875,7 @@ async def health(i: discord.Interaction):
 async def moders(i):
     await i.response.defer(ephemeral=False)
     try:
-        mods = moders_store.read()
+        mods = await moderation_repo.get_all_moderators()
         if not mods:
             await safe_send(i.followup, "ℹ️ Пусто", ephemeral=False)
             return
@@ -1895,8 +1894,7 @@ async def give(i, user: discord.Member):
         return
     await i.response.defer(ephemeral=False)
     try:
-        added = await moders_store.update(
-            lambda d: (d.append(user.id), True)[1] if user.id not in d else False)
+        added = await moderation_repo.add_moderator(user.id)
         await safe_send(i.followup,
             f"✅ {user.mention} получил доступ." if added else "ℹ️ Уже есть.",
             ephemeral=False
@@ -1913,8 +1911,7 @@ async def take(i, user: discord.Member):
         return
     await i.response.defer(ephemeral=False)
     try:
-        removed = await moders_store.update(
-            lambda d: (d.remove(user.id), True)[1] if user.id in d else False)
+        removed = await moderation_repo.remove_moderator(user.id)
         await safe_send(i.followup,
             f"❌ {user.mention} лишён." if removed else "ℹ️ Уже без.",
             ephemeral=False
@@ -1927,15 +1924,15 @@ async def take(i, user: discord.Member):
 # ============================================================
 # АКТИВНОСТЬ
 # ============================================================
-def _get_steam_of(m):
-    return links_store.read().get(str(m.id))
+async def _get_steam_of(m):
+    return await links_repo.get_link(m.id)
 
 
 async def _activity_guard(i, m, need_admin=True):
     if need_admin and not admin_only(i):
         await i.response.send_message("❌", ephemeral=False)
         return None
-    sid = _get_steam_of(m)
+    sid = await _get_steam_of(m)
     if not sid:
         await i.response.send_message("❌ Нет SteamID", ephemeral=False)
         return None
@@ -1952,17 +1949,15 @@ async def activity_set(i, member: discord.Member, server: str, hours: float):
         return
     await i.response.defer(ephemeral=False)
     try:
-        def _set(db):
-            p = db.get(sid, {})
-            a = p.get("activity", {})
-            if not isinstance(a, dict):
-                a = {}
-            a[server.upper()] = float(hours)
-            p.update(activity=a, discord_id=str(member.id),
-                     discord_name=member.display_name, updated_at=now_utc().isoformat())
-            db[sid] = p
-            return sum(float(v) for v in a.values() if isinstance(v, (int, float)))
-        total = await players_store.update(_set)
+        p = await players_repo.get_player(sid)
+        a = p.get("activity", {})
+        if not isinstance(a, dict):
+            a = {}
+        a[server.upper()] = float(hours)
+        p.update(activity=a, discord_id=str(member.id),
+                 discord_name=member.display_name, updated_at=now_utc().isoformat())
+        await players_repo.save_player(sid, p)
+        total = sum(float(v) for v in a.values() if isinstance(v, (int, float)))
         await safe_send(i.followup,
             f"✅ {member.display_name} `{server.upper()}`: {hours} ч.\n"
             f"{build_activity_bar(total, ACTIVITY_GOAL_HOURS)}", ephemeral=False
@@ -1979,8 +1974,10 @@ async def activity_clear(i, member: discord.Member):
         return
     await i.response.defer(ephemeral=False)
     try:
-        await players_store.update(lambda db: db.update(
-            {sid: {**db.get(sid, {}), "activity": {}, "updated_at": now_utc().isoformat()}}) or None)
+        p = await players_repo.get_player(sid)
+        p["activity"] = {}
+        p["updated_at"] = now_utc().isoformat()
+        await players_repo.save_player(sid, p)
         await safe_send(i.followup, "✅ Сброшено", ephemeral=False)
     except Exception as e:
         await log_error(i.client, "/activity_clear", e)
@@ -1994,7 +1991,7 @@ async def activity_show(i, member: discord.Member):
         return
     await i.response.defer(ephemeral=False)
     try:
-        a = players_store.read().get(sid, {}).get("activity", {})
+        a = (await players_repo.get_player(sid)).get("activity", {})
         if not a:
             await safe_send(i.followup, "ℹ️ Пусто", ephemeral=False)
             return
@@ -2027,7 +2024,7 @@ async def activity_all(i):
         if not ms:
             await safe_send(i.followup, "ℹ️ Пусто", ephemeral=False)
             return
-        db, links = players_store.read(), links_store.read()
+        db, links = await players_repo.get_all_players(), await links_repo.get_all_links()
         data = []
         for m in ms:
             sid = links.get(str(m.id))
@@ -2098,34 +2095,35 @@ async def setup(ctx):
 @tasks.loop(seconds=ACTIVITY_TRACK_SECONDS)
 async def activity_tracker():
     try:
-        links = links_store.read()
+        links = await links_repo.get_all_links()
         if not links:
             return
         online = await api.server_times()
         if not online:
             return
-        db = players_store.read()
+        db = await players_repo.get_all_players()
         n2s = {p.get("cs2red_nick"): s for s, p in db.items() if p.get("cs2red_nick")}
-        seen = seen_store.read()
-        if not seen.pop("_seeded", None):
+        seeded = await seen_repo.get_flag("_seeded")
+        if not seeded:
             for sid in links.values():
                 if sid in n2s:
                     continue
                 u = await api.cs2red_user(sid)
                 if u and u.get("nick"):
                     n2s[u["nick"]] = sid
-                    db.setdefault(sid, {})["cs2red_nick"] = u["nick"]
-            await players_store.save(db)
+                    p = db.setdefault(sid, {})
+                    p["cs2red_nick"] = u["nick"]
+                    await players_repo.save_player(sid, p)
         now = now_utc().isoformat()
         matched = 0
         for nick, secs in online.items():
             sid = n2s.get(nick)
             if not sid:
                 continue
-            prev = seen.get(nick)
+            prev = await seen_repo.get_activity(nick)
             delta = (secs - prev) if prev is not None and secs >= prev else \
                 (min(secs, ACTIVITY_TRACK_DELTA * 1.5) if prev is not None else 0.0)
-            seen[nick] = secs
+            await seen_repo.set_activity(nick, secs)
             if delta <= 0:
                 continue
             p = db.get(sid, {})
@@ -2135,12 +2133,11 @@ async def activity_tracker():
             a["AUTO"] = float(a.get("AUTO", 0)) + delta / 3600.0
             p.update(activity=a, discord_name=p.get("discord_name") or nick, updated_at=now)
             db[sid] = p
+            await players_repo.save_player(sid, p)
             matched += 1
-        seen["_seeded"] = True
+        await seen_repo.set_flag("_seeded", True)
         if matched:
-            await players_store.save(db)
             log(f"🕐 Трекер: +{matched}")
-        await seen_store.save(seen)
     except Exception as e:
         await log_error(bot, "activity_tracker", e)
 
@@ -2165,7 +2162,7 @@ def _pad(text: str, length: int) -> str:
 
 
 async def build_auto_sync_embeds(guild: discord.Guild) -> list:
-    links = links_store.read()
+    links = await links_repo.get_all_links()
 
     rows = []
     for did_str, sid in links.items():
@@ -2269,7 +2266,7 @@ async def build_auto_sync_embeds(guild: discord.Guild) -> list:
 async def auto_sync():
     try:
         log(f"⏰ auto_sync {now_utc().isoformat()}")
-        links = links_store.read()
+        links = await links_repo.get_all_links()
         guild = bot.get_guild(GUILD_ID)
         if not links or guild is None:
             return
@@ -2311,6 +2308,138 @@ async def auto_sync_error(err):
 async def before_auto_sync():
     await bot.wait_until_ready()
     await asyncio.sleep(random.randint(0, 120))
+
+
+# ============================================================
+# ИИ: /ask, !ask, /rules, !rules
+# ============================================================
+def _ai_summary(res: dict, query: str) -> str:
+    """Оформляет ответ ИИ + указывает использованные правила."""
+    rules_part = ""
+    if res.get("rules_used"):
+        rules_part = f"\n**Основание:** правила " + ", ".join(res["rules_used"]) + "."
+    cached_mark = " *(из кэша)*" if res.get("cached") else ""
+    provider = f" *(провайдер: {res.get('provider')})*" if res.get("provider") else ""
+    return f"{res['response']}{rules_part}{cached_mark}{provider}"
+
+
+def _format_ai_error(res: dict) -> str:
+    if res.get("limited"):
+        remaining = res.get("remaining", 0)
+        return (f"⏳ Превышен лимит запросов к ИИ. "
+                f"Осталось попыток в часе: **{remaining}**.")
+    return f"❌ {res.get('error') or 'Не удалось получить ответ.'}"
+
+
+@bot.tree.command(name="ask", description="Задать вопрос по правилам")
+@app_commands.describe(question="Ваш вопрос")
+async def ask(i, question: str):
+    global ai_service
+    await i.response.defer(ephemeral=False)
+    if ai_service is None:
+        await safe_send(i.followup, "❌ ИИ-сервис ещё не готов.", ephemeral=False)
+        return
+    res = await ai_service.ask(i.user.id, question)
+    if not res.get("ok"):
+        await safe_send(i.followup, _format_ai_error(res), ephemeral=False)
+        return
+    text = _ai_summary(res, question)
+    await safe_send(i.followup, text[:1900], ephemeral=False)
+
+
+@bot.tree.command(name="rules", description="Показать правила клана")
+async def rules(i):
+    await i.response.defer(ephemeral=False)
+    if ai_service is None or not getattr(ai_service, "rules", None):
+        await safe_send(i.followup, "❌ Правила не загружены.", ephemeral=False)
+        return
+    idx = ai_service.rules
+    if not idx.ready:
+        idx.load()
+    lines = []
+    seen = set()
+    for doc in idx._docs:
+        if doc["id"] not in seen:
+            seen.add(doc["id"])
+            lines.append(f"**{doc['id']}** — {doc['text'][:80]}")
+        if len(lines) >= 50:
+            break
+    if not lines:
+        await safe_send(i.followup, "ℹ️ Правила не найдены. Положи rules.txt в DATA_DIR.",
+                        ephemeral=False)
+        return
+    await safe_send(i.followup, "📜 **Правила клана:**\n" + "\n".join(lines)[:1900],
+                    ephemeral=False)
+
+
+@bot.command(name="ask")
+async def ask_legacy(ctx, *, question: str):
+    global ai_service
+    if ai_service is None:
+        await safe_send(ctx.channel, "❌ ИИ-сервис ещё не готов.")
+        return
+    res = await ai_service.ask(ctx.author.id, question)
+    if not res.get("ok"):
+        await safe_send(ctx.channel, _format_ai_error(res))
+        return
+    await safe_send(ctx.channel, _ai_summary(res, question)[:1900])
+
+
+@bot.command(name="rules")
+async def rules_legacy(ctx):
+    if ai_service is None or not getattr(ai_service, "rules", None):
+        await safe_send(ctx.channel, "❌ Правила не загружены.")
+        return
+    idx = ai_service.rules
+    if not idx.ready:
+        idx.load()
+    lines = []
+    seen = set()
+    for doc in idx._docs:
+        if doc["id"] not in seen:
+            seen.add(doc["id"])
+            lines.append(f"**{doc['id']}** — {doc['text'][:80]}")
+        if len(lines) >= 50:
+            break
+    if not lines:
+        await safe_send(ctx.channel, "ℹ️ Правила не найдены. Положи rules.txt в DATA_DIR.")
+        return
+    await safe_send(ctx.channel, "📜 **Правила клана:**\n" + "\n".join(lines)[:1900])
+
+
+# ============================================================
+# ОЧИСТКА КЭША ИИ (только администраторы)
+# ============================================================
+@bot.tree.command(name="ai_clear_cache", description="Очистить кэш ответов ИИ (админ)")
+@app_commands.default_permissions(administrator=True)
+async def ai_clear_cache(i):
+    if not i.user.guild_permissions.administrator:
+        await i.response.send_message("❌ Нужны права администратора.", ephemeral=True)
+        return
+    await i.response.defer(ephemeral=False)
+    try:
+        removed = await clear_cache()
+        await safe_send(i.followup, "✅ Кэш ИИ успешно очищен.", ephemeral=False)
+        if removed:
+            await log_to_channel(i.client,
+                f"🗑 Кэш ИИ очищен командой {i.user.mention} (удалено: {removed})")
+    except Exception as e:
+        await log_error(i.client, "/ai_clear_cache", e)
+        await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
+
+
+@bot.command(name="ai_clear_cache")
+@commands.has_permissions(administrator=True)
+async def ai_clear_cache_legacy(ctx):
+    try:
+        removed = await clear_cache()
+        await safe_send(ctx.channel, "✅ Кэш ИИ успешно очищен.")
+        if removed:
+            await log_to_channel(ctx.bot,
+                f"🗑 Кэш ИИ очищен командой {ctx.author.mention} (удалено: {removed})")
+    except Exception as e:
+        await log_error(ctx.bot, "!ai_clear_cache", e)
+        await safe_send(ctx.channel, f"❌ Ошибка: {str(e)[:200]}")
 
 
 # ============================================================

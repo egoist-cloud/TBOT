@@ -1,0 +1,18 @@
+# --- секреты: никогда не коммитить ---
+.env
+.env.*
+!.env.example
+
+# --- служебное ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+dist/
+*.zip
+.idea/
+.vscode/
+mass_links.json.bak
+error_log.txt
+error_log.old.txt
