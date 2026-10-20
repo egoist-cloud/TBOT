@@ -266,7 +266,7 @@ def _split_text_embeds(title: str, text: str, limit: int = 4000) -> list:
     return chunks or [_embed_black(title, "")]
 
 
-async def safe_send(target, *args, retries: int = 5, **kwargs):
+async def safe_send(target, *args, title: str = "", retries: int = 5, **kwargs):
     """
     Отправка с retry. Уважает:
     - Discord 429 (rate-limit) — ждёт retry_after
@@ -274,6 +274,7 @@ async def safe_send(target, *args, retries: int = 5, **kwargs):
 
     Любой переданный обычный текст (без embed=/content=/view=)
     автоматически оборачивается в чёрный Embed (color=0x000000).
+    Заголовок Embed можно задать через title=.
     Длинный текст разбивается на несколько Embeds.
     """
     # Обёртка текста в чёрный Embed, если не задан embed/content/view/file.
@@ -286,11 +287,11 @@ async def safe_send(target, *args, retries: int = 5, **kwargs):
         kwargs_backup = dict(kwargs)
         # Длинный текст разбиваем на несколько embeds.
         if len(text) > 4000:
-            embeds = _split_text_embeds("📊 Результат", text)
+            embeds = _split_text_embeds(title or "📊 Результат", text)
             for e in embeds:
                 e.color = 0x000000
             return await _send_multi(target, retries, embeds, **kwargs_backup)
-        embed = _embed_black("", text)
+        embed = _embed_black(title, text)
         kwargs["embed"] = embed
         args = tuple(rest)
 
@@ -1530,7 +1531,7 @@ async def admlink(i, user: discord.Member, steam_id: str):
         await links_repo.add_link(user.id, steam_id)
 
         embed = discord.Embed(
-            title="🔗 /admlink",
+            title="✅ Админ-привязка",
             color=0x57F287,
             timestamp=now_utc(),
         )
@@ -1701,7 +1702,8 @@ async def link_all(i):
             text += "**Нет на сервере:**\n" + "\n".join(no_member[:10]) + "\n\n"
         if other:
             text += "**Прочее:**\n" + "\n".join(other[:10])
-        await safe_send(i.followup, text[:1900], ephemeral=False)
+        await safe_send(i.followup, text[:1900], title="🔗 Массовая привязка",
+                        ephemeral=False)
         await log_to_channel(i.client,
             f"📊 /link_all: +{len(added)} / уже {len(already)} / "
             f"не SID {len(skip_not_sid)} / нет на сервере {len(no_member)} / "
@@ -2288,7 +2290,8 @@ async def moders(i):
                 lines.append(f"• @{target.display_name} (ник хоста: {target.display_name})")
             else:
                 lines.append(f"• `{u}`")
-        await safe_send(i.followup, f"🛠 ({len(mods)}):\n" + "\n".join(lines), ephemeral=False)
+        await safe_send(i.followup, f"🛠 ({len(mods)}):\n" + "\n".join(lines),
+                        title="🛠 Список модераторов", ephemeral=False)
     except Exception as e:
         await log_error(i.client, "/moders", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
@@ -2848,7 +2851,7 @@ async def rules(i):
                         ephemeral=False)
         return
     await safe_send(i.followup, "📜 **Правила клана:**\n" + "\n".join(lines)[:1900],
-                    ephemeral=False)
+                        title="📖 Правила", ephemeral=False)
 
 
 @bot.command(name="ask")
@@ -2884,7 +2887,8 @@ async def rules_legacy(ctx):
     if not lines:
         await safe_send(ctx.channel, "ℹ️ Правила не найдены. Положи rules.txt в DATA_DIR.")
         return
-    await safe_send(ctx.channel, "📜 **Правила клана:**\n" + "\n".join(lines)[:1900])
+    await safe_send(ctx.channel, "📜 **Правила клана:**\n" + "\n".join(lines)[:1900],
+                        title="📖 Правила")
 
 
 # ============================================================
@@ -2899,7 +2903,8 @@ async def ai_clear_cache(i):
     await i.response.defer(ephemeral=False)
     try:
         removed = await clear_cache()
-        await safe_send(i.followup, "✅ Кэш ИИ успешно очищен.", ephemeral=False)
+        await safe_send(i.followup, "✅ Кэш ИИ успешно очищен.", title="🤖 Кэш ИИ",
+                        ephemeral=False)
         if removed:
             await log_to_channel(i.client,
                 f"🗑 Кэш ИИ очищен командой {i.user.mention} (удалено: {removed})")
@@ -2913,7 +2918,7 @@ async def ai_clear_cache(i):
 async def ai_clear_cache_legacy(ctx):
     try:
         removed = await clear_cache()
-        await safe_send(ctx.channel, "✅ Кэш ИИ успешно очищен.")
+        await safe_send(ctx.channel, "✅ Кэш ИИ успешно очищен.", title="🤖 Кэш ИИ")
         if removed:
             await log_to_channel(ctx.bot,
                 f"🗑 Кэш ИИ очищен командой {ctx.author.mention} (удалено: {removed})")
