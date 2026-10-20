@@ -888,9 +888,52 @@ async def sync_role_by_id(guild, member, steam_id):
         return f"❌ нет прав"
 
 
+CLAN_ROLE_COLOR = 0x8E7CF3  # приятный фиолетовый — Discord не умеет градиенты через бота
+
+
+async def _find_or_create_clan_role(guild, member, clan_name: str, reason: str = "автосинхронизация"):
+    """Находит роль по имени клана или создаёт её.
+
+    Возвращает (role, status_text) — status_text непуст, если роль создана.
+    """
+    # 1) Повторно не создаём: роль по названию клана.
+    target = discord.utils.get(guild.roles, name=clan_name)
+    if target is not None:
+        return target, None
+
+    # 2) Проверяем права бота на управление ролями.
+    me = guild.me
+    if me is None or not me.guild_permissions.manage_roles:
+        return None, "❌ нет прав Manage Roles (бот не может создать роль клана)"
+
+    # 3) Позиция: на 1 выше top_role участника.
+    pos = (member.top_role.position + 1) if member.top_role else 1
+
+    try:
+        target = await guild.create_role(
+            name=clan_name,
+            color=discord.Colour(CLAN_ROLE_COLOR),
+            hoist=False,
+            mentionable=False,
+            reason=reason,
+        )
+        # Ставим позицию выше роли участника (клип let Discord сортирует админ-роли).
+        try:
+            await target.edit(position=pos, reason=reason)
+        except discord.Forbidden:
+            pass
+        return target, f"создана роль клана '{clan_name}'"
+    except discord.Forbidden:
+        return None, "❌ нет прав Manage Roles (не удалось создать роль клана)"
+    except discord.HTTPException as e:
+        return None, f"❌ ошибка создания роли: {e}"
+
+
 async def sync_clan_role_by_id(guild, member, steam_id):
-    if not CLAN_ROLE_MAP:
-        return f"ℹ️ CLAN_ROLE_MAP пуст"
+    # Проверяем права бота заранее (Manage Roles нужен для создания роли).
+    me = guild.me
+    if me is not None and not me.guild_permissions.manage_roles:
+        log(f"⚠️ sync_clan: бот не имеет права Manage Roles — роль создать не удастся")
 
     user = await api.cs2red_user(steam_id)
     if user is None:
@@ -908,10 +951,13 @@ async def sync_clan_role_by_id(guild, member, steam_id):
         return f"⚠️ {member.display_name}: в /api/clans нет members, роли не тронуты"
 
     clan = await api.player_clan(steam_id)
+    # Роли кланов, которыми управляем: известные по CLAN_ROLE_MAP + создаваемые по имени.
     managed = set(CLAN_ROLE_MAP.values())
-    held = [r for r in member.roles if r.id in managed]
 
     if clan is None:
+        # Игрок не в клане — снимаем все управляемые роли клана.
+        held = [r for r in member.roles if r.id in managed or r.name in {
+            c.get("name") for c in clans}]
         if held:
             for r in held:
                 try:
@@ -921,28 +967,39 @@ async def sync_clan_role_by_id(guild, member, steam_id):
             return f"🔄 клан снят"
         return f"ℹ️ без клана"
 
-    tid = CLAN_ROLE_MAP.get(clan["clan_id"])
-    if tid is None:
-        return f"ℹ️ клан без роли в CLAN_ROLE_MAP ({clan['clan_name']})"
+    clan_name = clan.get("clan_name") or ""
+    if not clan_name:
+        return f"ℹ️ клан без имени"
 
-    target = guild.get_role(tid)
+    # Ищем роль по имени (или по зарезервированному id в CLAN_ROLE_MAP).
+    target = discord.utils.get(guild.roles, name=clan_name)
+    created_status = None
     if target is None:
-        return f"⚠️ роль {tid} не найдена"
+        tid = CLAN_ROLE_MAP.get(clan.get("clan_id"))
+        if tid is not None:
+            target = guild.get_role(tid)
+        if target is None:
+            # Роли нет — создаём.
+            target, created_status = await _find_or_create_clan_role(guild, member, clan_name)
+            if target is None:
+                return f"⚠️ {created_status}" or "⚠️ не удалось создать роль клана"
 
+    # Снимаем прочие управляемые роли клана.
+    held = [r for r in member.roles if (r.id in managed or r.name in {
+        c.get("name") for c in clans}) and r != target]
     for r in held:
-        if r.id != tid:
-            try:
-                await member.remove_roles(r)
-            except discord.Forbidden:
-                pass
+        try:
+            await member.remove_roles(r)
+        except discord.Forbidden:
+            pass
 
     if target in member.roles:
-        return f"✅ уже в '{clan['clan_name']}'"
+        return f"✅ уже в '{clan_name}'" + (f" ({created_status})" if created_status else "")
     try:
         await member.add_roles(target)
-        return f"✅ выдан клан '{clan['clan_name']}'"
+        return f"✅ выдан клан '{clan_name}'" + (f" ({created_status})" if created_status else "")
     except discord.Forbidden:
-        return f"❌ нет прав"
+        return f"❌ нет прав выдать роль"
 
 
 # ============================================================
