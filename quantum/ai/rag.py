@@ -269,17 +269,25 @@ class RulesIndex:
             return base
 
         # Используем предвычисленные idf и среднюю длину — без пересчёта.
+        # Слова-маркеры наказания: пункты с ними получают небольшой буст,
+        # чтобы строки с санкциями чаще попадали в топ результатов.
+        PUNISH_MARKERS = ("наказание", "блокировка", "предупреждение", "бан", "мут",
+                          "предупрежден", "блокиров", "выговор", "аннулиров", "бип",
+                          "чс", "снятие", "килл", "нейтрализ")
         scored = []
         for idx, doc in enumerate(docs):
             counter = tokens[idx]
             dl = doc_len[idx]
             score = 0.0
+            low_text = doc["text"].lower()
+            boost = 1.5 if any(m in low_text for m in PUNISH_MARKERS) else 1.0
             for t in set(q_tokens):
                 tf = counter.get(t, 0)
                 if tf == 0:
                     continue
                 denom = tf + _K1 * (1 - _B + _B * (dl / avgdl if avgdl else 1.0))
                 score += idf_cache.get(t, 0.0) * (_K1 + 1) * tf / denom
+            score *= boost
             if score > 0:
                 scored.append({"id": doc["id"], "text": doc["text"], "score": score})
 
