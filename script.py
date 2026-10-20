@@ -1385,41 +1385,23 @@ async def linked_member_autocomplete(i, current):
 # ============================================================
 # /link_all
 # ============================================================
-@bot.tree.command(name="link_all", description="Массовая привязка из mass_links.json")
+@bot.tree.command(name="link_all", description="Массовая привязка/синхронизация из базы SQLite")
 async def link_all(i):
     if not await _admin_guard(i):
         return
     await i.response.defer(ephemeral=False)
 
     try:
-        f = data_path("mass_links.json")
-        if not f.exists():
-            await safe_send(
-                i.followup,
-                "❌ Файл `mass_links.json` не найден. "
-                "Загрузите его в корень проекта (DATA_DIR) и повторите.",
-                ephemeral=False,
-            )
-            return
-
-        try:
-            with open(f, "r", encoding="utf-8") as fp:
-                data = json.load(fp)
-            if not isinstance(data, dict):
-                raise ValueError("должен быть JSON-объект")
-        except json.JSONDecodeError as e:
+        # Данные о привязках берем из БД (SQLite), а не из mass_links.json.
+        data = await links_repo.get_all_links()
+        if not data:
             await safe_send(i.followup,
-                f"❌ JSON повреждён: {e}\n"
-                f"Проверь файл на https://jsonlint.com",
-                ephemeral=False
-            )
-            return
-        except Exception as e:
-            await safe_send(i.followup, f"❌ Ошибка чтения: {e}", ephemeral=False)
+                            "ℹ️ В базе нет привязок. Добавьте их через /link или /admlink.",
+                            ephemeral=False)
             return
 
         total = len(data)
-        log(f"📥 /link_all: {total} записей")
+        log(f"📥 /link_all: {len(data)} записей из БД")
 
         added = []
         skip_not_sid = []
@@ -1930,8 +1912,16 @@ async def moders(i):
         if not mods:
             await safe_send(i.followup, "ℹ️ Пусто", ephemeral=False)
             return
-        lines = [f"• {(i.guild.get_member(u).mention if i.guild.get_member(u) else f'`{u}`')}"
-                 for u in mods]
+        lines = []
+        for u in mods:
+            member = i.guild.get_member(int(u)) if str(u).isdigit() else None
+            target = member or bot.get_user(int(u)) if str(u).isdigit() else None
+            if member:
+                lines.append(f"• {member.mention}")
+            elif target:
+                lines.append(f"• @{target.display_name} (ник хоста: {target.display_name})")
+            else:
+                lines.append(f"• `{u}`")
         await safe_send(i.followup, f"🛠 ({len(mods)}):\n" + "\n".join(lines), ephemeral=False)
     except Exception as e:
         await log_error(i.client, "/moders", e)
