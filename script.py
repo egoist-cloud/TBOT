@@ -100,24 +100,42 @@ BOT_START_TIME = time.time()
 
 CMD_API_TIMEOUT = 30.0
 
-CS2RED_COOKIES = {k: v for k, v in {
-    "token": os.getenv("CS2RED_TOKEN", ""),
-    "bh": os.getenv("CS2RED_BH", ""),
-    "_yasc": os.getenv("CS2RED_YASC", ""),
-    "browser_id": os.getenv("CS2RED_BROWSER_ID", ""),
-    "yandexuid": os.getenv("CS2RED_YANDEXUID", ""),
-    "yuidss": os.getenv("CS2RED_YUIDSS", ""),
-    "i": os.getenv("CS2RED_I", ""),
-    "__ddg1_": os.getenv("CS2RED_DDG1", ""),
-    "__ddg8_": os.getenv("CS2RED_DDG8", ""),
-    "__ddg9_": os.getenv("CS2RED_DDG9", ""),
-    "__ddg10_": os.getenv("CS2RED_DDG10", ""),
-    "yabs-sid": os.getenv("CS2RED_YABS_SID", ""),
-    "_ym_uid": os.getenv("CS2RED_YM_UID", ""),
-    "_ym_d": os.getenv("CS2RED_YM_D", ""),
-    "_ym_isad": os.getenv("CS2RED_YM_ISAD", ""),
-    "ymex": os.getenv("CS2RED_YMEX", ""),
-}.items() if v}
+def _parse_cookie_string(raw: str) -> dict:
+    """Парсит raw cookie-строку ('name=value; name2=value2') в словарь."""
+    result = {}
+    for part in (raw or "").split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, v = part.split("=", 1)
+            if k.strip():
+                result[k.strip()] = v.strip()
+    return result
+
+
+# Куки для cs2red.admin. Приоритет: CS2RED_COOKIE_STRING (raw-строка),
+# иначе набор отдельных переменных CS2RED_*.
+_cookie_raw = os.getenv("CS2RED_COOKIE_STRING", "").strip()
+if _cookie_raw:
+    CS2RED_COOKIES = _parse_cookie_string(_cookie_raw)
+else:
+    CS2RED_COOKIES = {k: v for k, v in {
+        "token": os.getenv("CS2RED_TOKEN", ""),
+        "bh": os.getenv("CS2RED_BH", ""),
+        "_yasc": os.getenv("CS2RED_YASC", ""),
+        "browser_id": os.getenv("CS2RED_BROWSER_ID", ""),
+        "yandexuid": os.getenv("CS2RED_YANDEXUID", ""),
+        "yuidss": os.getenv("CS2RED_YUIDSS", ""),
+        "i": os.getenv("CS2RED_I", ""),
+        "__ddg1_": os.getenv("CS2RED_DDG1", ""),
+        "__ddg8_": os.getenv("CS2RED_DDG8", ""),
+        "__ddg9_": os.getenv("CS2RED_DDG9", ""),
+        "__ddg10_": os.getenv("CS2RED_DDG10", ""),
+        "yabs-sid": os.getenv("CS2RED_YABS_SID", ""),
+        "_ym_uid": os.getenv("CS2RED_YM_UID", ""),
+        "_ym_d": os.getenv("CS2RED_YM_D", ""),
+        "_ym_isad": os.getenv("CS2RED_YM_ISAD", ""),
+        "ymex": os.getenv("CS2RED_YMEX", ""),
+    }.items() if v}
 
 CS2RED_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -359,6 +377,34 @@ class API:
         if not users:
             return {"_not_found": True, "nick": None, "roleId": None}
         return users[0]
+
+    async def cs2red_search_by_nick(self, nickname: str, limit: int = 10):
+        """Ищет игроков в админ-панели cs2red по нику.
+
+        Возвращает список объектов игроков (у каждого есть поле steamid64),
+        или None при ошибке. 403 трактуется как ошибка авторизации.
+        """
+        data = await self._get_json(
+            "https://cs2red.ru/api/admin/users",
+            params={"begin": 0, "count": limit, "search": nickname})
+        if data is None:
+            return None
+        if not data.get("success"):
+            return None
+        return data.get("users") or []
+
+    @staticmethod
+    def extract_steam64(user: dict) -> str | None:
+        """Достаёт SteamID64 из объекта пользователя cs2red."""
+        if not isinstance(user, dict):
+            return None
+        for key in ("steamid64", "steamId64", "steam_id", "steamid", "steamId", "steamID"):
+            val = user.get(key)
+            if val:
+                sid = str(val).strip()
+                if sid.isdigit() and len(sid) == 17 and sid.startswith("7656119"):
+                    return sid
+        return None
 
     async def cs2red_full_user(self, steam_id: str):
         user = await self.cs2red_user(steam_id)
@@ -1490,6 +1536,128 @@ async def link_all(i):
             f"нет на cs2red {len(not_on_site)} / прочее {len(other)}")
     except Exception as e:
         await log_error(i.client, "/link_all", e)
+        await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
+
+
+@bot.tree.command(name="auto_link", description="Авто-привязка по никам через админ-панель cs2red (админ)")
+@app_commands.default_permissions(administrator=True)
+async def auto_link(i):
+    if not await _admin_guard(i):
+        return
+    await i.response.defer(ephemeral=False)
+
+    # Проверяем, что куки вообще заданы.
+    if not CS2RED_COOKIES:
+        await safe_send(i.followup,
+                        "❌ Ошибка авторизации на cs2red. Проверьте куки "
+                        "(CS2RED_COOKIE_STRING или CS2RED_*).", ephemeral=False)
+        return
+
+    # Проверочный запрос: убеждаемся, что авторизация работает.
+    probe = await api.cs2red_search_by_nick("__probe__", limit=1)
+    if probe is None:
+        if getattr(api, "last_status", None) == 403:
+            await safe_send(i.followup,
+                            "❌ Ошибка авторизации на cs2red. Проверьте куки.",
+                            ephemeral=False)
+            return
+        await safe_send(i.followup,
+                        "❌ cs2red не ответил на проверочный запрос. Попробуйте позже.",
+                        ephemeral=False)
+        return
+
+    try:
+        # Все участники сервера (без ботов).
+        members = [m for m in i.guild.members if not m.bot]
+        # Уже привязанные ID из БД.
+        linked = await links_repo.get_all_links()
+
+        linked_ids = set()
+        for did, sid in linked.items():
+            if str(did).isdigit():
+                linked_ids.add(str(did))
+
+        unlinked = [m for m in members if str(m.id) not in linked_ids]
+
+        total = len(unlinked)
+        processed = 0
+        added = []
+        skipped_ambigu = []
+        skipped_none = []
+        errors = []
+
+        # Фоновая задача прогресса — отправляем один раз в 20 итераций.
+        last_progress = 0
+
+        for m in unlinked:
+            processed += 1
+            nick = (m.display_name or "").strip()
+            if not nick:
+                skipped_none.append(f"{m.display_name}: пустой ник")
+                continue
+
+            try:
+                users = await api.cs2red_search_by_nick(nick)
+                if users is None:
+                    if getattr(api, "last_status", None) == 403:
+                        errors.append("403: авторизация на cs2red (куки) — команда прервана")
+                        break
+                    errors.append(f"{m.display_name}: cs2red не ответил")
+                    continue
+
+                steam_id = None
+                if len(users) == 1:
+                    steam_id = api.extract_steam64(users[0])
+
+                if steam_id is None:
+                    skipped_ambigu.append(f"{m.display_name} ({nick})")
+                else:
+                    await links_repo.add_link(m.id, steam_id)
+                    added.append(f"{m.display_name} → `{steam_id}`")
+            except Exception as e:
+                errors.append(f"{m.display_name}: {e}")
+
+            # задержка, чтобы не забанили за флуд запросами
+            await asyncio.sleep(1)
+
+            if processed - last_progress >= 20:
+                last_progress = processed
+                try:
+                    await safe_send(i.followup,
+                                    f"⏳ Прогресс: {processed}/{total}...",
+                                    ephemeral=False)
+                except Exception:
+                    pass
+
+        embed = discord.Embed(
+            title="🔗 Авто-привязка по никам",
+            color=0x57F287 if not errors else 0xFEE75C,
+            timestamp=now_utc(),
+        )
+        embed.add_field(name="Всего участников", value=str(len(members)), inline=True)
+        embed.add_field(name="Уже привязано", value=str(len(linked)), inline=True)
+        embed.add_field(name="Проверено", value=str(processed), inline=True)
+        embed.add_field(name="✅ Привязано", value=str(len(added)), inline=True)
+        embed.add_field(name="⚠️ Неоднозначно", value=str(len(skipped_ambigu)), inline=True)
+        embed.add_field(name="⏭ Не найдено", value=str(len(skipped_none)), inline=True)
+        embed.add_field(name="❌ Ошибок", value=str(len(errors)), inline=True)
+        if added:
+            embed.add_field(name="Последние привязки",
+                            value="\n".join(added[-10:]), inline=False)
+        if skipped_ambigu:
+            embed.add_field(
+                name="Неоднозначные (пропущены)",
+                value="\n".join(skipped_ambigu[:10]), inline=False)
+        if errors:
+            embed.add_field(name="Ошибки", value="\n".join(errors[:10]), inline=False)
+        embed.set_footer(text=f"Выполнил: {i.user.display_name}")
+
+        await safe_send(i.followup, embed=embed, ephemeral=False)
+        await log_to_channel(i.client,
+            f"🔗 /auto_link: привязано {len(added)}, неоднозначно "
+            f"{len(skipped_ambigu)}, не найдено {len(skipped_none)}, ошибок {len(errors)}")
+    except Exception as e:
+        await log_error(i.client, "/auto_link", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
 
 
