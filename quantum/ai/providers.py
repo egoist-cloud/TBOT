@@ -77,11 +77,14 @@ def _is_auth_error(status: int) -> bool:
 
 
 class GeminiProvider(AIProvider):
-    """Gemini Interactions API (generativelanguage.googleapis.com).
+    """Gemini generateContent API (generativelanguage.googleapis.com).
 
-    Формат запроса/ответа сверен с ai_rules.GeminiClient:
-    тело {model, input, system_instruction, store, generation_config},
-    заголовок x-goog-api-key. Текст ответа — steps[type=model_output].
+    Нативный эндпоинт: POST /v1beta/models/{model}:generateContent
+    Ключ передаётся в заголовке x-goog-api-key (НЕ Bearer — новый формат
+    ключей AQ.Ab8... уже отклоняется через Bearer).
+    Тело — нативный формат Gemini:
+        {"contents": [{"parts": [{"text": "..."}]}], ...}
+    Текст ответа — candidates[].content.parts[].text
     """
 
     name = "gemini"
@@ -89,7 +92,7 @@ class GeminiProvider(AIProvider):
     model_env = "AI_MODEL"
     default_model = "gemini-1.5-flash"
     api_url_env = "GEMINI_API_URL"
-    default_api_url = "https://generativelanguage.googleapis.com/v1beta/interactions"
+    default_api_url = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     max_output_env = "AI_MAX_OUTPUT_TOKENS"
 
     @property
@@ -103,12 +106,17 @@ class GeminiProvider(AIProvider):
         except (TypeError, ValueError):
             return 900
 
+    def _build_url(self) -> str:
+        """URL эндпоинта; {model} в шаблоне подставляется моделью."""
+        template = os.getenv(self.api_url_env) or self.default_api_url
+        return template.format(model=self._model)
+
     async def complete(self, messages: list) -> str | None:
         if not self.enabled:
             return None
-        # Conversations API ждёт input, а не список messages:
-        # собираем конкатенацию ролей с заголовками роль:.
-        prompt_parts = []
+        # Нативный формат Gemini: contents = список частей диалога.
+        # Системную инструкцию выносим в system_instruction, остальное — parts.
+        contents: list[dict] = []
         system = ""
         for m in messages:
             role = (m or {}).get("role", "user")
@@ -118,21 +126,25 @@ class GeminiProvider(AIProvider):
             if role == "system":
                 system = (system + "\n" + content).strip()
             else:
-                prompt_parts.append(f"{role}: {content}")
+                contents.append({"parts": [{"text": content}]})
+        # Если нет user-сообщений (только system) — всё равно нужен хотя бы
+        # один contents-элемент, иначе Gemini вернёт 400.
+        if not contents:
+            contents.append({"parts": [{"text": ""}]})
+
         body: dict = {
-            "model": self._model,
-            "input": "\n".join(prompt_parts),
-            "store": False,
-            "generation_config": {"max_output_tokens": self._max_output},
+            "contents": contents,
+            "generationConfig": {"maxOutputTokens": self._max_output},
         }
         if system:
-            body["system_instruction"] = system
+            body["system_instruction"] = {"parts": [{"text": system}]}
 
+        # Ключ ТОЛЬКО в x-goog-api-key, никакого Authorization: Bearer.
         headers = {
             "x-goog-api-key": self._api_key(),
             "Content-Type": "application/json",
         }
-        url = os.getenv(self.api_url_env) or self.default_api_url
+        url = self._build_url()
         return await self._post(url, headers, body)
 
     async def _post(self, url: str, headers: dict, body: dict) -> str | None:
@@ -144,6 +156,8 @@ class GeminiProvider(AIProvider):
             ) as r:
                 raw = (await r.text())[:2000]
                 if r.status != 200:
+                    # Отладочный вывод реального ответа Google в консоль (Render).
+                    print(f"Gemini error: {r.status} - {raw[:2000]}")
                     if _is_auth_error(r.status):
                         msg = (f"авторизация {r.status}: неверный API-ключ "
                                f"({self.env_key}): {raw[:200]}")
@@ -154,8 +168,12 @@ class GeminiProvider(AIProvider):
                     elif r.status == 400:
                         msg = f"неверный запрос (проверь AI_MODEL): {raw[:200]}"
                         self._record(r.status, msg)
+                    elif r.status == 404:
+                        msg = f"модель не найдена (проверь AI_MODEL): {raw[:200]}"
+                        self._record(r.status, msg)
                     else:
-                        self._record(r.status, f"HTTP {r.status}: {raw[:200]}")
+                        msg = f"HTTP {r.status}: {raw[:200]}"
+                        self._record(r.status, msg)
                     return None
                 try:
                     data = await r.json(content_type=None)
@@ -177,14 +195,15 @@ class GeminiProvider(AIProvider):
         if not isinstance(data, dict):
             return None
         parts: list[str] = []
-        for step in data.get("steps") or []:
-            if not isinstance(step, dict):
+        for cand in data.get("candidates") or []:
+            if not isinstance(cand, dict):
                 continue
-            if step.get("type") not in ("model_output", None):
-                continue
-            for item in step.get("content") or []:
-                if isinstance(item, dict) and item.get("type") == "text" and item.get("text"):
+            content = cand.get("content") or {}
+            for item in content.get("parts") or []:
+                if isinstance(item, dict) and item.get("text"):
                     parts.append(str(item["text"]))
+        if not parts:
+            return None
         text = "\n".join(parts).strip()
         return text or None
 
