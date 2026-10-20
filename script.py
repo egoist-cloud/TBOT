@@ -1431,8 +1431,16 @@ def admin_only(i):
 
 
 async def _admin_guard(i):
+    """Проверка прав администратора. Ответ об отказе идёт через followup,
+    поэтому вызывать `_admin_guard` можно только ПОСЛЕ `await i.response.defer()`."""
     if not admin_only(i):
-        await i.response.send_message("❌ Нужны права админа.", ephemeral=True)
+        try:
+            await i.followup.send("❌ Нужны права админа.", ephemeral=True)
+        except Exception:
+            try:
+                await i.response.send_message("❌ Нужны права админа.", ephemeral=True)
+            except Exception:
+                pass
         return False
     return True
 
@@ -1514,9 +1522,9 @@ async def unlink(i):
 @app_commands.describe(user="Участник Discord", steam_id="SteamID64 (17 цифр)")
 @app_commands.default_permissions(administrator=True)
 async def admlink(i, user: discord.Member, steam_id: str):
+    await i.response.defer(ephemeral=False)
     if not await _admin_guard(i):
         return
-    await i.response.defer(ephemeral=False)
     steam_id = steam_id.strip()
     if not (steam_id.isdigit() and len(steam_id) == 17 and steam_id.startswith("7656119")):
         await safe_send(i.followup, "❌ Неверный SteamID (ожидается SteamID64 из 17 цифр, "
@@ -1558,9 +1566,9 @@ async def admlink(i, user: discord.Member, steam_id: str):
 
 @bot.tree.command(name="sync_all", description="Синхронизировать всех")
 async def sync_all(i):
+    await i.response.defer(ephemeral=False)
     if not await _admin_guard(i):
         return
-    await i.response.defer(ephemeral=False)
     try:
         links = await links_repo.get_all_links()
         if not links:
@@ -1606,9 +1614,9 @@ async def linked_member_autocomplete(i, current):
 # ============================================================
 @bot.tree.command(name="link_all", description="Массовая привязка/синхронизация из базы SQLite")
 async def link_all(i):
+    await i.response.defer(ephemeral=False)
     if not await _admin_guard(i):
         return
-    await i.response.defer(ephemeral=False)
 
     try:
         # Данные о привязках берем из БД (SQLite), а не из mass_links.json.
@@ -1716,9 +1724,9 @@ async def link_all(i):
 @bot.tree.command(name="auto_link", description="Авто-привязка по никам через админ-панель cs2red (админ)")
 @app_commands.default_permissions(administrator=True)
 async def auto_link(i):
+    await i.response.defer(ephemeral=False)
     if not await _admin_guard(i):
         return
-    await i.response.defer(ephemeral=False)
 
     # Проверяем, что куки вообще заданы.
     if not CS2RED_COOKIES:
@@ -1863,9 +1871,9 @@ async def auto_link(i):
 
 @bot.tree.command(name="export_members", description="Выгрузить привязки в mass_links.json")
 async def export_members(i):
+    await i.response.defer(ephemeral=False)
     if not await _admin_guard(i):
         return
-    await i.response.defer(ephemeral=False)
     try:
         links = await links_repo.get_all_links()
         if not links:
@@ -1938,9 +1946,9 @@ async def player_info(i, member: discord.Member):
 @bot.tree.command(name="player_note", description="Заметка к профилю")
 @app_commands.describe(member="Участник Discord", note="Заметка")
 async def player_note(i, member: discord.Member, note: str):
+    await i.response.defer(ephemeral=False)
     if not await _admin_guard(i):
         return
-    await i.response.defer(ephemeral=False)
     try:
         sid = await links_repo.get_link(member.id)
         if not sid:
@@ -1962,9 +1970,9 @@ async def player_note(i, member: discord.Member, note: str):
 
 @bot.tree.command(name="player_list", description="Вся база")
 async def player_list(i):
+    await i.response.defer(ephemeral=False)
     if not await _admin_guard(i):
         return
-    await i.response.defer(ephemeral=False)
     try:
         db = await players_repo.get_all_players()
         if not db:
