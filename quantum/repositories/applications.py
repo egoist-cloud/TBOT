@@ -55,3 +55,22 @@ async def finalize_application(user_id, status: str) -> None:
         (status, _now(), str(user_id)),
     )
     await db.commit()
+
+
+async def count_applications() -> int:
+    """Общее число заявок в таблице (для панели)."""
+    db = await get_db()
+    cursor = await db.execute("SELECT COUNT(*) AS c FROM applications")
+    row = await cursor.fetchone()
+    await cursor.close()
+    return row["c"] if row is not None else 0
+
+
+async def count_pending_applications() -> int:
+    """Число активных (на рассмотрении) заявок."""
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT COUNT(*) AS c FROM applications WHERE status = 'pending'")
+    row = await cursor.fetchone()
+    await cursor.close()
+    return row["c"] if row is not None else 0

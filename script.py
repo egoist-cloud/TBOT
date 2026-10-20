@@ -1462,6 +1462,59 @@ async def on_ready():
     log(f"📡 Guilds: {[g.name for g in bot.guilds]}")
 
 
+@bot.event
+async def on_member_join(member):
+    """Авто-привязка нового участника к Steam ID по его нику при входе на сервер."""
+    try:
+        # Пропускаем ботов.
+        if member.bot:
+            return
+
+        # Уже привязан в БД?
+        ex = await links_repo.get_link(member.id)
+        if ex:
+            return
+
+        nick = (member.display_name or "").strip()
+        if not nick:
+            return
+
+        await api._acquire_rate_slot()
+        users = await api.cs2red_search_by_nick(nick)
+        if users is None:
+            # Тихо логируем ошибку cs2red (403/429/сбой) — не падаем.
+            reason = api.blocked_reason or getattr(api, "last_status", None)
+            log(f"🐣 on_member_join {member}: cs2red не ответил ({reason})")
+            return
+
+        if len(users) == 1:
+            steam_id = api.extract_steam64(users[0])
+            if steam_id:
+                await links_repo.add_link(member.id, steam_id)
+                c_nick = users[0].get("nick") or nick
+                log(f"✅ Автопривязка при входе: {member.display_name} → `{steam_id}` "
+                    f"(ник на cs2red: {c_nick})")
+                # Лог в канал.
+                if LOG_CHANNEL_ID:
+                    ch = bot.get_channel(LOG_CHANNEL_ID)
+                    if ch is not None:
+                        try:
+                            await safe_send(
+                                ch,
+                                f"✅ Автопривязка при входе: {member.mention} → `{steam_id}` "
+                                f"(ник на cs2red: {c_nick})")
+                        except Exception as e:
+                            log(f"⚠️ on_member_join лог: {e}")
+                return
+
+        # Неоднозначный или нулевой результат — пропуск.
+        log(f"🐣 on_member_join {member.display_name} ({nick}): "
+            f"найдено {len(users)} игроков — пропуск автопривязки")
+    except Exception as e:
+        # Никогда не роняем обработчик из-за единичной ошибки.
+        log(f"⚠️ on_member_join: {type(e).__name__}: {e}")
+
+
 def admin_only(i):
     return i.user.guild_permissions.administrator
 
@@ -3054,8 +3107,8 @@ class PanelView(discord.ui.View):
             res.append(await sync_clan_role_by_id(guild, m, sid))
             await asyncio.sleep(REQUEST_DELAY)
         text = f"📊 Синхронизация ({len(res)}):\n" + "\n".join(res)
-        await interaction.followup.send(text[:1900], title="🔗 Синхронизация",
-                                        ephemeral=False)
+        await safe_send(interaction.followup, text[:1900], title="🔗 Синхронизация",
+                        ephemeral=False)
 
     @discord.ui.button(label="📖 Обновить правила", style=discord.ButtonStyle.secondary,
                        custom_id="panel_rules", row=1)
@@ -3075,26 +3128,17 @@ class PanelView(discord.ui.View):
     async def panel_health(self, interaction, button):
         button.disabled = True
         await interaction.response.defer(ephemeral=False)
-        # Компактная проверка систем.
         try:
-            lines = []
-            lines.append(f"🟢 Аптайм: {int(time.time() - BOT_START_TIME)} сек.")
-            ws_ms = bot.latency * 1000
-            lines.append(f"🌐 WebSocket: {ws_ms:.0f} мс")
-            linked = await links_repo.count_all()
-            lines.append(f"🔗 Привязки в БД: {linked}")
-            if ai_service is not None:
-                n_prov = len(ai_service.providers)
-                rules = len(ai_service.rules._docs)
-                lines.append(f"🤖 ИИ: провайдеров {n_prov}, правил {rules}")
-            last_status = getattr(api, "last_status", None)
-            lines.append(f"📡 cs2red: {last_status}")
-            await interaction.followup.send(
-                "🩺 **Состояние системы**\n" + "\n".join(lines),
-                title="🩺 Состояние системы", ephemeral=False)
-        except Exception:
-            await interaction.followup.send("❌ Ошибка при проверке состояния.",
-                                            ephemeral=False)
+            embed = await build_panel_health_embed()
+            await safe_send(interaction.followup, embed=embed, ephemeral=False)
+        except Exception as e:
+            log(f"⚠️ panel_health: {e}")
+            try:
+                await safe_send(interaction.followup,
+                                f"❌ Ошибка при проверке состояния: {str(e)[:200]}",
+                                ephemeral=False)
+            except Exception:
+                pass
 
 
 @bot.tree.command(name="panel", description="Панель управления ботом (админ)")
@@ -3103,19 +3147,146 @@ async def panel(i):
     await i.response.defer(ephemeral=False)
     if not await _admin_guard(i):
         return
-    embed = discord.Embed(
-        title="🛠 Панель управления",
-        description=("Админ-панель бота. Выберите действие:\n\n"
-                     "🔄 **Привязать всех** — массовая автопривязка по никам\n"
-                     "🔗 **Синхронизация** — синхронизировать роли всех привязанных\n"
-                     "📖 **Обновить правила** — перечитать rules.txt в базе знаний\n"
-                     "💚 **Health** — быстрая проверка состояния систем"),
+    embed = await build_panel_embed()
+    view = PanelView()
+    await safe_send(i.followup, embed=embed, view=view, ephemeral=False)
+
+
+def _uptime_str() -> str:
+    up = int(time.time() - BOT_START_TIME)
+    d, r = divmod(up, 86400)
+    h, r = divmod(r, 3600)
+    m, s = divmod(r, 60)
+    if d:
+        return f"{d} д {h} ч"
+    if h:
+        return f"{h} ч {m} мин"
+    if m:
+        return f"{m} мин {s} сек"
+    return f"{s} сек"
+
+
+async def build_panel_health_embed() -> discord.Embed:
+    """Собирает Embed со сводным состоянием систем (для кнопки Health)."""
+    e = discord.Embed(
+        title="🩺 Состояние системы",
         color=0x000000,
         timestamp=now_utc(),
     )
-    embed.set_footer(text="Quantum • Панель администратора")
-    view = PanelView()
-    await safe_send(i.followup, embed=embed, view=view, ephemeral=False)
+    # Базовые метрики
+    e.add_field(name="Аптайм", value=_uptime_str(), inline=True)
+    e.add_field(name="WS Пинг", value=f"{bot.latency * 1000:.0f} мс", inline=True)
+    e.add_field(name="Cookies", value=str(len(CS2RED_COOKIES)), inline=True)
+    linked = await links_repo.count_all()
+    e.add_field(name="Привязок", value=str(linked), inline=True)
+    try:
+        apps_total = await applications_repo.count_applications()
+        apps_pending = await applications_repo.count_pending_applications()
+    except Exception:
+        apps_total = apps_pending = "?"
+    e.add_field(name="Заявок", value=f"{apps_total} (в работе: {apps_pending})", inline=True)
+
+    # Блок ИИ
+    if ai_service is not None:
+        prov = ai_service.providers
+        if prov:
+            p = prov[0]
+            req = sum(getattr(x, "requests", 0) for x in prov)
+            errs = sum(getattr(x, "failures", 0) for x in prov)
+            model = getattr(p, "_model", "?")
+            ai_txt = (f"{p.name} ({model})\n"
+                      f"провайдеров: {len(prov)}\nзапросов: {req}, ошибок: {errs}")
+        else:
+            ai_txt = "Нет настроенных провайдеров"
+        e.add_field(name="🤖 ИИ", value=ai_txt, inline=False)
+    else:
+        e.add_field(name="🤖 ИИ", value="Не инициализирован", inline=False)
+
+    # Блок Правила
+    if ai_service is not None and ai_service.rules is not None:
+        rules = ai_service.rules
+        n_docs = len(getattr(rules, "_docs", []) or [])
+        # символы
+        syms = sum(len(d.get("text", "")) for d in getattr(rules, "_docs", []) or [])
+        rules_txt = f"Пунктов: {n_docs}\nСимволов: {syms}\nИсточник: rules.txt"
+        e.add_field(name="📖 Правила", value=rules_txt, inline=False)
+    else:
+        e.add_field(name="📖 Правила", value="Не загружены", inline=False)
+
+    # cs2red и ошибки: используем api.last_status, ошибок в лог-файле — считаем.
+    last_status = getattr(api, "last_status", None)
+    e.add_field(name="📡 cs2red", value=f"HTTP: {last_status}" if last_status else "нет данных",
+                inline=True)
+
+    # GitHub-синк в script.py не подключён — честно сообщаем.
+    e.add_field(name="🐙 GitHub", value="Синк не подключён", inline=True)
+    e.set_footer(text="Quantum • Панель администратора")
+    return e
+
+
+async def build_panel_embed() -> discord.Embed:
+    """Собирает расширенную Embed-панель управления."""
+    e = discord.Embed(
+        title="🛠 Панель управления",
+        description="Админ-панель бота. Выберите действие кнопками ниже.",
+        color=0x000000,
+        timestamp=now_utc(),
+    )
+    e.add_field(name="Аптайм", value=_uptime_str(), inline=True)
+    e.add_field(name="WS Пинг", value=f"{bot.latency * 1000:.0f} мс", inline=True)
+    e.add_field(name="Cookies", value=str(len(CS2RED_COOKIES)), inline=True)
+    try:
+        linked = await links_repo.count_all()
+    except Exception:
+        linked = "?"
+    e.add_field(name="Привязок", value=str(linked), inline=True)
+    try:
+        apps_total = await applications_repo.count_applications()
+    except Exception:
+        apps_total = "?"
+    e.add_field(name="Заявок", value=str(apps_total), inline=True)
+
+    # ИИ
+    if ai_service is not None:
+        prov = ai_service.providers
+        if prov:
+            p = prov[0]
+            model = getattr(p, "_model", "?")
+            req = sum(getattr(x, "requests", 0) for x in prov)
+            errs = sum(getattr(x, "failures", 0) for x in prov)
+            ai_txt = (f"статус: работает · провайдер: {p.name}\n"
+                      f"модель: {model}\nзапросов: {req}, ошибок: {errs}")
+        else:
+            ai_txt = "Нет настроенных провайдеров"
+    else:
+        ai_txt = "Не инициализирован"
+    e.add_field(name="🤖 ИИ", value=ai_txt, inline=False)
+
+    # Правила
+    rules_parts = []
+    if ai_service is not None and ai_service.rules is not None:
+        docs = getattr(ai_service.rules, "_docs", []) or []
+        rules_parts.append(f"пунктов: {len(docs)}")
+        rules_parts.append(f"символов: {sum(len(d.get('text', '')) for d in docs)}")
+        rules_parts.append("источник: rules.txt")
+        rules_parts.append("обновлено: последний запуск/обновление")
+    else:
+        rules_parts.append("не загружены")
+    e.add_field(name="📖 Правила", value="\n".join(rules_parts), inline=False)
+
+    # GitHub
+    e.add_field(name="🐙 GitHub", value="Синк не подключён", inline=True)
+
+    # Что делают кнопки
+    btns = (
+        "🔄 **Привязать всех** — автопривязка по никам всех непривязанных\n"
+        "🔗 **Синхронизация** — синхронизация ролей привязанных\n"
+        "📖 **Обновить правила** — перечитать rules.txt (база знаний)\n"
+        "💚 **Health** — развернуть состояние систем"
+    )
+    e.add_field(name="⚙️ Что делают кнопки", value=btns, inline=False)
+    e.set_footer(text="Quantum • Панель администратора")
+    return e
 
 
 # ============================================================
