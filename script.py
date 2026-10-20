@@ -33,6 +33,7 @@ from quantum.repositories import users as users_repo
 from quantum.repositories import moderation as moderation_repo
 from quantum.repositories import applications as applications_repo
 from quantum.ai import AIService
+from github_sync import GitHubSync
 from quantum.ai.cache import count_cache, clear_cache
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -137,6 +138,17 @@ else:
         "_ym_isad": os.getenv("CS2RED_YM_ISAD", ""),
         "ymex": os.getenv("CS2RED_YMEX", ""),
     }.items() if v}
+
+
+# GitHub-синк данных бота (опционально: требует GITHUB_TOKEN + GITHUB_REPO).
+github_sync = GitHubSync(
+    token=os.getenv("GITHUB_TOKEN", ""),
+    repo=os.getenv("GITHUB_REPO", ""),
+    branch=os.getenv("GITHUB_BRANCH", "main") or "main",
+    base_path=os.getenv("GITHUB_BASE_PATH", ""),
+    commit_prefix="bot data",
+    skip_render=True,
+)
 
 CS2RED_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -1391,6 +1403,19 @@ class MyBot(commands.Bot):
             log("✅ SQLite готов (init_db + миграция)")
             await api.start()
             log("✅ API session ready")
+
+            # GitHub-синк данных (если настроен): подтягиваем отсутствующие файлы.
+            if github_sync.enabled and api.session:
+                try:
+                    _saved = await github_sync.pull(
+                        api.session,
+                        ["links.json", "players_db.json", "users_db.json",
+                         "moderators.json", "votes.json", "seen.json"],
+                        DATA_DIR,
+                    )
+                    log(f"🐙 GitHub-синк: получено {len(_saved)} файлов")
+                except Exception as e:
+                    log(f"⚠️ GitHub pull: {type(e).__name__}: {e}")
 
             global ai_service
             ai_service = AIService(api.session, data_dir=str(DATA_DIR))
@@ -3218,10 +3243,27 @@ async def build_panel_health_embed() -> discord.Embed:
     e.add_field(name="📡 cs2red", value=f"HTTP: {last_status}" if last_status else "нет данных",
                 inline=True)
 
-    # GitHub-синк в script.py не подключён — честно сообщаем.
-    e.add_field(name="🐙 GitHub", value="Синк не подключён", inline=True)
+    # GitHub-синк
+    e.add_field(name="🐙 GitHub", value=_github_status(), inline=True)
     e.set_footer(text="Quantum • Панель администратора")
     return e
+
+
+def _github_status() -> str:
+    """Формирует строку статуса GitHub-синка для панели."""
+    if not github_sync.enabled:
+        missing = []
+        if not getattr(github_sync, "token", ""):
+            missing.append("GITHUB_TOKEN")
+        if not getattr(github_sync, "repo", ""):
+            missing.append("GITHUB_REPO")
+        return f"Синк не настроен (нет {', '.join(missing)})"
+    state = ("ошибка: " + (github_sync.last_error or "")[:80]
+             if github_sync.last_error else "работает")
+    return (f"статус: {state}\n"
+            f"репозиторий: {getattr(github_sync, 'repo', '?')}\n"
+            f"ветка: {getattr(github_sync, 'branch', '?')}\n"
+            f"отправлено: {github_sync.pushed_total}, получено: {github_sync.pulled_total}")
 
 
 async def build_panel_embed() -> discord.Embed:
@@ -3275,7 +3317,7 @@ async def build_panel_embed() -> discord.Embed:
     e.add_field(name="📖 Правила", value="\n".join(rules_parts), inline=False)
 
     # GitHub
-    e.add_field(name="🐙 GitHub", value="Синк не подключён", inline=True)
+    e.add_field(name="🐙 GitHub", value=_github_status(), inline=True)
 
     # Что делают кнопки
     btns = (
