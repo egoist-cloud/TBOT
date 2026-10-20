@@ -5,6 +5,10 @@
   * читает rules.txt из DATA_DIR (по умолчанию рядом с ботом);
   * разбивает текст на «документы» — отдельные пункты вида «2.2. ...»;
   * индексирует их токенами и ищет по BM25-скорингу;
+  * нормализует текст: нижний регистр, снятие пунктуации, транслит
+    кириллицы -> латиницы (чтобы «ультра» совпадало с «ULTRA» и т.п.);
+  * если в запросе есть номер пункта (например «2.2») — в первую очередь
+    ищет точное совпадение по номеру, а не по словам;
   * отдаёт топ-k найденных пунктов с их id и текстом.
 
 Без внешних сервисов и зависимостей.
@@ -23,17 +27,98 @@ CLAUSE_RE = re.compile(
     r"^\s*(?:п\.?\s*|пункт\s*)?(\d{1,2}(?:\.\d{1,2}){1,3})\s*[.)\-:]?\s*(.*)$",
     re.IGNORECASE,
 )
-# Внутри строки: токены для индекса
-TOKEN_RE = re.compile(r"[а-яёa-z0-9]{3,}", re.IGNORECASE)
+# Номер пункта внутри строки/запроса: «2.2», «п. 2.2», «пункт 2.2».
+CLAUSE_NUM_RE = re.compile(r"\b(\d{1,2}(?:\.\d{1,2}){1,3})\b")
+# Токены для индекса (после транслитерации — только a-z0-9)
+TOKEN_RE = re.compile(r"[a-z0-9]{3,}")
 
 _DEFAULT_RULES_FILE = "rules.txt"
 
 _K1 = 1.5
 _B = 0.75
 
+# Кириллица -> латиница (транслитерация для поиска по русским словам и их
+# латинским аналогам «ультра»->«ultra», «паблик»->«public»).
+
+_TRANS = {
+    ord("а"): "a", ord("б"): "b", ord("в"): "v", ord("г"): "g", ord("д"): "d",
+    ord("е"): "e", ord("ё"): "e", ord("ж"): "zh", ord("з"): "z", ord("и"): "i",
+    ord("й"): "i", ord("к"): "k", ord("л"): "l", ord("м"): "m", ord("н"): "n",
+    ord("о"): "o", ord("п"): "p", ord("р"): "r", ord("с"): "s", ord("т"): "t",
+    ord("у"): "u", ord("ф"): "f", ord("х"): "h", ord("ц"): "c", ord("ч"): "ch",
+    ord("ш"): "sh", ord("щ"): "sch", ord("ъ"): "", ord("ы"): "y", ord("ь"): "",
+    ord("э"): "e", ord("ю"): "iu", ord("я"): "ia",
+    ord("А"): "a", ord("Б"): "b", ord("В"): "v", ord("Г"): "g", ord("Д"): "d",
+    ord("Е"): "e", ord("Ё"): "e", ord("Ж"): "zh", ord("З"): "z", ord("И"): "i",
+    ord("Й"): "i", ord("К"): "k", ord("Л"): "l", ord("М"): "m", ord("Н"): "n",
+    ord("О"): "o", ord("П"): "p", ord("Р"): "r", ord("С"): "s", ord("Т"): "t",
+    ord("У"): "u", ord("Ф"): "f", ord("Х"): "h", ord("Ц"): "c", ord("Ч"): "ch",
+    ord("Ш"): "sh", ord("Щ"): "sch", ord("Ъ"): "", ord("Ы"): "y", ord("Ь"): "",
+    ord("Э"): "e", ord("Ю"): "iu", ord("Я"): "ia",
+}
+
+
+# Словарь частоупотребимых русских слов -> английских аналогов (для поиска
+# «паблик» ~ PUBLIC, «ультра» ~ ULTRA и т.д.). Применяется до транслитерации.
+
+_WORD_MAP = {
+    "паблик": "public", "паблике": "public", "паблике": "public",
+    "паблик": "public", "паблика": "public", "паблика": "public",
+    "ультра": "ultra", "ультры": "ultra", "ультре": "ultra",
+    "экстрим": "extreme", "экстрима": "extreme",
+    "медиум": "medium", "медиума": "medium",
+    "базовый": "basic", "базовая": "basic", "базового": "basic",
+    "лайт": "lite", "лайте": "lite",
+    "минигейм": "minigame", "минигейма": "minigame",
+    "мини-гейм": "minigame",
+    "маньяк": "maniac", "маньяка": "maniac",
+    "тюрьма": "jail", "тюрьме": "jail", "тюрьмы": "jail",
+    "арена": "arena", "арены": "arena", "арене": "arena",
+    "ввдм": "wwdm",
+    "авп": "awp",
+    "сноусуп": "smoke", "дым": "smoke",
+    "паутинка": "web", "паутинки": "web", "паутинку": "web",
+    "граб": "grab", "граба": "grab",
+    "флеш": "flash", "шприц": "syringe",
+    "привилегия": "privilege", "привилегии": "privilege",
+    "привилегий": "privilege",
+    "правило": "rule", "правила": "rule", "правил": "rule", "правилам": "rule",
+    "бан": "ban", "баны": "ban", "блокировка": "ban", "блокировку": "ban",
+    "мут": "mute", "мута": "mute",
+    "чит": "cheat", "читы": "cheat", "читов": "cheat", "софт": "cheat",
+    "скрипт": "script", "скрипты": "script",
+}
+
+
+def _apply_word_map(text: str) -> str:
+    """Заменяет русские слова их английскими аналогами (до транслитерации).
+
+    Сортировка по убыванию длины ключа: чтобы «паблике» заменялось целиком,
+    а не как «паблик» + «е».
+    """
+    if not text:
+        return text
+    low = (text or "").lower()
+    for ru, en in sorted(_WORD_MAP.items(), key=lambda kv: len(kv[0]), reverse=True):
+        low = low.replace(ru, en)
+    return low
+
+
+def normalize_token(text: str) -> str:
+    """Нижний регистр + словесные синонимы + транслит кириллицы -> латиницы."""
+    if not text:
+        return ""
+    return _apply_word_map(text).translate(_TRANS)
+
+
+def _normalize_text(text: str) -> str:
+    """Нормализует текст для токенизации: синонимы + транслит."""
+    t = _apply_word_map(text)
+    return t.translate(_TRANS)
+
 
 def _tokenize(text: str) -> list[str]:
-    return [t.lower() for t in TOKEN_RE.findall(text or "")]
+    return TOKEN_RE.findall(_normalize_text(text))
 
 
 def _load_rules_text(data_dir) -> str:
@@ -86,6 +171,8 @@ class RulesIndex:
         self._docs: list[dict] = []
         self._tokens: list[Counter] = []
         self._df: Counter = Counter()
+        # карта id -> normalized(text) для поиска по номеру
+        self._by_num: dict[str, str] = {}
         self._loaded: float = 0.0
         self._lock = threading.Lock()
 
@@ -95,7 +182,9 @@ class RulesIndex:
         docs = _split_rules(text)
         tokens = []
         df: Counter = Counter()
+        by_num: dict[str, str] = {}
         for doc in docs:
+            by_num[doc["id"]] = doc["text"]
             toks = _tokenize(doc["text"])
             tokens.append(Counter(toks))
             df.update(set(toks))
@@ -103,21 +192,55 @@ class RulesIndex:
             self._docs = docs
             self._tokens = tokens
             self._df = df
+            self._by_num = by_num
         return len(docs)
 
     @property
     def ready(self) -> bool:
         return bool(self._docs)
 
+    def lookup_number(self, query: str):
+        """Если в запросе есть номер пункта (2.2) — возвращает (id, text) или None."""
+        m = CLAUSE_NUM_RE.search(query or "")
+        if not m:
+            return None
+        num = m.group(1)
+        with self._lock:
+            text = self._by_num.get(num)
+        if text is not None:
+            return (num, text)
+        return None
+
     def search(self, query: str, top_k: int = 5) -> list[dict]:
-        """Возвращает [{id, text, score}] — топ пунктов по BM25."""
+        """Возвращает [{id, text, score}] — топ пунктов по BM25.
+
+        Если в запросе есть номер пункта — он возвращается первым
+        (точное совпадение), даже если словесного скоринга нет.
+        """
+        # Приоритет: точный номер.
+        num_hit = self.lookup_number(query)
+        if num_hit is not None:
+            num_id, num_text = num_hit
+            # Может быть нужно вернуть только этот пункт? Но чтобы поддержать
+            # контекст, вернём его первым, а дальше — словесные совпадения.
+            # Если у запроса нет внятных слов кроме номера — возвращаем только его.
+
         with self._lock:
             docs = list(self._docs)
             tokens = list(self._tokens)
             df = dict(self._df)
         q_tokens = _tokenize(query)
+        # Если в запросе только номер и ничего более внятного (или номер найден
+        # точно) — отдаём этот пункт сразу.
+        if num_hit is not None and not q_tokens:
+            return [{"id": num_hit[0], "text": num_hit[1], "score": 1e9}]
+
+        base: list[dict] = []
+        if num_hit is not None:
+            base = [{"id": num_hit[0], "text": num_hit[1], "score": 1e9}]
+
         if not q_tokens or not docs:
-            return []
+            return base
 
         n = len(docs)
         avgdl = sum(sum(c.values()) for c in tokens) / n if n else 0.0
@@ -141,7 +264,15 @@ class RulesIndex:
                 scored.append({"id": doc["id"], "text": doc["text"], "score": score})
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:top_k]
+
+        # Не дублируем номер, если он уже есть в base.
+        existing_ids = {d["id"] for d in base}
+        for item in scored:
+            if item["id"] not in existing_ids:
+                base.append(item)
+            if len(base) >= top_k:
+                break
+        return base[:top_k]
 
 
 def search_rules(query: str, top_k: int = 5, index: RulesIndex | None = None) -> list[dict]:
