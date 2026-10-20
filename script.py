@@ -2332,18 +2332,18 @@ def _build_ai_embed(res: dict, query: str) -> discord.Embed:
         timestamp=now_utc(),
     )
     embed.add_field(name="Вопрос", value=query[:1024], inline=False)
-    # Markdown в ответе ИИ Embed поддерживает; лимит поля — 1024 символа,
-    # поэтому режем ответ на части при необходимости.
+
     answer = response or "_пустой ответ_"
+    # Обрезаем слишком длинные ответы (суммарный лимит Embed ~4096 символов).
+    if len(answer) > 4096:
+        answer = answer[:4093] + "..."
+
+    # Markdown в ответе ИИ Embed поддерживает; лимит поля — 1024 символа,
+    # поэтому режем ответ на поля по 1024.
     if len(answer) <= 1024:
         embed.add_field(name="Ответ", value=answer, inline=False)
     else:
-        # Разбиваем на чанки по 1024, не разрывая переносы строк.
-        chunks = []
-        cur = answer
-        while cur:
-            chunks.append(cur[:1024])
-            cur = cur[1024:]
+        chunks = [answer[i:i + 1024] for i in range(0, len(answer), 1024)]
         embed.add_field(name=f"Ответ (часть 1/{len(chunks)})",
                         value=chunks[0], inline=False)
         for idx, chunk in enumerate(chunks[1:], start=2):
@@ -2353,7 +2353,7 @@ def _build_ai_embed(res: dict, query: str) -> discord.Embed:
     if rules_used:
         embed.add_field(
             name="Основание",
-            value="Правила " + ", ".join(rules_used),
+            value="Правила: " + ", ".join(rules_used),
             inline=False,
         )
 
