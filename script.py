@@ -1348,7 +1348,12 @@ async def link_all(i):
     try:
         f = data_path("mass_links.json")
         if not f.exists():
-            await safe_send(i.followup, "❌ Файл `mass_links.json` не найден.", ephemeral=False)
+            await safe_send(
+                i.followup,
+                "❌ Файл `mass_links.json` не найден. "
+                "Загрузите его в корень проекта (DATA_DIR) и повторите.",
+                ephemeral=False,
+            )
             return
 
         try:
@@ -2313,6 +2318,26 @@ async def before_auto_sync():
 # ============================================================
 # ИИ: /ask, !ask, /rules, !rules
 # ============================================================
+def _parse_ai_response(response: str) -> dict:
+    """Разбирает ответ ИИ формата ОТВЕТ/НАКАЗАНИЕ/ОСНОВАНИЕ."""
+    result = {"answer": "", "punishment": "", "basis": ""}
+    if not response:
+        return result
+    for line in response.splitlines():
+        line = line.strip()
+        low = line.lower()
+        if low.startswith("ответ:"):
+            result["answer"] = line.split(":", 1)[1].strip()
+        elif low.startswith("наказание:"):
+            result["punishment"] = line.split(":", 1)[1].strip()
+        elif low.startswith("основание:"):
+            result["basis"] = line.split(":", 1)[1].strip()
+    if not result["answer"]:
+        # ИИ не следовал шаблону — кладём весь ответ как есть в поле Ответ.
+        result["answer"] = response
+    return result
+
+
 def _build_ai_embed(res: dict, query: str) -> discord.Embed:
     """Собирает красивый Embed с ответом ИИ."""
     response = res.get("response") or ""
@@ -2328,34 +2353,44 @@ def _build_ai_embed(res: dict, query: str) -> discord.Embed:
 
     embed = discord.Embed(
         title=title,
-        color=0x2B2D31,
+        color=0x000000,
         timestamp=now_utc(),
     )
     embed.add_field(name="Вопрос", value=query[:1024], inline=False)
 
-    answer = response or "_пустой ответ_"
-    # Обрезаем слишком длинные ответы (суммарный лимит Embed ~4096 символов).
-    if len(answer) > 4096:
-        answer = answer[:4093] + "..."
+    parsed = _parse_ai_response(response)
 
-    # Markdown в ответе ИИ Embed поддерживает; лимит поля — 1024 символа,
-    # поэтому режем ответ на поля по 1024.
-    if len(answer) <= 1024:
-        embed.add_field(name="Ответ", value=answer, inline=False)
+    # Значения полей с ограничением по длине (1024 на поле).
+    def _field(value: str) -> str:
+        if not value or value == "-":
+            return "_— нет данных_"
+        if len(value) > 4090:
+            return value[:4087] + "..."
+        return value
+
+    answer = parsed.get("answer") or response or "_пустой ответ_"
+    punishment = parsed.get("punishment")
+    basis = parsed.get("basis") or ("Правила: " + ", ".join(rules_used) if rules_used else "")
+
+    # Поле «Ответ» — может быть длинным, режем на части по 1024.
+    answer_text = _field(answer)
+    if len(answer_text) <= 1024:
+        embed.add_field(name="Ответ", value=answer_text, inline=False)
     else:
-        chunks = [answer[i:i + 1024] for i in range(0, len(answer), 1024)]
+        chunks = [answer_text[i:i + 1024] for i in range(0, len(answer_text), 1024)]
         embed.add_field(name=f"Ответ (часть 1/{len(chunks)})",
                         value=chunks[0], inline=False)
         for idx, chunk in enumerate(chunks[1:], start=2):
             embed.add_field(name=f"Ответ (часть {idx}/{len(chunks)})",
                             value=chunk, inline=False)
 
-    if rules_used:
-        embed.add_field(
-            name="Основание",
-            value="Правила: " + ", ".join(rules_used),
-            inline=False,
-        )
+    embed.add_field(name="Наказание", value=_field(punishment), inline=False)
+
+    if basis:
+        basis_text = _field(basis)
+        if not basis_text.startswith("Правила") and not basis_text.startswith("П.П"):
+            basis_text = "П.П. " + basis_text
+        embed.add_field(name="Основание", value=basis_text, inline=False)
 
     footer = []
     if provider:
