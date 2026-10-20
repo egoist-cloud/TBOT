@@ -176,8 +176,18 @@ class RulesIndex:
         self._loaded: float = 0.0
         self._lock = threading.Lock()
 
+        # Предвычисленные для BM25 параметры (читаются только при load()).
+        self._n = 0                 # число документов
+        self._avgdl = 0.0           # средняя длина документа (в токенах)
+        self._doc_len = []          # длина каждого документа (в токенах)
+        self._idf_cache: dict[str, float] = {}  # слово -> idf (для всех слов)
+
     def load(self) -> int:
-        """Перечитывает rules.txt (идемпотентно). Возвращает число пунктов."""
+        """Перечитывает rules.txt (идемпотентно). Возвращает число пунктов.
+
+        При загрузке предвычисляет idf для ВСЕХ слов и удерживает их в памяти,
+        чтобы поиск (search) не пересчитывал статистику на каждый запрос.
+        """
         text = _load_rules_text(self.data_dir)
         docs = _split_rules(text)
         tokens = []
@@ -188,11 +198,24 @@ class RulesIndex:
             toks = _tokenize(doc["text"])
             tokens.append(Counter(toks))
             df.update(set(toks))
+
+        n = len(docs)
+        doc_len = [sum(c.values()) for c in tokens]
+        avgdl = (sum(doc_len) / n) if n else 0.0
+        # Предвычисляем idf для всех встречающихся слов.
+        idf_cache: dict[str, float] = {}
+        for word, df_t in df.items():
+            idf_cache[word] = math.log(1 + (n - df_t + 0.5) / (df_t + 0.5))
+
         with self._lock:
             self._docs = docs
             self._tokens = tokens
             self._df = df
             self._by_num = by_num
+            self._n = n
+            self._avgdl = avgdl
+            self._doc_len = doc_len
+            self._idf_cache = idf_cache
         return len(docs)
 
     @property
@@ -228,7 +251,10 @@ class RulesIndex:
         with self._lock:
             docs = list(self._docs)
             tokens = list(self._tokens)
-            df = dict(self._df)
+            doc_len = list(self._doc_len)
+            n = self._n
+            avgdl = self._avgdl
+            idf_cache = dict(self._idf_cache)
         q_tokens = _tokenize(query)
         # Если в запросе только номер и ничего более внятного (или номер найден
         # точно) — отдаём этот пункт сразу.
@@ -242,24 +268,18 @@ class RulesIndex:
         if not q_tokens or not docs:
             return base
 
-        n = len(docs)
-        avgdl = sum(sum(c.values()) for c in tokens) / n if n else 0.0
-        idf_cache: dict[str, float] = {}
-        for t in set(q_tokens):
-            df_t = df.get(t, 0)
-            idf_cache[t] = math.log(1 + (n - df_t + 0.5) / (df_t + 0.5))
-
+        # Используем предвычисленные idf и среднюю длину — без пересчёта.
         scored = []
         for idx, doc in enumerate(docs):
             counter = tokens[idx]
-            dl = sum(counter.values())
+            dl = doc_len[idx]
             score = 0.0
             for t in set(q_tokens):
                 tf = counter.get(t, 0)
                 if tf == 0:
                     continue
                 denom = tf + _K1 * (1 - _B + _B * (dl / avgdl if avgdl else 1.0))
-                score += idf_cache[t] * (_K1 + 1) * tf / denom
+                score += idf_cache.get(t, 0.0) * (_K1 + 1) * tf / denom
             if score > 0:
                 scored.append({"id": doc["id"], "text": doc["text"], "score": score})
 
