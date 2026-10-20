@@ -2313,14 +2313,56 @@ async def before_auto_sync():
 # ============================================================
 # ИИ: /ask, !ask, /rules, !rules
 # ============================================================
-def _ai_summary(res: dict, query: str) -> str:
-    """Оформляет ответ ИИ + указывает использованные правила."""
-    rules_part = ""
-    if res.get("rules_used"):
-        rules_part = f"\n**Основание:** правила " + ", ".join(res["rules_used"]) + "."
-    cached_mark = " *(из кэша)*" if res.get("cached") else ""
-    provider = f" *(провайдер: {res.get('provider')})*" if res.get("provider") else ""
-    return f"{res['response']}{rules_part}{cached_mark}{provider}"
+def _build_ai_embed(res: dict, query: str) -> discord.Embed:
+    """Собирает красивый Embed с ответом ИИ."""
+    response = res.get("response") or ""
+    rules_used = res.get("rules_used") or []
+    cached = res.get("cached")
+    provider = res.get("provider") or ""
+
+    # Заголовок зависит от того, отвечали ли по конкретным правилам.
+    if rules_used:
+        title = "📖 Разбор правил"
+    else:
+        title = "💡 Ответ на вопрос"
+
+    embed = discord.Embed(
+        title=title,
+        color=0x2B2D31,
+        timestamp=now_utc(),
+    )
+    embed.add_field(name="Вопрос", value=query[:1024], inline=False)
+    # Markdown в ответе ИИ Embed поддерживает; лимит поля — 1024 символа,
+    # поэтому режем ответ на части при необходимости.
+    answer = response or "_пустой ответ_"
+    if len(answer) <= 1024:
+        embed.add_field(name="Ответ", value=answer, inline=False)
+    else:
+        # Разбиваем на чанки по 1024, не разрывая переносы строк.
+        chunks = []
+        cur = answer
+        while cur:
+            chunks.append(cur[:1024])
+            cur = cur[1024:]
+        embed.add_field(name=f"Ответ (часть 1/{len(chunks)})",
+                        value=chunks[0], inline=False)
+        for idx, chunk in enumerate(chunks[1:], start=2):
+            embed.add_field(name=f"Ответ (часть {idx}/{len(chunks)})",
+                            value=chunk, inline=False)
+
+    if rules_used:
+        embed.add_field(
+            name="Основание",
+            value="Правила " + ", ".join(rules_used),
+            inline=False,
+        )
+
+    footer = []
+    if provider:
+        footer.append(f"Провайдер: {provider}")
+    footer.append("Из кэша: Да" if cached else "Из кэша: Нет")
+    embed.set_footer(text=" | ".join(footer))
+    return embed
 
 
 def _format_ai_error(res: dict) -> str:
@@ -2343,8 +2385,8 @@ async def ask(i, question: str):
     if not res.get("ok"):
         await safe_send(i.followup, _format_ai_error(res), ephemeral=False)
         return
-    text = _ai_summary(res, question)
-    await safe_send(i.followup, text[:1900], ephemeral=False)
+    embed = _build_ai_embed(res, question)
+    await safe_send(i.followup, embed=embed, ephemeral=False)
 
 
 @bot.tree.command(name="rules", description="Показать правила клана")
@@ -2382,7 +2424,8 @@ async def ask_legacy(ctx, *, question: str):
     if not res.get("ok"):
         await safe_send(ctx.channel, _format_ai_error(res))
         return
-    await safe_send(ctx.channel, _ai_summary(res, question)[:1900])
+    embed = _build_ai_embed(res, question)
+    await safe_send(ctx.channel, embed=embed)
 
 
 @bot.command(name="rules")
