@@ -1683,6 +1683,12 @@ async def sync_all(i):
     await i.response.defer(ephemeral=False)
     if not await _admin_guard(i):
         return
+    await run_sync_all(i)
+
+
+async def run_sync_all(i):
+    """Полная логика синхронизации ролей (используется командой /sync_all
+    и кнопкой «Синхронизация» в панели). Ожидает, что defer уже вызван."""
     try:
         links = await links_repo.get_all_links()
         if not links:
@@ -1909,7 +1915,12 @@ async def auto_link(i):
     await i.response.defer(ephemeral=False)
     if not await _admin_guard(i):
         return
+    await run_auto_link(i)
 
+
+async def run_auto_link(i):
+    """Полная логика авто-привязки по никам (используется командой /auto_link
+    и кнопкой «Привязать всех» в панели). Ожидает, что defer уже вызван."""
     # Проверяем, что куки вообще заданы.
     if not CS2RED_COOKIES:
         await safe_send(i.followup,
@@ -3158,50 +3169,26 @@ class PanelView(discord.ui.View):
     async def panel_link_all(self, interaction, button):
         button.disabled = True
         await interaction.response.defer(ephemeral=False)
-        guild = interaction.guild
-        users = [m for m in guild.members if not m.bot]
-        linked = await links_repo.get_all_links()
-        already = len(linked)
-        to_process = [m for m in users if str(m.id) not in linked]
-        done = 0
-        await interaction.followup.send(f"🔄 Привязать всех: в БД {already}, "
-                                        f"непривязанных {len(to_process)}...",
-                                        ephemeral=False)
-        for m in to_process:
-            nick = (m.display_name or "").strip()
-            if nick:
-                try:
-                    users_found = await api.cs2red_search_by_nick(nick)
-                    if users_found and len(users_found) == 1:
-                        sid = api.extract_steam64(users_found[0])
-                        if sid:
-                            await links_repo.add_link(m.id, sid)
-                            done += 1
-                except Exception:
-                    pass
-            await asyncio.sleep(api.RATE_LIMIT_SECONDS)
-        await interaction.followup.send(
-            f"✅ Привязано новых: {done}, уже было: {already}.", ephemeral=False)
+        # Полный запуск /auto_link (прогресс-бар, защита от 403/429).
+        try:
+            await run_auto_link(interaction)
+        except Exception as e:
+            log(f"⚠️ panel_link_all: {e}")
+            await safe_send(interaction.followup, f"❌ Ошибка: {str(e)[:200]}",
+                            ephemeral=False)
 
     @discord.ui.button(label="🔗 Синхронизация", style=discord.ButtonStyle.secondary,
                        custom_id="panel_sync", row=0)
     async def panel_sync(self, interaction, button):
         button.disabled = True
         await interaction.response.defer(ephemeral=False)
-        guild = interaction.guild
-        links = await links_repo.get_all_links()
-        res = []
-        for did, sid in links.items():
-            m = guild.get_member(int(did)) if str(did).isdigit() else None
-            if m is None:
-                res.append(f"⚠️ {did}: нет")
-                continue
-            res.append(await sync_role_by_id(guild, m, sid))
-            res.append(await sync_clan_role_by_id(guild, m, sid))
-            await asyncio.sleep(REQUEST_DELAY)
-        text = f"📊 Синхронизация ({len(res)}):\n" + "\n".join(res)
-        await safe_send(interaction.followup, text[:1900], title="🔗 Синхронизация",
-                        ephemeral=False)
+        # Полный запуск /sync_all (прогресс-бар, остановка при 403/429).
+        try:
+            await run_sync_all(interaction)
+        except Exception as e:
+            log(f"⚠️ panel_sync: {e}")
+            await safe_send(interaction.followup, f"❌ Ошибка: {str(e)[:200]}",
+                            ephemeral=False)
 
     @discord.ui.button(label="📖 Обновить правила", style=discord.ButtonStyle.secondary,
                        custom_id="panel_rules", row=1)
