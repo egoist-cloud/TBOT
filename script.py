@@ -1688,17 +1688,85 @@ async def sync_all(i):
         if not links:
             await safe_send(i.followup, "ℹ️ Пусто.", ephemeral=False)
             return
+
+        total = len(links)
+        processed = 0
         res = []
+        stopped = False
+        api.blocked_reason = ""
+
+        def _progress(processed_: int, total_: int) -> discord.Embed:
+            pct = int((processed_ / total_) * 100) if total_ else 0
+            e = discord.Embed(
+                title="🔗 Синхронизация ролей",
+                color=0x000000,
+                timestamp=now_utc(),
+            )
+            e.add_field(name="Обработано", value=f"{processed_} из {total_}", inline=True)
+            e.add_field(name="Прогресс", value=f"{pct}%", inline=True)
+            return e
+
+        # Промежуточное сообщение — пользователь видит, что процесс идёт.
+        msg = await i.followup.send(embed=_progress(0, total), ephemeral=False)
+        last_update = 0.0
+
         for did, sid in links.items():
-            m = i.guild.get_member(int(did))
+            if stopped:
+                break
+            processed += 1
+            m = i.guild.get_member(int(did)) if str(did).isdigit() else None
             if m is None:
                 res.append(f"⚠️ {did}: нет")
-                continue
-            res.append(await sync_role_by_id(i.guild, m, sid))
-            res.append(await sync_clan_role_by_id(i.guild, m, sid))
+            else:
+                r1 = await sync_role_by_id(i.guild, m, sid)
+                if api.blocked_reason in ("403", "429"):
+                    res.append(f"⛔ остановлено: {api.blocked_reason} ({r1})")
+                    stopped = True
+                else:
+                    res.append(r1)
+                    r2 = await sync_clan_role_by_id(i.guild, m, sid)
+                    if api.blocked_reason in ("403", "429"):
+                        res.append(f"⛔ остановлено: {api.blocked_reason} ({r2})")
+                        stopped = True
+                    else:
+                        res.append(r2)
+
             await asyncio.sleep(REQUEST_DELAY)
-        text = f"📊 {len(res)}\n\n" + "\n".join(res)
-        await safe_send(i.followup, text[:1900], ephemeral=False)
+
+            # Прогресс не чаще раза в 10 секунд.
+            now = time.time()
+            if now - last_update >= 10.0:
+                last_update = now
+                try:
+                    await msg.edit(embed=_progress(processed, total))
+                except Exception:
+                    pass
+
+        # Если остановились из-за 403/429 — выводим понятное сообщение.
+        if api.blocked_reason in ("403", "429"):
+            reason = api.blocked_reason
+            await safe_send(
+                i.followup,
+                ("❌ Ошибка авторизации (403). Проверьте куки на cs2red."
+                 if reason == "403"
+                 else "❌ Сайт cs2red временно заблокировал запросы (429). "
+                      "Подождите 5 минут."),
+                ephemeral=False,
+            )
+
+        text = f"📊 Синхронизация ({len(res)}):\n" + "\n".join(res)
+        # Обновляем итоговый Embed в том же сообщении.
+        final = discord.Embed(
+            title="🔗 Синхронизация ролей",
+            description=text[:4000] or "—",
+            color=0x57F287 if not stopped else 0xFEE75C,
+            timestamp=now_utc(),
+        )
+        try:
+            await msg.edit(embed=final)
+        except Exception:
+            await safe_send(i.followup, text[:1900], title="🔗 Синхронизация",
+                            ephemeral=False)
         await log_to_channel(i.client, text)
     except Exception as e:
         await log_error(i.client, "/sync_all", e)
