@@ -1777,8 +1777,25 @@ async def auto_link(i):
         skipped_none = []
         errors = []
 
-        # Фоновая задача прогресса — отправляем один раз в 20 итераций.
-        last_progress = 0
+        # --- Стартовый Embed с прогрессом ---
+        def _progress_embed(processed_: int, total_: int, added_: int) -> discord.Embed:
+            pct = int((processed_ / total_) * 100) if total_ else 0
+            e = discord.Embed(
+                title="🔗 Авто-привязка по никам",
+                color=0x000000,
+                timestamp=now_utc(),
+            )
+            e.add_field(name="Обработано", value=f"{processed_} из {total_}", inline=True)
+            e.add_field(name="Прогресс", value=f"{pct}%", inline=True)
+            e.add_field(name="✅ Привязано", value=str(added_), inline=True)
+            return e
+
+        msg = await i.followup.send(
+            embed=_progress_embed(0, total, 0), ephemeral=False)
+
+        # Обновляем прогресс не чаще, чем раз в 10 секунд.
+        last_update = 0.0
+        last_progress_update = 0  # сколько обработано на момент последнего апдейта
 
         for m in unlinked:
             processed += 1
@@ -1793,12 +1810,14 @@ async def auto_link(i):
                     reason = api.blocked_reason
                     if reason == "403" or getattr(api, "last_status", None) == 403:
                         errors.append("403: авторизация на cs2red (куки) — команда прервана")
+                        await msg.edit(embed=_progress_embed(processed, total, len(added)))
                         await safe_send(i.followup,
                                         "❌ Ошибка авторизации (403). Проверьте куки.",
                                         ephemeral=False)
                         break
                     if reason == "429":
                         errors.append("429: сайт cs2red временно заблокировал запросы")
+                        await msg.edit(embed=_progress_embed(processed, total, len(added)))
                         await safe_send(
                             i.followup,
                             "❌ Сайт cs2red временно заблокировал запросы (429). "
@@ -1807,6 +1826,7 @@ async def auto_link(i):
                         break
                     if reason:
                         errors.append(f"{reason}: ошибка сервера cs2red — команда прервана")
+                        await msg.edit(embed=_progress_embed(processed, total, len(added)))
                         await safe_send(i.followup,
                                         f"❌ Ошибка сервера cs2red ({reason}). "
                                         "Повторите позже.",
@@ -1830,15 +1850,18 @@ async def auto_link(i):
             # задержка, чтобы не забанили за флуд запросами
             await asyncio.sleep(api.RATE_LIMIT_SECONDS)
 
-            if processed - last_progress >= 20:
-                last_progress = processed
+            # Обновляем Embed раз в 10 секунд (или каждые ~5 человек — при
+            # задержке 2.5с это совпадает по времени). Не обновляем на каждом шаге.
+            now = time.time()
+            if now - last_update >= 10.0:
+                last_update = now
+                last_progress_update = processed
                 try:
-                    await safe_send(i.followup,
-                                    f"⏳ Прогресс: {processed}/{total}...",
-                                    ephemeral=False)
+                    await msg.edit(embed=_progress_embed(processed, total, len(added)))
                 except Exception:
                     pass
 
+        # --- Финальный отчёт ---
         embed = discord.Embed(
             title="🔗 Авто-привязка по никам",
             color=0x57F287 if not errors else 0xFEE75C,
@@ -1862,7 +1885,11 @@ async def auto_link(i):
             embed.add_field(name="Ошибки", value="\n".join(errors[:10]), inline=False)
         embed.set_footer(text=f"Выполнил: {i.user.display_name}")
 
-        await safe_send(i.followup, embed=embed, ephemeral=False)
+        # Обновим итоговый Embed в том же сообщении.
+        try:
+            await msg.edit(embed=embed)
+        except Exception:
+            await safe_send(i.followup, embed=embed, ephemeral=False)
         await log_to_channel(i.client,
             f"🔗 /auto_link: привязано {len(added)}, неоднозначно "
             f"{len(skipped_ambigu)}, не найдено {len(skipped_none)}, ошибок {len(errors)}")
