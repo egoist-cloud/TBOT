@@ -240,12 +240,72 @@ async def _rate_limit_send():
         _send_timestamps.append(time.time())
 
 
+def _embed_black(title: str = "", description: str = "") -> discord.Embed:
+    """Универсальный чёрный Embed для ответов бота."""
+    embed = discord.Embed(color=0x000000)
+    if title:
+        embed.title = title
+    if description:
+        embed.description = description
+    embed.set_footer(text="Quantum")
+    return embed
+
+
+def _split_text_embeds(title: str, text: str, limit: int = 4000) -> list:
+    """Разбивает длинный текст на несколько чёрных Embeds по ~4000 символов."""
+    text = text or ""
+    if not text:
+        return [_embed_black(title, "")]
+    chunks = []
+    for i in range(0, len(text), limit):
+        chunk = text[i:i + limit]
+        if i > 0:
+            chunks.append(_embed_black(f"{title} (часть {i // limit + 1})", chunk))
+        else:
+            chunks.append(_embed_black(title, chunk))
+    return chunks or [_embed_black(title, "")]
+
+
 async def safe_send(target, *args, retries: int = 5, **kwargs):
     """
     Отправка с retry. Уважает:
     - Discord 429 (rate-limit) — ждёт retry_after
     - Cloudflare 429 (HTML-заглушка) — ждёт 90 секунд
+
+    Любой переданный обычный текст (без embed=/content=/view=)
+    автоматически оборачивается в чёрный Embed (color=0x000000).
+    Длинный текст разбивается на несколько Embeds.
     """
+    # Обёртка текста в чёрный Embed, если не задан embed/content/view/file.
+    has_embed = "embed" in kwargs or "embeds" in kwargs
+    has_content = "content" in kwargs
+    has_rich = has_embed or has_content or "view" in kwargs or "files" in kwargs
+    if not has_rich and args and isinstance(args[0], str):
+        text = args[0]
+        rest = args[1:]
+        kwargs_backup = dict(kwargs)
+        # Длинный текст разбиваем на несколько embeds.
+        if len(text) > 4000:
+            embeds = _split_text_embeds("📊 Результат", text)
+            for e in embeds:
+                e.color = 0x000000
+            return await _send_multi(target, retries, embeds, **kwargs_backup)
+        embed = _embed_black("", text)
+        kwargs["embed"] = embed
+        args = tuple(rest)
+
+    return await _safe_send_inner(target, retries, *args, **kwargs)
+
+
+async def _send_multi(target, retries, embeds, **kwargs):
+    """Отправляет список Embeds по одному (для длинных ответов)."""
+    for emb in embeds:
+        k = dict(kwargs)
+        k["embed"] = emb
+        await _safe_send_inner(target, retries, **k)
+
+
+async def _safe_send_inner(target, retries, *args, **kwargs):
     await _rate_limit_send()
     last_exc = None
     for attempt in range(retries):
