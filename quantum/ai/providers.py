@@ -102,9 +102,9 @@ class GeminiProvider(AIProvider):
     @property
     def _max_output(self) -> int:
         try:
-            return int(os.getenv(self.max_output_env, "900"))
+            return int(os.getenv(self.max_output_env, "2000"))
         except (TypeError, ValueError):
-            return 900
+            return 2000
 
     def _build_url(self) -> str:
         """URL эндпоинта; {model} в шаблоне подставляется моделью."""
@@ -229,9 +229,9 @@ class _OpenAICompatProvider(AIProvider):
     @property
     def _max_output(self) -> int:
         try:
-            return int(os.getenv(self.max_output_env, "900"))
+            return int(os.getenv(self.max_output_env, "2000"))
         except (TypeError, ValueError):
-            return 900
+            return 2000
 
     async def complete(self, messages: list) -> str | None:
         if not self.enabled:

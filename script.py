@@ -3024,17 +3024,11 @@ def _build_ai_embed(res: dict, query: str) -> discord.Embed:
     if not is_vip:
         embed.add_field(name="Наказание", value=_field(punishment), inline=False)
 
-    if basis:
+    # Для VIP-пунктов поле «Основание» не выводим (это описание функций).
+    if basis and not is_vip:
         basis_text = _field(basis)
-        if is_vip:
-            # VIP: 7.8 (вместо П.П. 7.8)
-            if not basis_text.startswith("VIP") and not basis_text.startswith("Правила"):
-                # убираем префикс П.П., если ИИ его добавил
-                bare = basis_text.replace("П.П.", "").strip()
-                basis_text = "VIP: " + bare if bare else basis_text
-        else:
-            if not basis_text.startswith("Правила") and not basis_text.startswith("П.П"):
-                basis_text = "П.П. " + basis_text
+        if not basis_text.startswith("Правила") and not basis_text.startswith("П.П"):
+            basis_text = "П.П. " + basis_text
         embed.add_field(name="Основание", value=basis_text, inline=False)
 
     footer = []
