@@ -114,6 +114,7 @@ class GeminiProvider(AIProvider):
     async def complete(self, messages: list) -> str | None:
         if not self.enabled:
             return None
+        print(f"DEBUG: Gemini key = {self._api_key()[:5]}... (len={len(self._api_key())})")
         # Нативный формат Gemini: contents = список частей диалога.
         # Системную инструкцию выносим в system_instruction, остальное — parts.
         contents: list[dict] = []
