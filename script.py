@@ -1446,6 +1446,7 @@ class MyBot(commands.Bot):
 
             auto_sync.start()
             activity_tracker.start()
+            hourly_clan_sync.start()
             log("✅ Все 2 фоновых задачи запущены")
         except Exception as e:
             log(f"❌ ОШИБКА в setup_hook: {type(e).__name__}: {e}")
@@ -2946,6 +2947,61 @@ async def auto_sync_error(err):
 async def before_auto_sync():
     await bot.wait_until_ready()
     await asyncio.sleep(random.randint(0, 120))
+
+
+# ============================================================
+# ЧАСОВАЯ СИНХРОНИЗАЦИЯ КЛАНОВ
+# ============================================================
+@tasks.loop(hours=1)
+async def hourly_clan_sync():
+    """Автоматически, раз в час, обновляет роли кланов для всех привязанных игроков."""
+    try:
+        links = await links_repo.get_all_links()
+        guild = bot.get_guild(GUILD_ID)
+        if not links or guild is None:
+            return
+
+        checked = 0
+        updated = 0
+        # Реально обрабатываем кланы: проверим клан игрока через cs2red и применим роль.
+        for did, sid in links.items():
+            m = guild.get_member(int(did)) if str(did).isdigit() else None
+            if m is None:
+                continue
+
+            result = await sync_clan_role_by_id(guild, m, sid)
+            # Статус: "создана роль"/"выдан"/"уже в"/"клан снят"/"без клана" = изменений; 
+            # при отсутствии изменений тоже считаем проверенным.
+            checked += 1
+            if any(k in result for k in ("выдан", "создана", "клан снят", "уже в")):
+                updated += 1
+
+            await asyncio.sleep(api.RATE_LIMIT_SECONDS)
+
+            # Если cs2red начал блокировать (403/429) — прерываем цикл и ждём следующего запуска.
+            if api.blocked_reason in ("403", "429"):
+                reason = api.blocked_reason
+                log(f"⏰ hourly_clan_sync: cs2red блокирует ({reason}) — пауза до следующего цикла")
+                break
+
+        log(f"⏰ hourly_clan_sync: проверено {checked}, ролей обновлено {updated}")
+        # Логируем в канал, если он доступен.
+        if LOG_CHANNEL_ID:
+            ch = bot.get_channel(LOG_CHANNEL_ID)
+            if ch is not None:
+                try:
+                    await safe_send(ch, f"⏰ Кланы: проверено {checked}, обновлено {updated}.",
+                                    title="⏰ Часовая синхронизация кланов")
+                except Exception as e:
+                    log(f"⚠️ hourly_clan_sync лог: {e}")
+    except Exception as e:
+        await log_error(bot, "hourly_clan_sync", e)
+
+
+@hourly_clan_sync.before_loop
+async def before_hourly_clan_sync():
+    await bot.wait_until_ready()
+    await asyncio.sleep(random.randint(60, 180))
 
 
 # ============================================================
