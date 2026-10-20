@@ -1382,6 +1382,8 @@ class MyBot(commands.Bot):
 
             self.add_view(ApplicationManagement())
             log("✅ ApplicationManagement view добавлен")
+            self.add_view(PanelView())
+            log("✅ PanelView добавлен")
 
             auto_sync.start()
             activity_tracker.start()
@@ -2933,6 +2935,126 @@ async def ai_clear_cache_legacy(ctx):
     except Exception as e:
         await log_error(ctx.bot, "!ai_clear_cache", e)
         await safe_send(ctx.channel, f"❌ Ошибка: {str(e)[:200]}")
+
+
+# ============================================================
+# ПАНЕЛЬ УПРАВЛЕНИЯ (/panel)
+# ============================================================
+class PanelView(discord.ui.View):
+    """Панель управления ботом: кнопки запускают служебные действия."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🔄 Привязать всех", style=discord.ButtonStyle.primary,
+                       custom_id="panel_link_all", row=0)
+    async def panel_link_all(self, interaction, button):
+        button.disabled = True
+        await interaction.response.defer(ephemeral=False)
+        guild = interaction.guild
+        users = [m for m in guild.members if not m.bot]
+        linked = await links_repo.get_all_links()
+        already = len(linked)
+        to_process = [m for m in users if str(m.id) not in linked]
+        done = 0
+        await interaction.followup.send(f"🔄 Привязать всех: в БД {already}, "
+                                        f"непривязанных {len(to_process)}...",
+                                        ephemeral=False)
+        for m in to_process:
+            nick = (m.display_name or "").strip()
+            if nick:
+                try:
+                    users_found = await api.cs2red_search_by_nick(nick)
+                    if users_found and len(users_found) == 1:
+                        sid = api.extract_steam64(users_found[0])
+                        if sid:
+                            await links_repo.add_link(m.id, sid)
+                            done += 1
+                except Exception:
+                    pass
+            await asyncio.sleep(api.RATE_LIMIT_SECONDS)
+        await interaction.followup.send(
+            f"✅ Привязано новых: {done}, уже было: {already}.", ephemeral=False)
+
+    @discord.ui.button(label="🔗 Синхронизация", style=discord.ButtonStyle.secondary,
+                       custom_id="panel_sync", row=0)
+    async def panel_sync(self, interaction, button):
+        button.disabled = True
+        await interaction.response.defer(ephemeral=False)
+        guild = interaction.guild
+        links = await links_repo.get_all_links()
+        res = []
+        for did, sid in links.items():
+            m = guild.get_member(int(did)) if str(did).isdigit() else None
+            if m is None:
+                res.append(f"⚠️ {did}: нет")
+                continue
+            res.append(await sync_role_by_id(guild, m, sid))
+            res.append(await sync_clan_role_by_id(guild, m, sid))
+            await asyncio.sleep(REQUEST_DELAY)
+        text = f"📊 Синхронизация ({len(res)}):\n" + "\n".join(res)
+        await interaction.followup.send(text[:1900], title="🔗 Синхронизация",
+                                        ephemeral=False)
+
+    @discord.ui.button(label="📖 Обновить правила", style=discord.ButtonStyle.secondary,
+                       custom_id="panel_rules", row=1)
+    async def panel_rules(self, interaction, button):
+        button.disabled = True
+        await interaction.response.defer(ephemeral=False)
+        if ai_service is None:
+            await interaction.followup.send("❌ ИИ-сервис не инициализирован.",
+                                            ephemeral=False)
+            return
+        n = ai_service.rules.load()
+        await interaction.followup.send(f"✅ Правила обновлены: {n} пунктов.",
+                                        ephemeral=False)
+
+    @discord.ui.button(label="💚 Health", style=discord.ButtonStyle.success,
+                       custom_id="panel_health", row=1)
+    async def panel_health(self, interaction, button):
+        button.disabled = True
+        await interaction.response.defer(ephemeral=False)
+        # Компактная проверка систем.
+        try:
+            lines = []
+            lines.append(f"🟢 Аптайм: {int(time.time() - BOT_START_TIME)} сек.")
+            ws_ms = bot.latency * 1000
+            lines.append(f"🌐 WebSocket: {ws_ms:.0f} мс")
+            linked = await links_repo.count_all()
+            lines.append(f"🔗 Привязки в БД: {linked}")
+            if ai_service is not None:
+                n_prov = len(ai_service.providers)
+                rules = len(ai_service.rules._docs)
+                lines.append(f"🤖 ИИ: провайдеров {n_prov}, правил {rules}")
+            last_status = getattr(api, "last_status", None)
+            lines.append(f"📡 cs2red: {last_status}")
+            await interaction.followup.send(
+                "🩺 **Состояние системы**\n" + "\n".join(lines),
+                title="🩺 Состояние системы", ephemeral=False)
+        except Exception:
+            await interaction.followup.send("❌ Ошибка при проверке состояния.",
+                                            ephemeral=False)
+
+
+@bot.tree.command(name="panel", description="Панель управления ботом (админ)")
+@app_commands.default_permissions(administrator=True)
+async def panel(i):
+    await i.response.defer(ephemeral=False)
+    if not await _admin_guard(i):
+        return
+    embed = discord.Embed(
+        title="🛠 Панель управления",
+        description=("Админ-панель бота. Выберите действие:\n\n"
+                     "🔄 **Привязать всех** — массовая автопривязка по никам\n"
+                     "🔗 **Синхронизация** — синхронизировать роли всех привязанных\n"
+                     "📖 **Обновить правила** — перечитать rules.txt в базе знаний\n"
+                     "💚 **Health** — быстрая проверка состояния систем"),
+        color=0x000000,
+        timestamp=now_utc(),
+    )
+    embed.set_footer(text="Quantum • Панель администратора")
+    view = PanelView()
+    await safe_send(i.followup, embed=embed, view=view, ephemeral=False)
 
 
 # ============================================================
