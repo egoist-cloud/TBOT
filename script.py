@@ -2993,6 +2993,9 @@ def _build_ai_embed(res: dict, query: str) -> discord.Embed:
 
     parsed = _parse_ai_response(response)
 
+    # VIP-пункты: номера начинаются с 7.
+    is_vip = any(str(rid).startswith("7.") for rid in rules_used)
+
     # Значения полей с ограничением по длине (1024 на поле).
     def _field(value: str) -> str:
         if not value or value == "-":
@@ -3017,12 +3020,21 @@ def _build_ai_embed(res: dict, query: str) -> discord.Embed:
             embed.add_field(name=f"Ответ (часть {idx}/{len(chunks)})",
                             value=chunk, inline=False)
 
-    embed.add_field(name="Наказание", value=_field(punishment), inline=False)
+    # Для VIP-пунктов поле «Наказание» скрываем: это описание функций, а не санкция.
+    if not is_vip:
+        embed.add_field(name="Наказание", value=_field(punishment), inline=False)
 
     if basis:
         basis_text = _field(basis)
-        if not basis_text.startswith("Правила") and not basis_text.startswith("П.П"):
-            basis_text = "П.П. " + basis_text
+        if is_vip:
+            # VIP: 7.8 (вместо П.П. 7.8)
+            if not basis_text.startswith("VIP") and not basis_text.startswith("Правила"):
+                # убираем префикс П.П., если ИИ его добавил
+                bare = basis_text.replace("П.П.", "").strip()
+                basis_text = "VIP: " + bare if bare else basis_text
+        else:
+            if not basis_text.startswith("Правила") and not basis_text.startswith("П.П"):
+                basis_text = "П.П. " + basis_text
         embed.add_field(name="Основание", value=basis_text, inline=False)
 
     footer = []
