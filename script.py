@@ -2988,10 +2988,11 @@ async def _collect_admins(guild) -> list:
     return admins
 
 
-def _collect_bot_mods(guild) -> list:
+async def _collect_bot_mods(guild) -> list:
     """Модераторы бота (таблица moderators) в виде строк для Embed."""
     rows = []
-    for uid in moderation_repo.get_all_moderators() or []:
+    moderators = await moderation_repo.get_all_moderators()
+    for uid in moderators or []:
         member = guild.get_member(int(uid)) if str(uid).isdigit() else None
         if member:
             rows.append(f"**{member.display_name}** — {member.mention}")
@@ -3066,6 +3067,125 @@ async def admins(i):
     except Exception as e:
         await log_error(i.client, "/admins", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
+
+
+# ============================================================
+# /search — история заявок игрока в клан
+# ============================================================
+_STATUS_EMOJI = {
+    "accepted": "✅",
+    "rejected": "❌",
+    "pending": "⏳",
+    "voting": "🗳️",
+    "withdrawn": "↩️",
+}
+
+
+def _fmt_dt(value) -> str:
+    """ISO-строка времени → 'дд.мм.гггг чч:мм'."""
+    if not value:
+        return "—"
+    try:
+        dt = datetime.datetime.fromisoformat(str(value))
+    except Exception:
+        return str(value)[:16]
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.strftime("%d.%m.%Y %H:%M")
+
+
+def _build_search_embed(target, summary: dict, history: list) -> discord.Embed:
+    """Embed с историей заявок игрока в клан."""
+    total = int(summary.get("total", 0) or 0)
+    accepted = int(summary.get("accepted", 0) or 0)
+    rejected = int(summary.get("rejected", 0) or 0)
+    in_work = int(summary.get("in_work", 0) or 0)
+    clan_main = int(summary.get("clan_main", 0) or 0)
+    clan_other = int(summary.get("clan_other", 0) or 0)
+
+    embed = discord.Embed(
+        title=f"🔎 Заявки: {target.display_name}",
+        color=0x000000,
+    )
+    try:
+        embed.set_thumbnail(url=target.display_avatar.url)
+    except Exception:
+        pass
+    embed.description = f"Клан **{CLAN_NAME}** · всего заявок: **{total}**"
+
+    embed.add_field(
+        name="📊 Сводка",
+        value=(f"**Всего заявок:** {total}\n"
+               f"**Принято:** {accepted}\n"
+               f"**Отклонено:** {rejected}\n"
+               f"**В работе:** {in_work}"),
+        inline=True,
+    )
+    embed.add_field(
+        name="📂 По кланам",
+        value=(f"**В клан {CLAN_NAME}:** {clan_main}\n"
+               f"**В другие кланы:** {clan_other}"),
+        inline=True,
+    )
+
+    lines: list[str] = []
+    used = 0
+    for item in history[:15]:
+        status = (item.get("status") or "").strip().lower()
+        emoji = _STATUS_EMOJI.get(status, "▫️")
+        ident = (item.get("message_id") or item.get("app_id")
+                 or item.get("user_id") or "")
+        ticket = f"`ticket-{ident}`" if ident else "—"
+        clan = item.get("clan_name") or "—"
+        line = (f"{emoji} {ticket} · **{clan}** · "
+                f"{_fmt_dt(item.get('created_at'))}")
+        mod_id = item.get("moderator_id")
+        if mod_id:
+            line += f" · решил <@{mod_id}>"
+        if used + len(line) + 1 > 1000:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    rest = max(0, len(history) - 15)
+    if rest:
+        lines.append(f"_…и ещё {rest} заявок_")
+    text = "\n".join(lines) if lines else "Заявок не найдено."
+    embed.add_field(name="📜 История заявок", value=text[:1024], inline=False)
+
+    embed.set_footer(text=f"Quantum • {now_utc().strftime('%d.%m.%Y %H:%M')}")
+    return embed
+
+
+@bot.tree.command(name="search", description="История заявок игрока в клан")
+@app_commands.describe(user="Чьи заявки показать (по умолчанию — ваши)")
+async def search(i, user: discord.Member = None):
+    """История заявок игрока в клан: какие заявки подавал и чем они закончились.
+
+    Ответ всегда ephemeral: свою историю видит только вызвавший команду.
+    Чужую историю может запросить только модератор или админ.
+    """
+    await i.response.defer(ephemeral=True)
+    try:
+        member = i.user if isinstance(i.user, discord.Member) else None
+        is_reviewer = bool(member and user_can_review(member))
+        if not is_reviewer and i.guild is not None:
+            is_reviewer = await is_moderator(i.user.id, i.guild)
+
+        target = user or i.user
+        if target.id != i.user.id and not is_reviewer:
+            await safe_send(i.followup, "❌ У вас нет прав.", ephemeral=True)
+            return
+
+        summary = await applications_repo.get_history_summary(target.id)
+        history = await applications_repo.get_user_history(target.id, limit=25)
+        embed = _build_search_embed(target, summary, history)
+        await safe_send(i.followup, embed=embed, ephemeral=True)
+    except Exception as e:
+        await log_error(i.client, "/search", e)
+        try:
+            await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}", ephemeral=True)
+        except Exception:
+            pass
 
 
 # ============================================================

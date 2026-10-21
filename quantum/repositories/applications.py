@@ -39,9 +39,19 @@ async def upsert_application(user_id, *, clan_name="", status="pending",
     moderator_id при новой заявке сбрасывается: пользователь мог подать
     заявку повторно, и старый решитель не должен засчитываться в его
     статистику за новую заявку.
+
+    Каждая новая заявка (app_id отличается от предыдущей) попадает в
+    application_history — в applications хранится только последняя.
     """
     db = await get_db()
     now = _now()
+    uid = str(user_id)
+    cursor = await db.execute(
+        "SELECT app_id FROM applications WHERE user_id = ?", (uid,))
+    prev = await cursor.fetchone()
+    await cursor.close()
+    prev_app_id = prev["app_id"] if prev is not None else None
+
     await db.execute(
         "INSERT INTO applications (user_id, status, clan_name, message_id, "
         "channel_id, app_id, moderator_id, created_at, updated_at) "
@@ -51,9 +61,85 @@ async def upsert_application(user_id, *, clan_name="", status="pending",
         "message_id = excluded.message_id, channel_id = excluded.channel_id, "
         "app_id = excluded.app_id, moderator_id = NULL, "
         "updated_at = excluded.updated_at",
-        (str(user_id), status, clan_name, message_id, channel_id, app_id, now, now),
+        (uid, status, clan_name, message_id, channel_id, app_id, now, now),
     )
     await db.commit()
+
+    if app_id and app_id != prev_app_id:
+        await add_history(user_id, clan_name=clan_name, status=status,
+                          message_id=message_id, channel_id=channel_id,
+                          app_id=app_id)
+
+
+async def add_history(user_id, *, clan_name="", status="pending", message_id="",
+                      channel_id="", app_id="", moderator_id=None) -> None:
+    """Добавляет запись в историю заявок (append-only)."""
+    db = await get_db()
+    now = _now()
+    await db.execute(
+        "INSERT OR IGNORE INTO application_history "
+        "(user_id, clan_name, status, message_id, channel_id, app_id, "
+        "moderator_id, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (str(user_id), clan_name, status, message_id, channel_id, app_id,
+         str(moderator_id) if moderator_id else None, now, now),
+    )
+    await db.commit()
+
+
+async def get_user_history(user_id, limit: int = 25) -> list:
+    """История заявок игрока: новые сверху."""
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT user_id, clan_name, status, message_id, app_id, moderator_id, "
+        "created_at, updated_at FROM application_history "
+        "WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+        (str(user_id), int(limit)),
+    )
+    rows = await cursor.fetchall()
+    await cursor.close()
+    return [dict(r) for r in rows]
+
+
+async def get_history_summary(user_id) -> dict:
+    """Сводка по истории заявок игрока.
+
+    Возвращает: total, accepted, rejected, in_work, clan_main, clan_other.
+    """
+    db = await get_db()
+    uid = str(user_id)
+    main_clan = (DEFAULT_CLAN_NAME or "").strip().lower()
+    summary = {"total": 0, "accepted": 0, "rejected": 0, "in_work": 0,
+               "clan_main": 0, "clan_other": 0}
+
+    cursor = await db.execute(
+        "SELECT status, COUNT(*) AS c FROM application_history "
+        "WHERE user_id = ? GROUP BY status", (uid,))
+    rows = await cursor.fetchall()
+    await cursor.close()
+    for row in rows:
+        status = row["status"]
+        count = row["c"]
+        summary["total"] += count
+        if status == "accepted":
+            summary["accepted"] = count
+        elif status == "rejected":
+            summary["rejected"] = count
+        elif status in ACTIVE_STATUSES:
+            summary["in_work"] += count
+
+    cursor = await db.execute(
+        "SELECT clan_name, COUNT(*) AS c FROM application_history "
+        "WHERE user_id = ? GROUP BY clan_name", (uid,))
+    rows = await cursor.fetchall()
+    await cursor.close()
+    for row in rows:
+        name = (row["clan_name"] or "").strip().lower()
+        if name and name == main_clan:
+            summary["clan_main"] += row["c"]
+        else:
+            summary["clan_other"] += row["c"]
+    return summary
 
 
 async def list_pending_applications() -> list:
@@ -82,6 +168,18 @@ async def finalize_application(user_id, status: str, moderator_id=None) -> None:
          str(user_id)),
     )
     await db.commit()
+    # Дублируем финальный статус в историю заявок (последняя запись игрока).
+    try:
+        await db.execute(
+            "UPDATE application_history SET status = ?, moderator_id = ?, "
+            "updated_at = ? WHERE id = (SELECT id FROM application_history "
+            "WHERE user_id = ? ORDER BY id DESC LIMIT 1)",
+            (status, str(moderator_id) if moderator_id else None, _now(),
+             str(user_id)),
+        )
+        await db.commit()
+    except Exception as e:
+        print(f"[applications] обновить историю: {e}")
 
 
 async def count_applications() -> int:

@@ -116,6 +116,22 @@ async def init_db() -> None:
             created_at  TEXT,
             updated_at  TEXT
         );
+
+        -- История заявок: в applications хранится только последняя заявка
+        -- игрока (user_id — PRIMARY KEY), а /search показывает все.
+        CREATE TABLE IF NOT EXISTS application_history (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id      TEXT NOT NULL,
+            clan_name    TEXT,
+            status       TEXT NOT NULL DEFAULT 'pending',
+            message_id   TEXT,
+            channel_id   TEXT,
+            app_id       TEXT,
+            moderator_id TEXT,
+            created_at   TEXT,
+            updated_at   TEXT,
+            UNIQUE(user_id, app_id)
+        );
         """
     )
     # Миграции для БД, созданных до этих колонок. Идут ДО создания
@@ -130,6 +146,24 @@ async def init_db() -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_ai_cache_expires ON ai_cache (expires_at);
         CREATE INDEX IF NOT EXISTS idx_applications_app ON applications (app_id);
+        CREATE INDEX IF NOT EXISTS idx_app_history_user ON application_history (user_id);
         """
     )
+    # Переносим текущие заявки в историю (идемпотентно: UNIQUE(user_id, app_id)).
+    # У заявок, созданных до появления app_id, подставляем стабильный
+    # идентификатор 'legacy-<message_id>' — иначе повторный запуск добавлял бы
+    # дубли (NULL в UNIQUE не сравнивается).
+    try:
+        await db.execute(
+            "INSERT OR IGNORE INTO application_history "
+            "(user_id, clan_name, status, message_id, channel_id, app_id, "
+            "moderator_id, created_at, updated_at) "
+            "SELECT user_id, clan_name, status, message_id, channel_id, "
+            "COALESCE(NULLIF(app_id, ''), "
+            "'legacy-' || COALESCE(NULLIF(message_id, ''), user_id)), "
+            "moderator_id, created_at, updated_at FROM applications"
+        )
+        await db.commit()
+    except Exception as e:
+        print(f"[db] перенос заявок в историю: {e}")
     await db.commit()
