@@ -1865,13 +1865,13 @@ async def sync_all(i):
     await run_sync_all(i)
 
 
-async def run_sync_all(i):
+async def run_sync_all(i, ephemeral: bool = False):
     """Полная логика синхронизации ролей (используется командой /sync_all
     и кнопкой «Синхронизация» в панели). Ожидает, что defer уже вызван."""
     try:
         links = await links_repo.get_all_links()
         if not links:
-            await safe_send(i.followup, "ℹ️ Пусто.", ephemeral=False)
+            await safe_send(i.followup, "ℹ️ Пусто.", ephemeral=ephemeral)
             return
 
         total = len(links)
@@ -1892,7 +1892,7 @@ async def run_sync_all(i):
             return e
 
         # Промежуточное сообщение — пользователь видит, что процесс идёт.
-        msg = await i.followup.send(embed=_progress(0, total), ephemeral=False)
+        msg = await i.followup.send(embed=_progress(0, total), ephemeral=ephemeral)
         last_update = 0.0
 
         for did, sid in links.items():
@@ -1936,7 +1936,7 @@ async def run_sync_all(i):
                  if reason == "403"
                  else "❌ Сайт cs2red временно заблокировал запросы (429). "
                       "Подождите 5 минут."),
-                ephemeral=False,
+                ephemeral=ephemeral,
             )
 
         text = f"📊 Синхронизация ({len(res)}):\n" + "\n".join(res)
@@ -1951,7 +1951,7 @@ async def run_sync_all(i):
             await msg.edit(embed=final)
         except Exception:
             await safe_send(i.followup, text[:1900], title="🔗 Синхронизация",
-                            ephemeral=False)
+                            ephemeral=ephemeral)
         await log_to_channel(i.client, text)
     except Exception as e:
         await log_error(i.client, "/sync_all", e)
@@ -2097,14 +2097,14 @@ async def auto_link(i):
     await run_auto_link(i)
 
 
-async def run_auto_link(i):
+async def run_auto_link(i, ephemeral: bool = False):
     """Полная логика авто-привязки по никам (используется командой /auto_link
     и кнопкой «Привязать всех» в панели). Ожидает, что defer уже вызван."""
     # Проверяем, что куки вообще заданы.
     if not CS2RED_COOKIES:
         await safe_send(i.followup,
                         "❌ Ошибка авторизации на cs2red. Проверьте куки "
-                        "(CS2RED_COOKIE_STRING или CS2RED_*).", ephemeral=False)
+                        "(CS2RED_COOKIE_STRING или CS2RED_*).", ephemeral=ephemeral)
         return
 
     # Проверочный запрос: убеждаемся, что авторизация работает.
@@ -2114,17 +2114,17 @@ async def run_auto_link(i):
         if api.blocked_reason == "403" or getattr(api, "last_status", None) == 403:
             await safe_send(i.followup,
                             "❌ Ошибка авторизации (403). Проверьте куки на cs2red.",
-                            ephemeral=False)
+                            ephemeral=ephemeral)
             return
         if api.blocked_reason == "429":
             await safe_send(i.followup,
                             "❌ Сайт cs2red временно заблокировал запросы (429). "
                             "Подождите 5 минут.",
-                            ephemeral=False)
+                            ephemeral=ephemeral)
             return
         await safe_send(i.followup,
                         "❌ cs2red не ответил на проверочный запрос. Попробуйте позже.",
-                        ephemeral=False)
+                        ephemeral=ephemeral)
         return
 
     try:
@@ -2134,7 +2134,7 @@ async def run_auto_link(i):
         linked = await links_repo.get_all_links()
 
         linked_ids = set()
-        for did, sid in linked.items():
+        for did, _sid in linked.items():
             if str(did).isdigit():
                 linked_ids.add(str(did))
 
@@ -2161,11 +2161,10 @@ async def run_auto_link(i):
             return e
 
         msg = await i.followup.send(
-            embed=_progress_embed(0, total, 0), ephemeral=False)
+            embed=_progress_embed(0, total, 0), ephemeral=ephemeral)
 
         # Обновляем прогресс не чаще, чем раз в 10 секунд.
         last_update = 0.0
-        last_progress_update = 0  # сколько обработано на момент последнего апдейта
 
         for m in unlinked:
             processed += 1
@@ -2183,7 +2182,7 @@ async def run_auto_link(i):
                         await msg.edit(embed=_progress_embed(processed, total, len(added)))
                         await safe_send(i.followup,
                                         "❌ Ошибка авторизации (403). Проверьте куки.",
-                                        ephemeral=False)
+                                        ephemeral=ephemeral)
                         break
                     if reason == "429":
                         errors.append("429: сайт cs2red временно заблокировал запросы")
@@ -2192,7 +2191,7 @@ async def run_auto_link(i):
                             i.followup,
                             "❌ Сайт cs2red временно заблокировал запросы (429). "
                             "Подождите 5 минут.",
-                            ephemeral=False)
+                            ephemeral=ephemeral)
                         break
                     if reason:
                         errors.append(f"{reason}: ошибка сервера cs2red — команда прервана")
@@ -2200,7 +2199,7 @@ async def run_auto_link(i):
                         await safe_send(i.followup,
                                         f"❌ Ошибка сервера cs2red ({reason}). "
                                         "Повторите позже.",
-                                        ephemeral=False)
+                                        ephemeral=ephemeral)
                         break
                     errors.append(f"{m.display_name}: cs2red не ответил")
                     continue
@@ -3398,6 +3397,28 @@ async def ai_clear_cache_legacy(ctx):
 # ============================================================
 # ПАНЕЛЬ УПРАВЛЕНИЯ (/panel)
 # ============================================================
+async def _panel_guard(interaction) -> bool:
+    """Проверка прав для кнопок панели.
+
+    Кнопки панели видны всем в канале, поэтому каждая кнопка обязана
+    сама проверять права: иначе любой участник сервера мог запустить
+    привязку всех и синхронизацию ролей.
+    """
+    if interaction.user.guild_permissions.administrator:
+        return True
+    try:
+        guild = interaction.guild
+        if guild is not None and await is_moderator(interaction.user.id, guild):
+            return True
+    except Exception:
+        pass
+    try:
+        await interaction.response.send_message("❌ Нет прав.", ephemeral=True)
+    except Exception:
+        pass
+    return False
+
+
 class PanelView(discord.ui.View):
     """Панель управления ботом: кнопки запускают служебные действия."""
 
@@ -3407,56 +3428,64 @@ class PanelView(discord.ui.View):
     @discord.ui.button(label="🔄 Привязать всех", style=discord.ButtonStyle.primary,
                        custom_id="panel_link_all", row=0)
     async def panel_link_all(self, interaction, button):
+        if not await _panel_guard(interaction):
+            return
         button.disabled = True
-        await interaction.response.defer(ephemeral=False)
+        await interaction.response.defer(ephemeral=True)
         # Полный запуск /auto_link (прогресс-бар, защита от 403/429).
         try:
-            await run_auto_link(interaction)
+            await run_auto_link(interaction, ephemeral=True)
         except Exception as e:
             log(f"⚠️ panel_link_all: {e}")
             await safe_send(interaction.followup, f"❌ Ошибка: {str(e)[:200]}",
-                            ephemeral=False)
+                            ephemeral=True)
 
     @discord.ui.button(label="🔗 Синхронизация", style=discord.ButtonStyle.secondary,
                        custom_id="panel_sync", row=0)
     async def panel_sync(self, interaction, button):
+        if not await _panel_guard(interaction):
+            return
         button.disabled = True
-        await interaction.response.defer(ephemeral=False)
+        await interaction.response.defer(ephemeral=True)
         # Полный запуск /sync_all (прогресс-бар, остановка при 403/429).
         try:
-            await run_sync_all(interaction)
+            await run_sync_all(interaction, ephemeral=True)
         except Exception as e:
             log(f"⚠️ panel_sync: {e}")
             await safe_send(interaction.followup, f"❌ Ошибка: {str(e)[:200]}",
-                            ephemeral=False)
+                            ephemeral=True)
 
     @discord.ui.button(label="📖 Обновить правила", style=discord.ButtonStyle.secondary,
                        custom_id="panel_rules", row=1)
     async def panel_rules(self, interaction, button):
+        if not await _panel_guard(interaction):
+            return
         button.disabled = True
-        await interaction.response.defer(ephemeral=False)
+        await interaction.response.defer(ephemeral=True)
         if ai_service is None:
             await interaction.followup.send("❌ ИИ-сервис не инициализирован.",
-                                            ephemeral=False)
+                                            ephemeral=True)
             return
         n = ai_service.rules.load()
         await interaction.followup.send(f"✅ Правила обновлены: {n} пунктов.",
-                                        ephemeral=False)
+                                        ephemeral=True)
 
     @discord.ui.button(label="💚 Health", style=discord.ButtonStyle.success,
                        custom_id="panel_health", row=1)
     async def panel_health(self, interaction, button):
+        if not await _panel_guard(interaction):
+            return
         button.disabled = True
-        await interaction.response.defer(ephemeral=False)
+        await interaction.response.defer(ephemeral=True)
         try:
             embed = await build_panel_health_embed()
-            await safe_send(interaction.followup, embed=embed, ephemeral=False)
+            await safe_send(interaction.followup, embed=embed, ephemeral=True)
         except Exception as e:
             log(f"⚠️ panel_health: {e}")
             try:
                 await safe_send(interaction.followup,
                                 f"❌ Ошибка при проверке состояния: {str(e)[:200]}",
-                                ephemeral=False)
+                                ephemeral=True)
             except Exception:
                 pass
 
@@ -3464,12 +3493,14 @@ class PanelView(discord.ui.View):
 @bot.tree.command(name="panel", description="Панель управления ботом (админ)")
 @app_commands.default_permissions(administrator=True)
 async def panel(i):
-    await i.response.defer(ephemeral=False)
+    await i.response.defer(ephemeral=True)
     if not await _admin_guard(i):
         return
     embed = await build_panel_embed()
     view = PanelView()
-    await safe_send(i.followup, embed=embed, view=view, ephemeral=False)
+    # Панель — только для админов, поэтому показываем её ephemeral:
+    # в канале её не видно, кнопки не достаются посторонним.
+    await safe_send(i.followup, embed=embed, view=view, ephemeral=True)
 
 
 def _uptime_str() -> str:
@@ -3633,7 +3664,14 @@ app = Flask(__name__)
 
 
 @app.route("/")
-def health():
+@app.route("/health")
+def flask_health():
+    """Health-check для Render.
+
+    Имя НЕ `health`: в модуле уже есть слэш-команда `health`, и
+    переопределение одноимённой функции путало бы читателя кода
+    (и сломало бы `from script import health`).
+    """
     return "Bot is running"
 
 
