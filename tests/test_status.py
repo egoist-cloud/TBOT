@@ -110,8 +110,13 @@ def test_resubmission_clears_previous_moderator():
 
 
 def test_status_embed_layout():
-    """Embed профиля: чёрный цвет, два поля, аватарка."""
-    stats = {"accepted": 7, "rejected": 2, "pending": 1, "total": 9}
+    """Embed профиля: эффективность, категории, статус, список заявок."""
+    stats = {
+        "accepted": 7, "rejected": 2, "total": 9,
+        "clan_main": 5, "clan_other": 2,
+        "pending": 1, "pending_total": 3,
+        "in_work": [{"app_id": "abc", "user_id": "42", "message_id": "111"}],
+    }
     embed = botmod._build_status_embed(_FakeTarget(), stats)
 
     assert embed.color.value == 0, "embed должен быть чёрным"
@@ -119,8 +124,91 @@ def test_status_embed_layout():
     assert embed.thumbnail.url == _FakeTarget.display_avatar.url
 
     fields = {f.name: f.value for f in embed.fields}
-    assert "📈 **Принято заявок:** 7" in fields["📊 Эффективность"]
-    assert "📉 **Отклонено заявок:** 2" in fields["📊 Эффективность"]
-    assert "🏆 **Всего обработано:** 9" in fields["📊 Эффективность"]
-    assert "📋 **Заявок на рассмотрении:** 1" in fields["⏳ В работе"]
+    efficiency = fields["📊 Эффективность"]
+    assert "**Принято заявок:** 7" in efficiency
+    assert "**Отклонено заявок:** 2" in efficiency
+    assert "**Всего обработано:** 9" in efficiency
+
+    categories = fields["📂 По категориям"]
+    assert "**Заявок в клан TALENT:** 5" in categories
+    assert "**Заявок в другие кланы:** 2" in categories
+
+    status = fields["📊 Статус заявок"]
+    assert "**В работе:** 1" in status
+    assert "**В работе в клане:** 3" in status
+
+    assert fields["🛠 Заявки в работе"] == "`ticket-111`"
     print("  ok: embed профиля собран по формату")
+
+
+def test_status_embed_empty_work_placeholder():
+    """Без заявок в работе — заглушка в списке."""
+    stats = {"accepted": 0, "rejected": 0, "total": 0,
+             "clan_main": 0, "clan_other": 0,
+             "pending": 0, "pending_total": 0, "in_work": []}
+    embed = botmod._build_status_embed(_FakeTarget(), stats)
+    fields = {f.name: f.value for f in embed.fields}
+    assert fields["🛠 Заявки в работе"] == "Нет активных заявок"
+    print("  ok: заглушка для пустого списка заявок")
+
+
+def test_stats_split_by_clan():
+    """Решённые заявки делятся на основной клан и другие."""
+    async def scenario():
+        await init_db()
+        try:
+            await applications_repo.upsert_application(
+                9301, clan_name="TALENT", status="pending",
+                message_id="1", channel_id="2", app_id="cl01")
+            await applications_repo.finalize_application(
+                9301, "accepted", moderator_id=606)
+
+            await applications_repo.upsert_application(
+                9302, clan_name="TALENT", status="pending",
+                message_id="3", channel_id="4", app_id="cl02")
+            await applications_repo.finalize_application(
+                9302, "rejected", moderator_id=606)
+
+            await applications_repo.upsert_application(
+                9303, clan_name="OTHER", status="pending",
+                message_id="5", channel_id="6", app_id="cl03")
+            await applications_repo.finalize_application(
+                9303, "accepted", moderator_id=606)
+
+            stats = await applications_repo.get_user_stats(606)
+            assert stats["accepted"] == 2, stats
+            assert stats["rejected"] == 1, stats
+            assert stats["total"] == 3, stats
+            assert stats["clan_main"] == 2, stats
+            assert stats["clan_other"] == 1, stats
+        finally:
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: заявки разбиты по кланам")
+
+
+def test_stats_in_work_list_contains_ids():
+    """Список заявок в работе содержит идентификаторы заявок."""
+    async def scenario():
+        await init_db()
+        try:
+            app_id = "work001"
+            await applications_repo.upsert_application(
+                9401, clan_name="TALENT", status="pending",
+                message_id="555", channel_id="666", app_id=app_id)
+            await votes_repo.apply_vote(app_id, "accept", 707)
+
+            stats = await applications_repo.get_user_stats(707)
+            assert stats["pending"] == 1, stats
+            assert stats["pending_total"] >= 1, stats
+            assert len(stats["in_work"]) == 1, stats
+            item = stats["in_work"][0]
+            assert item["message_id"] == "555", item
+            assert item["app_id"] == app_id, item
+            assert item["user_id"] == "9401", item
+        finally:
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: список заявок в работе содержит ID")

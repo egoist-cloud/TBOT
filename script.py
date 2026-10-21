@@ -26,6 +26,7 @@ from flask import Flask
 
 from quantum.db import init_db, close_db
 from quantum.migrations import import_json_to_sqlite
+from quantum.agent import Agent
 from quantum.repositories import votes as votes_repo
 from quantum.repositories import seen as seen_repo
 from quantum.repositories import links as links_repo
@@ -77,6 +78,9 @@ APPLICATIONS_CHANNEL_ID = 1511463623703265361
 THREADS_CHANNEL_ID = 1236678127778795660
 DB_CHANNEL_ID = 1554883485834149888
 ERROR_LOG_CHANNEL_ID = 1511463623703265361
+
+# Канал ИИ-агента: ошибки команд, отчёты о состоянии, идеи по улучшению.
+AGENT_CHANNEL_ID = int(os.getenv("AGENT_CHANNEL_ID", "1556427610160889907") or 0)
 
 ALLOWED_ROLE_ID = int(os.getenv("ALLOWED_ROLE_ID", "0"))
 REVIEWER_ROLE_ID_2 = int(os.getenv("REVIEWER_ROLE_ID_2", "0"))
@@ -292,6 +296,11 @@ NET_ERRORS = (
 async def log_error(bot: commands.Bot, context: str, exc):
     _write_error_to_file(context, exc)
     log(f"❌ [{context}] {exc}")
+    # ИИ-агент: считаем ошибку и дублируем её в канал агента.
+    try:
+        agent.record_error(context)
+    except Exception:
+        pass
     if isinstance(exc, NET_ERRORS):
         return
     channel = bot.get_channel(ERROR_LOG_CHANNEL_ID) if ERROR_LOG_CHANNEL_ID else None
@@ -303,6 +312,11 @@ async def log_error(bot: commands.Bot, context: str, exc):
         await safe_send(channel, redact(f"❌ **Ошибка**\n**Контекст:** `{context}`\n```\n{text[:1500]}\n```"))
     except Exception as e:
         log(f"⚠️ не смог отправить лог: {e}")
+    # Стилизованный Embed об ошибке — в канал ИИ-агента.
+    try:
+        await agent.report_error(context, exc)
+    except Exception as e:
+        log(f"⚠️ agent.report_error: {e}")
 
 
 # ============================================================
@@ -1600,6 +1614,7 @@ class MyBot(commands.Bot):
             auto_sync.start()
             activity_tracker.start()
             hourly_clan_sync.start()
+            agent_watch.start()
             log("✅ Фоновые задачи запущены")
         except Exception as e:
             log(f"❌ ОШИБКА в setup_hook: {type(e).__name__}: {e}")
@@ -1638,6 +1653,9 @@ class MyBot(commands.Bot):
 
 
 bot = MyBot()
+
+# ИИ-агент: наблюдает за системой, пишет об ошибках и предлагает идеи.
+agent = Agent(bot, AGENT_CHANNEL_ID)
 
 # ИИ-сервис (каскад провайдеров + кэш + RAG). Инициализируется в setup_hook.
 ai_service: AIService | None = None
@@ -2740,11 +2758,19 @@ async def take(i, user: discord.Member):
 # СТАТИСТИКА МОДЕРАТОРА (/status)
 # ============================================================
 def _build_status_embed(target, stats: dict) -> discord.Embed:
-    """Чёрный Embed профиля: принято / отклонено / в работе."""
+    """Чёрный Embed профиля модератора.
+
+    Поля: эффективность (личные цифры), разбивка по кланам, статус
+    заявок и список заявок в работе.
+    """
     accepted = int(stats.get("accepted", 0) or 0)
     rejected = int(stats.get("rejected", 0) or 0)
+    total = int(stats.get("total", 0) or 0) or (accepted + rejected)
+    clan_main = int(stats.get("clan_main", 0) or 0)
+    clan_other = int(stats.get("clan_other", 0) or 0)
     pending = int(stats.get("pending", 0) or 0)
-    total = accepted + rejected
+    pending_total = int(stats.get("pending_total", 0) or 0)
+    in_work = stats.get("in_work") or []
 
     embed = discord.Embed(
         title=f"👤 Профиль: {target.display_name}",
@@ -2754,27 +2780,56 @@ def _build_status_embed(target, stats: dict) -> discord.Embed:
         embed.set_thumbnail(url=target.display_avatar.url)
     except Exception:
         pass
+
+    # Поле 1: эффективность.
     embed.add_field(
         name="📊 Эффективность",
         value=(
-            f"📈 **Принято заявок:** {accepted}\n"
-            f"📉 **Отклонено заявок:** {rejected}\n"
-            f"🏆 **Всего обработано:** {total}"
+            f"**Принято заявок:** {accepted}\n"
+            f"**Отклонено заявок:** {rejected}\n"
+            f"**Всего обработано:** {total}"
         ),
-        inline=False,
+        inline=True,
     )
+
+    # Поле 2: по категориям (кланы).
     embed.add_field(
-        name="⏳ В работе",
-        value=f"📋 **Заявок на рассмотрении:** {pending}",
-        inline=False,
+        name="📂 По категориям",
+        value=(
+            f"**Заявок в клан {CLAN_NAME}:** {clan_main}\n"
+            f"**Заявок в другие кланы:** {clan_other}"
+        ),
+        inline=True,
     )
+
+    # Поле 3: статус заявок.
+    embed.add_field(
+        name="📊 Статус заявок",
+        value=(
+            f"**В работе:** {pending}\n"
+            f"**В работе в клане:** {pending_total}"
+        ),
+        inline=True,
+    )
+
+    # Поле 4: список заявок в работе.
+    tickets = []
+    for item in in_work[:20]:
+        ident = (item.get("message_id") or item.get("user_id")
+                 or item.get("app_id") or "")
+        if ident:
+            tickets.append(f"`ticket-{ident}`")
+    work_text = ", ".join(tickets) if tickets else "Нет активных заявок"
+    embed.add_field(name="🛠 Заявки в работе", value=work_text[:1024], inline=False)
+
+    embed.set_footer(text=f"Quantum • {now_utc().strftime('%d.%m.%Y %H:%M')}")
     return embed
 
 
-@bot.tree.command(name="status", description="Личная статистика по заявкам в клан")
-@app_commands.describe(user="Чью статистику показать (по умолчанию — ваша)")
+@bot.tree.command(name="status", description="Профиль модератора: статистика по заявкам")
+@app_commands.describe(user="Чей профиль посмотреть (по умолчанию — ваш)")
 async def status(i, user: discord.Member = None):
-    """Личная статистика модератора по заявкам.
+    """Личная статистика модератора по таблице applications.
 
     Ответ всегда ephemeral: свои цифры видит только вызвавший команду.
     Чужую статистику может запросить только модератор или админ.
@@ -2793,7 +2848,6 @@ async def status(i, user: discord.Member = None):
 
         stats = await applications_repo.get_user_stats(target.id)
         embed = _build_status_embed(target, stats)
-        embed.set_footer(text=f"Quantum • {i.created_at.strftime('%d.%m.%Y %H:%M')}")
         await safe_send(i.followup, embed=embed, ephemeral=True)
     except Exception as e:
         await log_error(i.client, "/status", e)
@@ -2801,6 +2855,119 @@ async def status(i, user: discord.Member = None):
             await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}", ephemeral=True)
         except Exception:
             pass
+
+
+# ============================================================
+# /admins — кто администрирует клан
+# ============================================================
+_admin_cache: dict[int, tuple[float, list]] = {}
+_ADMIN_CACHE_TTL = 60.0
+
+
+async def _collect_admins(guild) -> list:
+    """Администраторы сервера по правам. Результат кэшируется на минуту.
+
+    Список участников discord.py кэширует сам, но на больших серверах он
+    может быть неполным — тогда один раз догружаем его через
+    chunk_members (Discord жёстко лимитирует такие запросы).
+    """
+    now = time.time()
+    cached = _admin_cache.get(guild.id)
+    if cached and now - cached[0] < _ADMIN_CACHE_TTL:
+        return cached[1]
+
+    members = list(guild.members)
+    if not members:
+        try:
+            await guild.chunk_members()
+            members = list(guild.members)
+        except Exception as e:
+            log(f"⚠️ chunk_members: {e}")
+    admins = [m for m in members if m.guild_permissions.administrator]
+    # Люди — первыми, боты — в конце.
+    admins.sort(key=lambda m: (m.bot, (m.display_name or "").lower()))
+    _admin_cache[guild.id] = (time.time(), admins)
+    return admins
+
+
+def _collect_bot_mods(guild) -> list:
+    """Модераторы бота (таблица moderators) в виде строк для Embed."""
+    rows = []
+    for uid in moderation_repo.get_all_moderators() or []:
+        member = guild.get_member(int(uid)) if str(uid).isdigit() else None
+        if member:
+            rows.append(f"**{member.display_name}** — {member.mention}")
+        else:
+            rows.append(f"• `{uid}` — не в сервере")
+    return rows
+
+
+async def _collect_reviewer_roles(guild) -> list:
+    """Ревьюерские роли (из переменных окружения) в виде строк."""
+    rows = []
+    for rid in get_all_reviewer_role_ids():
+        if not rid:
+            continue
+        role = guild.get_role(rid)
+        if role is None:
+            continue
+        rows.append(f"{role.mention} — **{role.name}**")
+    return rows
+
+
+def _build_admins_embed(guild, admin_members: list, mod_lines: list,
+                        role_lines: list) -> discord.Embed:
+    """Embed со списком администраторов, модераторов и ревьюеров."""
+    if admin_members:
+        admin_rows = []
+        for m in admin_members:
+            icon = "🤖 " if m.bot else ""
+            admin_rows.append(f"{icon}**{m.display_name}** — {m.mention}")
+    else:
+        admin_rows = ["—"]
+
+    embed = discord.Embed(
+        title="🛡 Администрация клана",
+        color=0x000000,
+        timestamp=now_utc(),
+    )
+    embed.description = (
+        f"Клан **{CLAN_NAME}** · сервер **{guild.name}**\n"
+        f"👥 Участников: **{guild.member_count}**")
+    embed.add_field(name="👑 Администраторы Discord",
+                    value="\n".join(admin_rows)[:1024] or "—", inline=False)
+    embed.add_field(name="⚙️ Модераторы бота",
+                    value="\n".join(mod_lines)[:1024] or "—", inline=False)
+    embed.add_field(name="🎯 Ревьюеры заявок",
+                    value="\n".join(role_lines)[:1024] or "—", inline=False)
+    embed.add_field(
+        name="📊 Сводка",
+        value=(f"Администраторов: **{len(admin_members)}**\n"
+               f"Модераторов: **{len(mod_lines)}**\n"
+               f"Ревьюерских ролей: **{len(role_lines)}**"),
+        inline=True)
+    embed.set_footer(text="Quantum • Администрация")
+    return embed
+
+
+@bot.tree.command(name="admins", description="Администраторы и модераторы клана")
+async def admins(i):
+    """Кто администрирует клан: права Discord, модераторы бота, ревьюеры."""
+    await i.response.defer(ephemeral=False)
+    try:
+        guild = i.guild
+        if guild is None:
+            await safe_send(i.followup, "❌ Команда работает только на сервере.")
+            return
+
+        admin_members = await _collect_admins(guild)
+        mod_lines = await _collect_bot_mods(guild)
+        role_lines = await _collect_reviewer_roles(guild)
+        embed = _build_admins_embed(guild, admin_members, mod_lines, role_lines)
+        await safe_send(i.followup, embed=embed)
+    except Exception as e:
+        await log_error(i.client, "/admins", e)
+        await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
 
 
 # ============================================================
@@ -3248,6 +3415,40 @@ async def before_hourly_clan_sync():
 
 
 # ============================================================
+# ИИ-АГЕНТ: НАБЛЮДЕНИЕ ЗА СИСТЕМОЙ, ОТЧЁТЫ, ИДЕИ
+# ============================================================
+AGENT_CHECK_MINUTES = int(os.getenv("AGENT_CHECK_MINUTES", "30") or 30)
+
+
+@tasks.loop(minutes=AGENT_CHECK_MINUTES)
+async def agent_watch():
+    """Цикл ИИ-агента: следит за системой, шлёт отчёты и идеи.
+
+    Отчёт и идея публикуются по своему расписанию (agent.py), а не каждый
+    цикл: иначе канал агента забивается сообщениями.
+    """
+    try:
+        providers = ai_service.providers if ai_service else []
+        extra = {
+            "uptime": _uptime_str(),
+            "ping": f"{bot.latency * 1000:.0f} мс",
+            "ai": _ai_status(),
+            "rules": _rules_status(),
+            "github": _github_status(),
+            "cs2red": getattr(api, "last_status", None) or "нет данных",
+        }
+        await agent.run_cycle(providers=providers, extra=extra)
+    except Exception as e:
+        await log_error(bot, "agent_watch", e)
+
+
+@agent_watch.before_loop
+async def before_agent_watch():
+    await bot.wait_until_ready()
+    await asyncio.sleep(random.randint(60, 180))
+
+
+# ============================================================
 # ИИ: /ask, !ask, /rules, !rules
 # ============================================================
 def _parse_ai_response(response: str) -> dict:
@@ -3583,6 +3784,31 @@ def _uptime_str() -> str:
     return f"{s} сек"
 
 
+def _ai_status() -> str:
+    """Статус ИИ-провайдеров (для панели и отчётов агента)."""
+    if ai_service is None:
+        return "Не инициализирован"
+    prov = ai_service.providers
+    if not prov:
+        return "Нет настроенных провайдеров"
+    p = prov[0]
+    req = sum(getattr(x, "requests", 0) for x in prov)
+    errs = sum(getattr(x, "failures", 0) for x in prov)
+    model = getattr(p, "_model", "?")
+    return (f"{p.name} ({model})\nпровайдеров: {len(prov)}\n"
+            f"запросов: {req}, ошибок: {errs}")
+
+
+def _rules_status() -> str:
+    """Статус правил rules.txt (для панели и отчётов агента)."""
+    if ai_service is None or ai_service.rules is None:
+        return "Не загружены"
+    rules = ai_service.rules
+    n_docs = len(getattr(rules, "_docs", []) or [])
+    syms = sum(len(d.get("text", "")) for d in getattr(rules, "_docs", []) or [])
+    return f"Пунктов: {n_docs}\nСимволов: {syms}\nИсточник: rules.txt"
+
+
 async def build_panel_health_embed() -> discord.Embed:
     """Собирает Embed со сводным состоянием систем (для кнопки Health)."""
     e = discord.Embed(
@@ -3604,31 +3830,10 @@ async def build_panel_health_embed() -> discord.Embed:
     e.add_field(name="Заявок", value=f"{apps_total} (в работе: {apps_pending})", inline=True)
 
     # Блок ИИ
-    if ai_service is not None:
-        prov = ai_service.providers
-        if prov:
-            p = prov[0]
-            req = sum(getattr(x, "requests", 0) for x in prov)
-            errs = sum(getattr(x, "failures", 0) for x in prov)
-            model = getattr(p, "_model", "?")
-            ai_txt = (f"{p.name} ({model})\n"
-                      f"провайдеров: {len(prov)}\nзапросов: {req}, ошибок: {errs}")
-        else:
-            ai_txt = "Нет настроенных провайдеров"
-        e.add_field(name="🤖 ИИ", value=ai_txt, inline=False)
-    else:
-        e.add_field(name="🤖 ИИ", value="Не инициализирован", inline=False)
+    e.add_field(name="🤖 ИИ", value=_ai_status(), inline=False)
 
     # Блок Правила
-    if ai_service is not None and ai_service.rules is not None:
-        rules = ai_service.rules
-        n_docs = len(getattr(rules, "_docs", []) or [])
-        # символы
-        syms = sum(len(d.get("text", "")) for d in getattr(rules, "_docs", []) or [])
-        rules_txt = f"Пунктов: {n_docs}\nСимволов: {syms}\nИсточник: rules.txt"
-        e.add_field(name="📖 Правила", value=rules_txt, inline=False)
-    else:
-        e.add_field(name="📖 Правила", value="Не загружены", inline=False)
+    e.add_field(name="📖 Правила", value=_rules_status(), inline=False)
 
     # cs2red и ошибки: используем api.last_status, ошибок в лог-файле — считаем.
     last_status = getattr(api, "last_status", None)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import os
 
 from ..db import get_db
 from .votes import parse_voters
@@ -105,22 +106,35 @@ async def count_pending_applications() -> int:
 # Статусы, при которых заявка ещё «в работе».
 ACTIVE_STATUSES = ("pending", "voting")
 
+# Основной клан — по нему считаем «заявки в клан» и «заявки в другие кланы».
+DEFAULT_CLAN_NAME = os.getenv("CLAN_NAME", "TALENT")
+
 
 async def get_user_stats(user_id) -> dict:
     """Личная статистика по заявкам для одного пользователя.
 
     Возвращает:
-      accepted — заявки, финальное решение по которым принял этот модератор;
-      rejected — заявки, которые он отклонил;
-      pending  — заявки «в работе»: модератор уже голосовал, но решение
-                 ещё не вынесено;
-      total    — принято + отклонено (всего обработано).
+      accepted      — заявки, финальное решение по которым принял модератор;
+      rejected      — заявки, которые он отклонил;
+      total         — принято + отклонено (всего обработано);
+      clan_main     — из решённых: заявки в основной клан (CLAN_NAME);
+      clan_other    — из решённых: заявки в другие кланы;
+      pending       — личные заявки «в работе»: модератор уже голосовал
+                      либо заявка закреплена за ним;
+      pending_total — все заявки «в работе» в клане;
+      in_work       — список заявок «в работе» (личные): app_id, user_id,
+                      message_id, clan_name.
     """
     db = await get_db()
     uid = str(user_id)
-    stats = {"accepted": 0, "rejected": 0, "pending": 0, "total": 0}
+    stats = {
+        "accepted": 0, "rejected": 0, "total": 0,
+        "clan_main": 0, "clan_other": 0,
+        "pending": 0, "pending_total": 0, "in_work": [],
+    }
+    main_clan = (DEFAULT_CLAN_NAME or "").strip().lower()
 
-    # Решения, вынесенные этим модератором.
+    # 1. Решения, вынесенные этим модератором.
     cursor = await db.execute(
         "SELECT status, COUNT(*) AS c FROM applications "
         "WHERE moderator_id = ? AND status IN ('accepted', 'rejected') "
@@ -134,13 +148,32 @@ async def get_user_stats(user_id) -> dict:
             stats["rejected"] = row["c"]
     stats["total"] = stats["accepted"] + stats["rejected"]
 
-    # Заявки в работе: модератор уже проголосовал, но решение не принято.
+    # 2. Разбивка решённых заявок по кланам.
+    cursor = await db.execute(
+        "SELECT clan_name, COUNT(*) AS c FROM applications "
+        "WHERE moderator_id = ? AND status IN ('accepted', 'rejected') "
+        "GROUP BY clan_name", (uid,))
+    rows = await cursor.fetchall()
+    await cursor.close()
+    for row in rows:
+        name = (row["clan_name"] or "").strip().lower()
+        if name and name == main_clan:
+            stats["clan_main"] += row["c"]
+        else:
+            stats["clan_other"] += row["c"]
+
+    # 3. Все заявки «в работе».
     placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)
     cursor = await db.execute(
-        f"SELECT app_id FROM applications WHERE status IN ({placeholders})",
-        ACTIVE_STATUSES)
-    active_ids = {r["app_id"] for r in await cursor.fetchall() if r["app_id"]}
+        f"SELECT user_id, message_id, app_id, clan_name, moderator_id "
+        f"FROM applications WHERE status IN ({placeholders})", ACTIVE_STATUSES)
+    active = await cursor.fetchall()
     await cursor.close()
+    stats["pending_total"] = len(active)
+    active_ids = {r["app_id"] for r in active if r["app_id"]}
+
+    # 4. Личные заявки в работе: модератор уже голосовал или решил заявку.
+    voted: set = set()
     if active_ids:
         cursor = await db.execute(
             "SELECT message_id, accept_voters, deny_voters FROM votes")
@@ -150,5 +183,15 @@ async def get_user_stats(user_id) -> dict:
             if row["message_id"] not in active_ids:
                 continue
             if uid in parse_voters(row["accept_voters"], row["deny_voters"]):
-                stats["pending"] += 1
+                voted.add(row["message_id"])
+    for row in active:
+        if row["app_id"] not in voted and row["moderator_id"] != uid:
+            continue
+        stats["in_work"].append({
+            "app_id": row["app_id"] or "",
+            "user_id": row["user_id"] or "",
+            "message_id": row["message_id"] or "",
+            "clan_name": row["clan_name"] or "",
+        })
+    stats["pending"] = len(stats["in_work"])
     return stats
