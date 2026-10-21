@@ -12,8 +12,10 @@ import platform
 import sys
 import threading
 import traceback
+import uuid
 from pathlib import Path
-from collections import defaultdict, deque
+from collections import deque
+from urllib.parse import urlparse
 
 import aiohttp
 import discord
@@ -61,7 +63,7 @@ def now_utc() -> datetime.datetime:
 
 
 def log(msg: str):
-    print(msg, flush=True)
+    print(redact(msg), flush=True)
 
 
 # ============================================================
@@ -140,6 +142,77 @@ else:
     }.items() if v}
 
 
+# ============================================================
+# МАСКИРОВАНИЕ СЕКРЕТОВ В ЛОГАХ
+# ============================================================
+# Секреты попадали в логи и в Discord-канал ошибок: например, текст
+# HTTP-ошибки Steam содержал полный URL с ?key=<STEAM_API_KEY>, а
+# traceback aiohttp мог содержать заголовки с cookie cs2red.
+_SECRET_ENV_NAMES = (
+    "CS2RED_COOKIE_STRING",
+    "CS2RED_TOKEN", "CS2RED_BH", "CS2RED_I", "CS2RED_YASC",
+    "CS2RED_BROWSER_ID", "CS2RED_YANDEXUID", "CS2RED_YUIDSS",
+    "CS2RED_DDG1", "CS2RED_DDG8", "CS2RED_DDG9", "CS2RED_DDG10",
+    "CS2RED_YABS_SID", "CS2RED_YM_UID", "CS2RED_YM_D",
+    "CS2RED_YM_ISAD", "CS2RED_YMEX",
+    "STEAM_API_KEY",
+    "GEMINI_API_KEY", "GOOGLE_API_KEY",
+    "AI_API_KEY", "LLM7_API_KEY", "OPENROUTER_API_KEY",
+    "GITHUB_TOKEN", "DISCORD_TOKEN",
+)
+
+# Секреты короче 6 символов не маскируем: такое значение встречается
+# в тексте случайно и только испортит читаемость логов.
+_MIN_SECRET_LEN = 6
+
+
+def _collect_secret_values() -> list:
+    """Собирает значения всех секретов из окружения (для маскирования)."""
+    values = []
+    for name in _SECRET_ENV_NAMES:
+        val = (os.getenv(name) or "").strip()
+        if len(val) >= _MIN_SECRET_LEN:
+            values.append(val)
+    # Отдельные куки из CS2RED_COOKIE_STRING — тоже секреты.
+    for val in (CS2RED_COOKIES or {}).values():
+        val = (val or "").strip()
+        if len(val) >= _MIN_SECRET_LEN:
+            values.append(val)
+    # Сначала самые длинные: иначе короткое значение может разрезать
+    # длинное и оставить его хвост в открытом виде.
+    return sorted(set(values), key=len, reverse=True)
+
+
+_SECRET_VALUES = _collect_secret_values()
+
+
+def redact(text) -> str:
+    """Маскирует секреты в произвольной строке."""
+    if text is None:
+        return ""
+    s = str(text)
+    if not s:
+        return s
+    for val in _SECRET_VALUES:
+        if val in s:
+            s = s.replace(val, "***")
+    return s
+
+
+def _is_cs2red_host(url: str) -> bool:
+    """Проверка по ХОСТУ, а не по подстроке.
+
+    Проверка подстроки пропустила бы URL вида
+    https://evil.example/cs2red.ru — и такой запрос получил бы
+    приватную сессию с админскими cookie.
+    """
+    try:
+        host = (urlparse(url or "").hostname or "").lower()
+    except ValueError:
+        return False
+    return host == "cs2red.ru" or host.endswith(".cs2red.ru")
+
+
 # GitHub-синк данных бота (опционально: требует GITHUB_TOKEN + GITHUB_REPO).
 github_sync = GitHubSync(
     token=os.getenv("GITHUB_TOKEN", ""),
@@ -204,7 +277,7 @@ def _write_error_to_file(context: str, exc):
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)) \
             if isinstance(exc, BaseException) else str(exc)
         with open(data_path("error_log.txt"), "a", encoding="utf-8") as f:
-            f.write(f"[{ts}] {context}\n{tb}\n{'=' * 60}\n")
+            f.write(redact(f"[{ts}] {context}\n{tb}\n{'=' * 60}\n"))
     except Exception as e:
         log(f"⚠️ error_log: {e}")
 
@@ -228,7 +301,7 @@ async def log_error(bot: commands.Bot, context: str, exc):
     text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)) \
         if isinstance(exc, BaseException) else str(exc)
     try:
-        await safe_send(channel, f"❌ **Ошибка**\n**Контекст:** `{context}`\n```\n{text[:1500]}\n```")
+        await safe_send(channel, redact(f"❌ **Ошибка**\n**Контекст:** `{context}`\n```\n{text[:1500]}\n```"))
     except Exception as e:
         log(f"⚠️ не смог отправить лог: {e}")
 
@@ -399,7 +472,10 @@ class API:
     RETRY_5xx_WAIT = 10
 
     def __init__(self):
+        # Публичная сессия: Steam / GitHub / LLM — БЕЗ cookies и заголовков cs2red.
         self.session: aiohttp.ClientSession | None = None
+        # Приватная сессия: только cs2red.ru (админские cookie/заголовки).
+        self.cs2red: aiohttp.ClientSession | None = None
         self.sem = asyncio.Semaphore(4)
         self._clans_cache = {"ts": 0.0, "data": None}
         self.last_status: int | None = None
@@ -410,21 +486,47 @@ class API:
         self.blocked_reason = ""
 
     async def start(self):
-        connector = aiohttp.TCPConnector(
-            family=2, ttl_dns_cache=300, limit=16,
-            force_close=False, enable_cleanup_closed=True,
-        )
+        timeout = aiohttp.ClientTimeout(total=20, connect=10)
+
+        def _connector():
+            # У каждой сессии свой коннектор: общий коннектор закрылся бы
+            # вместе с первой закрытой сессией.
+            return aiohttp.TCPConnector(
+                family=2, ttl_dns_cache=300, limit=16,
+                force_close=False, enable_cleanup_closed=True,
+            )
+
+        # Публичная сессия — без секретов cs2red. Иначе cookie и заголовки
+        # Referer/Origin уходят на api.steampowered.com, api.github.com и
+        # LLM-провайдера: aiohttp не фильтрует cookie по домену.
         self.session = aiohttp.ClientSession(
+            timeout=timeout,
+            connector=_connector(),
+        )
+        # Приватная — только для самого cs2red.ru.
+        self.cs2red = aiohttp.ClientSession(
             headers=CS2RED_HEADERS,
             cookies=CS2RED_COOKIES or None,
-            timeout=aiohttp.ClientTimeout(total=20, connect=10),
-            connector=connector,
+            timeout=timeout,
+            connector=_connector(),
         )
-        log(f"🌐 API session. Cookies: {len(CS2RED_COOKIES)}, Headers: {len(CS2RED_HEADERS)}")
+        log(f"🌐 API sessions ready. Cookies: {len(CS2RED_COOKIES)}, "
+            f"Headers: {len(CS2RED_HEADERS)} (только для cs2red.ru)")
 
     async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
+        for sess in (self.cs2red, self.session):
+            if sess and not sess.closed:
+                await sess.close()
+
+    def session_for(self, url: str):
+        """Выбирает сессию по ХОСТУ.
+
+        cs2red.ru -> приватная (с админскими cookie), все остальные хосты
+        (Steam, GitHub, LLM) -> публичная, без cookie.
+        """
+        if _is_cs2red_host(url):
+            return self.cs2red or self.session
+        return self.session
 
     async def _acquire_rate_slot(self):
         """Обеспечивает не более 1 запроса к cs2red в RATE_LIMIT_SECONDS."""
@@ -437,9 +539,10 @@ class API:
             return
 
     async def _get_json(self, url, params=None):
-        if not self.session:
+        session = self.session_for(url)
+        if not session:
             return None
-        is_cs2red = "cs2red.ru" in url
+        is_cs2red = _is_cs2red_host(url)
 
         # 5xx-ретраи: если подряд падаем, останавливаем cs2red-поток.
         consecutive_5xx = 0
@@ -450,7 +553,7 @@ class API:
                     await self._acquire_rate_slot()
 
                 async with self.sem:
-                    async with self.session.get(url, params=params) as r:
+                    async with session.get(url, params=params) as r:
                         self.last_status = r.status
 
                         # 403 — авторизация сломана: останавливаемся окончательно.

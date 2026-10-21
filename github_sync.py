@@ -21,6 +21,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 from pathlib import Path
 
 DEFAULT_API = "https://api.github.com"
@@ -134,9 +135,12 @@ class GitHubSync:
             content, sha = await self._get(session, self._path(name))
             if content is None:
                 continue
+            if not content.strip():
+                # Пустой файл из репозитория не пишем: он затёр бы данные.
+                continue
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(content, encoding="utf-8")
+                _atomic_write_text(target, content)
             except Exception as e:
                 self.last_error = f"запись {name}: {e}"
                 continue
@@ -144,6 +148,8 @@ class GitHubSync:
             self._hash[name] = _hash_text(content)
             saved.append(name)
             self.pulled_total += 1
+        if saved:
+            self.last_error = ""
         return saved
 
     async def push(self, session, filenames, local_dir) -> tuple[int, str]:
@@ -194,6 +200,7 @@ class GitHubSync:
                 self._hash[name] = digest
                 sent.append(name)
                 self.pushed_total += 1
+                self.last_error = ""
             else:
                 failed.append(name)
 
@@ -210,3 +217,17 @@ class GitHubSync:
 
 def _hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _atomic_write_text(target: Path, content: str) -> None:
+    """Пишет файл атомарно: сначала во временный, потом os.replace.
+
+    Так прерванный деплой или рестарт не оставят после себя обрезанный
+    файл данных: старый файл останется целым до конца записи.
+    """
+    tmp = target.with_name(target.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(str(tmp), str(target))

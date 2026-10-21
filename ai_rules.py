@@ -25,7 +25,7 @@ import re
 import time
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 
@@ -585,10 +585,46 @@ def _json_to_text(raw: str) -> str:
     return "\n\n".join(parts) if parts else raw
 
 
+def is_cs2red_host(url: str) -> bool:
+    """Проверка по ХОСТУ, а не по подстроке.
+
+    Cookie и заголовки cs2red (Referer/Origin на /admin) должны уходить
+    только самому cs2red.ru. Проверка подстроки пропустила бы URL вида
+    https://evil.example/cs2red.ru.
+    """
+    try:
+        host = (urlparse(url or "").hostname or "").lower()
+    except ValueError:
+        return False
+    return host == "cs2red.ru" or host.endswith(".cs2red.ru")
+
+
+def pick_session(session, url: str):
+    """Выбирает HTTP-сессию по хосту.
+
+    Если передан объект API (с методом session_for), то для cs2red.ru берётся
+    приватная сессия с админскими cookie, для всех остальных хостов (Steam,
+    GitHub, LLM-провайдер) — публичная, без cookie. Это не даёт утечь cookie
+    cs2red на сторонние сервисы: aiohttp не фильтрует cookie по домену.
+    """
+    fn = getattr(session, "session_for", None)
+    if callable(fn):
+        return fn(url)
+    return session
+
+
 async def _fetch(session, url: str, cookies=None, headers=None,
                  limit: int = MAX_FETCH_BYTES) -> str | None:
+    sess = pick_session(session, url)
+    if sess is None:
+        return None
+    # Cookie и заголовки cs2red уходят ТОЛЬКО самому cs2red.ru — иначе
+    # админские куки попадут на сторонний хост.
+    if not is_cs2red_host(url):
+        cookies = None
+        headers = None
     try:
-        async with session.get(url, cookies=cookies, headers=headers) as r:
+        async with sess.get(url, cookies=cookies, headers=headers) as r:
             if r.status != 200:
                 return None
             raw = await r.content.read(limit)
