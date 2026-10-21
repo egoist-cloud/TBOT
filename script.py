@@ -1230,7 +1230,8 @@ async def _vote(interaction, kind, button=None):
         if tid:
             try:
                 await applications_repo.finalize_application(
-                    tid, "accepted" if kind == "accept" else "rejected")
+                    tid, "accepted" if kind == "accept" else "rejected",
+                    moderator_id=interaction.user.id)
             except Exception as e:
                 log(f"⚠️ Не финализировал заявку: {e}")
         if isinstance(interaction.channel, discord.Thread):
@@ -2733,6 +2734,73 @@ async def take(i, user: discord.Member):
     except Exception as e:
         await log_error(i.client, "/take", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
+
+
+# ============================================================
+# СТАТИСТИКА МОДЕРАТОРА (/status)
+# ============================================================
+def _build_status_embed(target, stats: dict) -> discord.Embed:
+    """Чёрный Embed профиля: принято / отклонено / в работе."""
+    accepted = int(stats.get("accepted", 0) or 0)
+    rejected = int(stats.get("rejected", 0) or 0)
+    pending = int(stats.get("pending", 0) or 0)
+    total = accepted + rejected
+
+    embed = discord.Embed(
+        title=f"👤 Профиль: {target.display_name}",
+        color=0x000000,
+    )
+    try:
+        embed.set_thumbnail(url=target.display_avatar.url)
+    except Exception:
+        pass
+    embed.add_field(
+        name="📊 Эффективность",
+        value=(
+            f"📈 **Принято заявок:** {accepted}\n"
+            f"📉 **Отклонено заявок:** {rejected}\n"
+            f"🏆 **Всего обработано:** {total}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="⏳ В работе",
+        value=f"📋 **Заявок на рассмотрении:** {pending}",
+        inline=False,
+    )
+    return embed
+
+
+@bot.tree.command(name="status", description="Личная статистика по заявкам в клан")
+@app_commands.describe(user="Чью статистику показать (по умолчанию — ваша)")
+async def status(i, user: discord.Member = None):
+    """Личная статистика модератора по заявкам.
+
+    Ответ всегда ephemeral: свои цифры видит только вызвавший команду.
+    Чужую статистику может запросить только модератор или админ.
+    """
+    await i.response.defer(ephemeral=True)
+    try:
+        member = i.user if isinstance(i.user, discord.Member) else None
+        is_reviewer = bool(member and user_can_review(member))
+        if not is_reviewer and i.guild is not None:
+            is_reviewer = await is_moderator(i.user.id, i.guild)
+
+        target = user or i.user
+        if target.id != i.user.id and not is_reviewer:
+            await safe_send(i.followup, "❌ У вас нет прав.", ephemeral=True)
+            return
+
+        stats = await applications_repo.get_user_stats(target.id)
+        embed = _build_status_embed(target, stats)
+        embed.set_footer(text=f"Quantum • {i.created_at.strftime('%d.%m.%Y %H:%M')}")
+        await safe_send(i.followup, embed=embed, ephemeral=True)
+    except Exception as e:
+        await log_error(i.client, "/status", e)
+        try:
+            await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}", ephemeral=True)
+        except Exception:
+            pass
 
 
 # ============================================================

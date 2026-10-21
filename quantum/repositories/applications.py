@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 
 from ..db import get_db
+from .votes import parse_voters
 
 
 def _now() -> str:
@@ -32,16 +33,23 @@ async def get_active_application(user_id) -> dict | None:
 
 async def upsert_application(user_id, *, clan_name="", status="pending",
                              message_id="", channel_id="", app_id="") -> None:
-    """Сохраняет/обновляет заявку пользователя (по user_id)."""
+    """Сохраняет/обновляет заявку пользователя (по user_id).
+
+    moderator_id при новой заявке сбрасывается: пользователь мог подать
+    заявку повторно, и старый решитель не должен засчитываться в его
+    статистику за новую заявку.
+    """
     db = await get_db()
     now = _now()
     await db.execute(
         "INSERT INTO applications (user_id, status, clan_name, message_id, "
-        "channel_id, app_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "channel_id, app_id, moderator_id, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?) "
         "ON CONFLICT(user_id) DO UPDATE SET "
         "status = excluded.status, clan_name = excluded.clan_name, "
         "message_id = excluded.message_id, channel_id = excluded.channel_id, "
-        "app_id = excluded.app_id, updated_at = excluded.updated_at",
+        "app_id = excluded.app_id, moderator_id = NULL, "
+        "updated_at = excluded.updated_at",
         (str(user_id), status, clan_name, message_id, channel_id, app_id, now, now),
     )
     await db.commit()
@@ -59,12 +67,18 @@ async def list_pending_applications() -> list:
     return [dict(r) for r in rows]
 
 
-async def finalize_application(user_id, status: str) -> None:
-    """Закрывает активную заявку пользователя (статус принят/отклонён/отозвана)."""
+async def finalize_application(user_id, status: str, moderator_id=None) -> None:
+    """Закрывает активную заявку пользователя (статус принят/отклонён/отозвана).
+
+    moderator_id — кто вынес решение (его голос достиг порога). Нужен
+    для личной статистики модератора в /status.
+    """
     db = await get_db()
     await db.execute(
-        "UPDATE applications SET status = ?, updated_at = ? WHERE user_id = ?",
-        (status, _now(), str(user_id)),
+        "UPDATE applications SET status = ?, moderator_id = ?, updated_at = ? "
+        "WHERE user_id = ?",
+        (status, str(moderator_id) if moderator_id else None, _now(),
+         str(user_id)),
     )
     await db.commit()
 
@@ -86,3 +100,55 @@ async def count_pending_applications() -> int:
     row = await cursor.fetchone()
     await cursor.close()
     return row["c"] if row is not None else 0
+
+
+# Статусы, при которых заявка ещё «в работе».
+ACTIVE_STATUSES = ("pending", "voting")
+
+
+async def get_user_stats(user_id) -> dict:
+    """Личная статистика по заявкам для одного пользователя.
+
+    Возвращает:
+      accepted — заявки, финальное решение по которым принял этот модератор;
+      rejected — заявки, которые он отклонил;
+      pending  — заявки «в работе»: модератор уже голосовал, но решение
+                 ещё не вынесено;
+      total    — принято + отклонено (всего обработано).
+    """
+    db = await get_db()
+    uid = str(user_id)
+    stats = {"accepted": 0, "rejected": 0, "pending": 0, "total": 0}
+
+    # Решения, вынесенные этим модератором.
+    cursor = await db.execute(
+        "SELECT status, COUNT(*) AS c FROM applications "
+        "WHERE moderator_id = ? AND status IN ('accepted', 'rejected') "
+        "GROUP BY status", (uid,))
+    rows = await cursor.fetchall()
+    await cursor.close()
+    for row in rows:
+        if row["status"] == "accepted":
+            stats["accepted"] = row["c"]
+        elif row["status"] == "rejected":
+            stats["rejected"] = row["c"]
+    stats["total"] = stats["accepted"] + stats["rejected"]
+
+    # Заявки в работе: модератор уже проголосовал, но решение не принято.
+    placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)
+    cursor = await db.execute(
+        f"SELECT app_id FROM applications WHERE status IN ({placeholders})",
+        ACTIVE_STATUSES)
+    active_ids = {r["app_id"] for r in await cursor.fetchall() if r["app_id"]}
+    await cursor.close()
+    if active_ids:
+        cursor = await db.execute(
+            "SELECT message_id, accept_voters, deny_voters FROM votes")
+        vote_rows = await cursor.fetchall()
+        await cursor.close()
+        for row in vote_rows:
+            if row["message_id"] not in active_ids:
+                continue
+            if uid in parse_voters(row["accept_voters"], row["deny_voters"]):
+                stats["pending"] += 1
+    return stats

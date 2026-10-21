@@ -33,6 +33,14 @@ def _loads_list(raw) -> list:
     return [str(x) for x in data]
 
 
+def parse_voters(accept_raw, deny_raw) -> set:
+    """Объединение списков избирателей: кто голосовал (за или против).
+
+    ID приводятся к str — в БД они лежат строками.
+    """
+    return set(_loads_list(accept_raw)) | set(_loads_list(deny_raw))
+
+
 async def get_votes(app_id) -> dict:
     """Возвращает состояние голосования для заявки.
 

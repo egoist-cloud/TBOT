@@ -112,6 +112,7 @@ async def init_db() -> None:
             message_id  TEXT,
             channel_id  TEXT,
             app_id      TEXT,
+            moderator_id TEXT,
             created_at  TEXT,
             updated_at  TEXT
         );
@@ -123,6 +124,7 @@ async def init_db() -> None:
     await _ensure_column(db, "votes", "accept_voters", "TEXT NOT NULL DEFAULT '[]'")
     await _ensure_column(db, "votes", "deny_voters", "TEXT NOT NULL DEFAULT '[]'")
     await _ensure_column(db, "applications", "app_id", "TEXT")
+    await _ensure_column(db, "applications", "moderator_id", "TEXT")
     # Индексы — только после миграций, когда колонки точно есть.
     await db.executescript(
         """
