@@ -3323,8 +3323,55 @@ async def activity_all(i):
 
 
 # ============================================================
-# !setup — обновлённый текст
+# !setup и /setup_clan - официальные условия вступления
 # ============================================================
+def _build_clan_conditions_embed() -> discord.Embed:
+    """Embed с официальными условиями вступления в клан.
+
+    Один и тот же текст для текстовой команды !setup и слэш-команды
+    /setup_clan, чтобы условия в канале и в команде не расходились.
+    """
+    embed = discord.Embed(
+        title="Официальные условия вступления в клан.",
+        color=0x000000,
+    )
+    embed.description = (
+        "Перед подачей заявки внимательно ознакомьтесь с нашими требованиями.\n"
+        "Несоответствие любому из пунктов приведёт к отказу."
+    )
+    embed.add_field(
+        name="📋 Общие требования",
+        value=("• Отсутствие VAC-банов в Steam и блокировок на cs2red.ru.\n"
+               "• Отсутствие членства в других кланах.\n"
+               "• Возраст — от 12 лет."),
+        inline=False,
+    )
+    embed.add_field(
+        name=f"🎯 Требования для {CLAN_NAME}",
+        value=("• Рейтинг — от 1.000 ммр.\n"
+               "• Онлайн — не менее 3 часов в день."),
+        inline=False,
+    )
+    embed.add_field(
+        name="📝 Что указать в заявке",
+        value="• Steam-профиль (ссылка или SteamID64)",
+        inline=False,
+    )
+    embed.add_field(
+        name="⚠️ Важно!",
+        value=("Если вам не напишут в течение 7 дней — заявка отклоняется.\n"
+               "После принятия есть 2 дня на вступление."),
+        inline=False,
+    )
+    embed.add_field(
+        name="💬 По вопросам вступления",
+        value="Обратитесь к администрации.",
+        inline=False,
+    )
+    embed.set_footer(text=f"Quantum • {now_utc().strftime('%d.%m.%Y %H:%M')}")
+    return embed
+
+
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def setup(ctx):
@@ -3332,27 +3379,35 @@ async def setup(ctx):
         await ctx.message.delete()
     except Exception:
         pass
-    e = discord.Embed(title="Официальные условия вступления в клан.",
-                      color=0x36393F)
-    e.description = (
-        "Перед подачей заявки внимательно ознакомьтесь с нашими требованиями.\n"
-        "**Несоответствие любому из пунктов приведёт к отказу.**\n\n"
-        "**Общие требования:**\n"
-        "• Отсутствие VAC-банов в Steam и блокировок на cs2red.ru.\n"
-        "• Отсутствие членства в других кланах.\n"
-        "• Возраст — **от 12 лет**.\n\n"
-        f"**Требования для {CLAN_NAME}:**\n"
-        "• Рейтинг — **от 1.000 ммр**.\n"
-        "• Онлайн — **не менее 3 часов в день**.\n\n"
-        "**Что указать в заявке:**\n"
-        "• Steam-профиль (ссылку или SteamID64)\n\n"
-        "**Важно!**\n"
-        "Если вам не напишут в течение 7 дней — заявка отклоняется.\n"
-        "После принятия есть **2 дня** на вступление.\n\n"
-        "По вопросам вступления: обратитесь к администрации."
-    )
+    e = _build_clan_conditions_embed()
     v = ClanView()
     await safe_send(ctx.channel, embed=e, view=v)
+
+
+@bot.tree.command(name="setup_clan",
+                  description="Опубликовать официальные условия вступления в клан")
+@app_commands.default_permissions(administrator=True)
+async def setup_clan(i):
+    """Публикует условия вступления в клан и список выбора клана.
+
+    Сообщение остаётся в канале, а под ним — выпадающий список:
+    при выборе клана открывается модальное окно для заявки.
+    """
+    await i.response.defer(ephemeral=False)
+    try:
+        if i.guild is None:
+            await safe_send(i.followup, "❌ Команда работает только на сервере.",
+                            ephemeral=True)
+            return
+        if not admin_only(i):
+            await safe_send(i.followup, "❌ Нет прав.", ephemeral=True)
+            return
+        embed = _build_clan_conditions_embed()
+        view = ClanView()
+        await safe_send(i.followup, embed=embed, view=view)
+    except Exception as e:
+        await log_error(i.client, "/setup_clan", e)
+        await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
 
 
 # ============================================================

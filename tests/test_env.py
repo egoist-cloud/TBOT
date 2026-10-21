@@ -46,7 +46,7 @@ def test_import_with_empty_env_vars():
     assert "GUILD_ID= 0" in out, out
     assert "CLAN_NAME= TALENT" in out, out
     assert "VOTES_REQUIRED= 2" in out, out
-    assert "COMMANDS= 27" in out, out
+    assert "COMMANDS= 28" in out, out
     print("  ok: бот стартует при пустых переменных окружения")
 
 
