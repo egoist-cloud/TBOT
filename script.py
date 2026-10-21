@@ -1153,30 +1153,56 @@ async def close_application_thread(thread, closed_by, reason):
 # ============================================================
 # ГОЛОСА
 # ============================================================
-async def _get_votes(mid):
-    return await votes_repo.get_votes(mid)
+def _new_app_id() -> str:
+    """Идентификатор заявки. Один на заявку, а не на сообщение.
+
+    Заявка публикуется сразу в двух местах: в канале заявок и в
+    отдельной ветке. Раньше голоса считались по id сообщения, поэтому
+    у одной заявки было две независимые записи голосов и можно было
+    проголосовать «за» в канале, а «против» — в ветке.
+    """
+    return uuid.uuid4().hex[:10]
 
 
-async def _save_votes(mid, st):
-    await votes_repo.save_votes(mid, st)
+def _app_id_of(button) -> str:
+    """Достаёт app_id из custom_id кнопки вида 'accept_btn:<app_id>'."""
+    cid = getattr(button, "custom_id", "") or ""
+    return cid.split(":", 1)[1] if ":" in cid else ""
 
 
-async def _vote(interaction, kind):
+def _app_id_for(interaction, button=None) -> str:
+    """app_id заявки из кнопки; fallback — id сообщения (старые сообщения)."""
+    app_id = _app_id_of(button) if button is not None else ""
+    if app_id:
+        return app_id
+    message = getattr(interaction, "message", None)
+    return str(message.id) if message is not None else ""
+
+
+async def _get_votes(app_id):
+    return await votes_repo.get_votes(app_id)
+
+
+async def _save_votes(app_id, st):
+    await votes_repo.save_votes(app_id, st)
+
+
+async def _vote(interaction, kind, button=None):
     await interaction.response.defer()
     if not user_can_review(interaction.user):
         await safe_send(interaction.followup, "❌ Нет прав.", ephemeral=True)
         return
-    st = await _get_votes(interaction.message.id)
-    if interaction.user.id in st["voters"] and not user_can_spam_vote(interaction.user):
+    app_id = _app_id_for(interaction, button)
+    st, applied = await votes_repo.apply_vote(
+        app_id, kind, interaction.user.id,
+        allow_repeat=user_can_spam_vote(interaction.user),
+    )
+    if not applied:
         await safe_send(interaction.followup, "Вы уже голосовали.", ephemeral=True)
         return
-    st[kind] += 1
-    if interaction.user.id not in st["voters"]:
-        st["voters"].append(interaction.user.id)
-    await _save_votes(interaction.message.id, st)
 
-    view = ApplicationManagement()
-    await view.update_labels(interaction.message.id)
+    view = ApplicationManagement(app_id)
+    await view.update_labels()
     if st[kind] >= VOTES_REQUIRED:
         embed = interaction.message.embeds[0]
         status = "Принят" if kind == "accept" else "Отклонен"
@@ -1221,17 +1247,32 @@ async def _vote(interaction, kind):
 # МЕНЮ ЗАЯВКИ
 # ============================================================
 class ApplicationManagement(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
+    """Кнопки заявки.
 
-    async def update_labels(self, mid):
-        st = await _get_votes(mid)
+    app_id зашит в custom_id кнопок: заявка публикуется в канале и в
+    ветке, и обе копии должны делить одни и те же голоса. Без app_id
+    в custom_id две заявки конфликтовали бы в реестре persistent-view.
+    """
+
+    def __init__(self, app_id: str = ""):
+        super().__init__(timeout=None)
+        self.app_id = str(app_id or "")
+        if self.app_id:
+            # discord.py копирует кнопки в экземпляр: правка не влияет
+            # на сам класс и на другие экземпляры.
+            for child in self.children:
+                if child.custom_id:
+                    child.custom_id = f"{child.custom_id}:{self.app_id}"
+
+    async def update_labels(self, mid=None):
+        st = await _get_votes(self.app_id or mid)
         for c in self.children:
-            if c.custom_id == "accept_btn":
+            base = (c.custom_id or "").split(":", 1)[0]
+            if base == "accept_btn":
                 c.label = f"Принять {st['accept']}/{VOTES_REQUIRED}"
-            elif c.custom_id == "deny_btn":
+            elif base == "deny_btn":
                 c.label = f"Отклонить {st['deny']}/{VOTES_REQUIRED}"
-            elif c.custom_id == "voted_list_btn":
+            elif base == "voted_list_btn":
                 c.label = f"👥 {len(st['voters'])}"
 
     @discord.ui.button(label="🙋 Взять", style=discord.ButtonStyle.primary,
@@ -1251,12 +1292,12 @@ class ApplicationManagement(discord.ui.View):
     @discord.ui.button(label="Принять 0/2", style=discord.ButtonStyle.success,
                        custom_id="accept_btn", row=0)
     async def accept(self, i, b):
-        await _vote(i, "accept")
+        await _vote(i, "accept", b)
 
     @discord.ui.button(label="Отклонить 0/2", style=discord.ButtonStyle.danger,
                        custom_id="deny_btn", row=0)
     async def deny(self, i, b):
-        await _vote(i, "deny")
+        await _vote(i, "deny", b)
 
     @discord.ui.button(label="🚫 Выдать запрет", style=discord.ButtonStyle.secondary,
                        custom_id="tempban_btn", row=1)
@@ -1306,7 +1347,7 @@ class ApplicationManagement(discord.ui.View):
     @discord.ui.button(label="👥 0", style=discord.ButtonStyle.secondary,
                        custom_id="voted_list_btn", row=1)
     async def voted_list(self, i, b):
-        st = await _get_votes(i.message.id)
+        st = await _get_votes(_app_id_for(i, b))
         if not st["voters"]:
             await i.response.send_message("Пусто", ephemeral=True)
             return
@@ -1396,14 +1437,17 @@ class QuestionnaireModal(discord.ui.Modal, title="Заявка в клан"):
         e.set_footer(text=f"{CLAN_NAME} • {utc_stamp()}")
 
         ch = i.guild.get_channel(APPLICATIONS_CHANNEL_ID) if APPLICATIONS_CHANNEL_ID else None
+        # Один app_id на заявку: сообщение в канале и сообщение в ветке
+        # должны показывать одни и те же счётчики голосов.
+        app_id = _new_app_id()
         msg = None
         if ch:
             try:
-                view = ApplicationManagement()
+                view = ApplicationManagement(app_id)
                 msg = await safe_send(ch, content=f"🔔 Новая заявка от {i.user.mention}",
                                       embed=e, view=view)
                 if msg:
-                    await view.update_labels(msg.id)
+                    await view.update_labels()
                     await msg.edit(view=view)
             except Exception as ex:
                 log(f"⚠️ Канал заявок: {ex}")
@@ -1416,15 +1460,16 @@ class QuestionnaireModal(discord.ui.Modal, title="Заявка в клан"):
                 status="pending",
                 message_id=str(msg.id) if msg else "",
                 channel_id=str(ch.id) if ch else "",
+                app_id=app_id,
             )
         except Exception as ex:
             log(f"⚠️ Не сохранил заявку в БД: {ex}")
 
         await safe_send(i.followup, "✅ Ваша заявка отправлена на рассмотрение!", ephemeral=True)
-        asyncio.create_task(_create_application_thread(i, e))
+        asyncio.create_task(_create_application_thread(i, e, app_id))
 
 
-async def _create_application_thread(i, e):
+async def _create_application_thread(i, e, app_id: str = ""):
     try:
         if not THREADS_CHANNEL_ID:
             return
@@ -1448,11 +1493,12 @@ async def _create_application_thread(i, e):
                         tasks_.append(t.add_user(m))
         for x in range(0, len(tasks_), 20):
             await asyncio.gather(*tasks_[x:x + 20], return_exceptions=True)
-        view = ApplicationManagement()
+        # Тот же app_id, что и у сообщения в канале: голоса общие.
+        view = ApplicationManagement(app_id)
         msg = await safe_send(t, content=f"{i.user.mention}, ваша заявка на рассмотрении.",
                               embed=e, view=view)
         if msg:
-            await view.update_labels(msg.id)
+            await view.update_labels()
             await msg.edit(view=view)
     except Exception as ex:
         log(f"⚠️ Ветка: {ex}")
@@ -1532,29 +1578,58 @@ class MyBot(commands.Bot):
                 log(f"✅ AI-сервис готов (провайдеров: {n_providers}, "
                     f"правил: {n_rules})")
 
-            if not GUILD_ID:
-                log("❌ GUILD_ID = 0 — синхронизация команд не выполнится!")
-                return
-
-            g = discord.Object(id=GUILD_ID)
-            self.tree.copy_global_to(guild=g)
-            log(f"🔄 Синхронизация команд для guild {GUILD_ID}...")
-            synced = await self.tree.sync(guild=g)
-            log(f"✅ Команд синхронизировано: {len(synced)}")
-
+            # Persistent-view и фоновые задачи нужны ВСЕГДА, даже если
+            # GUILD_ID не задан: иначе бот поднимается «живым», но кнопки
+            # заявок не работают и фоновые задачи не крутятся.
             self.add_view(ApplicationManagement())
             log("✅ ApplicationManagement view добавлен")
+            restored = await self._restore_application_views()
+            log(f"✅ Кнопки открытых заявок восстановлены: {restored}")
             self.add_view(PanelView())
             log("✅ PanelView добавлен")
+
+            if GUILD_ID:
+                g = discord.Object(id=GUILD_ID)
+                self.tree.copy_global_to(guild=g)
+                log(f"🔄 Синхронизация команд для guild {GUILD_ID}...")
+                synced = await self.tree.sync(guild=g)
+                log(f"✅ Команд синхронизировано: {len(synced)}")
+            else:
+                log("⚠️ GUILD_ID = 0 — команды синхронизируются только глобально")
 
             auto_sync.start()
             activity_tracker.start()
             hourly_clan_sync.start()
-            log("✅ Все 2 фоновых задачи запущены")
+            log("✅ Фоновые задачи запущены")
         except Exception as e:
             log(f"❌ ОШИБКА в setup_hook: {type(e).__name__}: {e}")
             traceback.print_exc()
             raise
+
+    async def _restore_application_views(self) -> int:
+        """Поднимает кнопки заявок, которые остались на рассмотрении.
+
+        Без этого после рестарта бота кнопки на сообщениях с открытыми
+        заявками перестают работать.
+        """
+        try:
+            pending = await applications_repo.list_pending_applications()
+        except Exception as e:
+            log(f"⚠️ Не удалось прочитать заявки: {e}")
+            return 0
+        count = 0
+        for rec in pending:
+            app_id = (rec.get("app_id") or "").strip()
+            if not app_id:
+                # Заявка создана до появления app_id: её кнопки работают
+                # по id сообщения, отдельный view не нужен.
+                continue
+            try:
+                self.add_view(ApplicationManagement(app_id))
+                count += 1
+            except Exception as e:
+                log(f"⚠️ Не поднял view заявки {app_id}: {e}")
+        return count
 
     async def close(self):
         await api.close()

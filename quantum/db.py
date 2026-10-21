@@ -37,6 +37,25 @@ async def close_db() -> None:
         _db = None
 
 
+async def _ensure_column(db, table: str, column: str, ddl: str) -> None:
+    """Добавляет колонку в существующую таблицу, если её ещё нет.
+
+    Нужна для миграции БД, созданных до появления колонок
+    (accept_voters / deny_voters / applications.app_id).
+    """
+    cursor = await db.execute(f"PRAGMA table_info({table})")
+    rows = await cursor.fetchall()
+    await cursor.close()
+    if any(r["name"] == column for r in rows):
+        return
+    try:
+        await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        await db.commit()
+        print(f"[db] миграция: {table}.{column} добавлена")
+    except Exception as e:
+        print(f"[db] миграция {table}.{column}: {e}")
+
+
 async def init_db() -> None:
     """Создаёт таблицы, если их ещё нет."""
     db = await get_db()
@@ -62,10 +81,12 @@ async def init_db() -> None:
         );
 
         CREATE TABLE IF NOT EXISTS votes (
-            message_id TEXT PRIMARY KEY,
-            accept     INTEGER NOT NULL DEFAULT 0,
-            deny       INTEGER NOT NULL DEFAULT 0,
-            voters     TEXT NOT NULL DEFAULT '[]'
+            message_id    TEXT PRIMARY KEY,
+            accept        INTEGER NOT NULL DEFAULT 0,
+            deny          INTEGER NOT NULL DEFAULT 0,
+            voters        TEXT NOT NULL DEFAULT '[]',
+            accept_voters TEXT NOT NULL DEFAULT '[]',
+            deny_voters   TEXT NOT NULL DEFAULT '[]'
         );
 
         CREATE TABLE IF NOT EXISTS seen (
@@ -90,11 +111,23 @@ async def init_db() -> None:
             clan_name   TEXT,
             message_id  TEXT,
             channel_id  TEXT,
+            app_id      TEXT,
             created_at  TEXT,
             updated_at  TEXT
         );
-
+        """
+    )
+    # Миграции для БД, созданных до этих колонок. Идут ДО создания
+    # индексов: индекс по applications(app_id) на старой БД падал бы
+    # с "no such column: app_id" и ломал бы запуск бота.
+    await _ensure_column(db, "votes", "accept_voters", "TEXT NOT NULL DEFAULT '[]'")
+    await _ensure_column(db, "votes", "deny_voters", "TEXT NOT NULL DEFAULT '[]'")
+    await _ensure_column(db, "applications", "app_id", "TEXT")
+    # Индексы — только после миграций, когда колонки точно есть.
+    await db.executescript(
+        """
         CREATE INDEX IF NOT EXISTS idx_ai_cache_expires ON ai_cache (expires_at);
+        CREATE INDEX IF NOT EXISTS idx_applications_app ON applications (app_id);
         """
     )
     await db.commit()
