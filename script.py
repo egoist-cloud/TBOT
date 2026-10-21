@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 from flask import Flask
 
 from quantum.db import init_db, close_db
+from quantum.env import env_int
 from quantum.migrations import import_json_to_sqlite
 from quantum.agent import Agent
 from quantum.repositories import votes as votes_repo
@@ -70,7 +71,7 @@ def log(msg: str):
 # НАСТРОЙКИ
 # ============================================================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+GUILD_ID = env_int("GUILD_ID", 0)
 
 LOG_CHANNEL_ID = 1511463623703265361
 APPLICATION_LOGS_CHANNEL_ID = 1511463623703265361
@@ -80,24 +81,29 @@ DB_CHANNEL_ID = 1554883485834149888
 ERROR_LOG_CHANNEL_ID = 1511463623703265361
 
 # Канал ИИ-агента: ошибки команд, отчёты о состоянии, идеи по улучшению.
-AGENT_CHANNEL_ID = int(os.getenv("AGENT_CHANNEL_ID", "1556427610160889907") or 0)
+AGENT_CHANNEL_ID = env_int("AGENT_CHANNEL_ID", 1556427610160889907)
 
-ALLOWED_ROLE_ID = int(os.getenv("ALLOWED_ROLE_ID", "0"))
-REVIEWER_ROLE_ID_2 = int(os.getenv("REVIEWER_ROLE_ID_2", "0"))
-SPAM_VOTE_ROLE_ID = int(os.getenv("SPAM_VOTE_ROLE_ID", "0"))
-EXTRA_REVIEWER_ROLE_1 = int(os.getenv("EXTRA_REVIEWER_ROLE_1", "0"))
-EXTRA_REVIEWER_ROLE_2 = int(os.getenv("EXTRA_REVIEWER_ROLE_2", "0"))
-EXTRA_REVIEWER_ROLE_3 = int(os.getenv("EXTRA_REVIEWER_ROLE_3", "0"))
+ALLOWED_ROLE_ID = env_int("ALLOWED_ROLE_ID", 0)
+REVIEWER_ROLE_ID_2 = env_int("REVIEWER_ROLE_ID_2", 0)
+SPAM_VOTE_ROLE_ID = env_int("SPAM_VOTE_ROLE_ID", 0)
+EXTRA_REVIEWER_ROLE_1 = env_int("EXTRA_REVIEWER_ROLE_1", 0)
+EXTRA_REVIEWER_ROLE_2 = env_int("EXTRA_REVIEWER_ROLE_2", 0)
+EXTRA_REVIEWER_ROLE_3 = env_int("EXTRA_REVIEWER_ROLE_3", 0)
 
-AUTO_ROLE_ID = int(os.getenv("AUTO_ROLE_ID", "0"))
-BYPASS_ROLE_ID = int(os.getenv("BYPASS_ROLE_ID", "0"))
-NO_COOLDOWN_ROLE_ID = int(os.getenv("NO_COOLDOWN_ROLE_ID", "0"))
+AUTO_ROLE_ID = env_int("AUTO_ROLE_ID", 0)
+BYPASS_ROLE_ID = env_int("BYPASS_ROLE_ID", 0)
+NO_COOLDOWN_ROLE_ID = env_int("NO_COOLDOWN_ROLE_ID", 0)
 
-ACTIVITY_ROLE_ID = int(os.getenv("ACTIVITY_ROLE_ID", "1448368118190837800"))
+ACTIVITY_ROLE_ID = env_int("ACTIVITY_ROLE_ID", 1448368118190837800)
 
-CLAN_NAME = os.getenv("CLAN_NAME", "TALENT")
+CLAN_NAME = (os.getenv("CLAN_NAME") or "TALENT").strip() or "TALENT"
 CLAN_URL = os.getenv("CLAN_URL", "https://cs2red.ru/clans/id/47")
-VOTES_REQUIRED = int(os.getenv("VOTES_REQUIRED", "2"))
+VOTES_REQUIRED = env_int("VOTES_REQUIRED", 2)
+
+# Фиксированный custom_id выпадающего списка заявок. Нужен, чтобы список
+# работал после рестарта бота: со случайным custom_id discord.py теряет
+# обработчик, и Discord отвечает «Приложение не ответило вовремя» (10062).
+CLAN_SELECT_CUSTOM_ID = "clan_select_quantum"
 
 ACTIVITY_GOAL_HOURS = 8
 ACTIVITY_MIN_HOURS = 8
@@ -261,7 +267,7 @@ CLAN_ROLE_MAP = {
     133: 1555183874605056080,
 }
 
-SYNC_INTERVAL_MINUTES = int(os.getenv("SYNC_INTERVAL_MINUTES", "15"))
+SYNC_INTERVAL_MINUTES = env_int("SYNC_INTERVAL_MINUTES", 15)
 REQUEST_DELAY = 0.3
 
 ACTIVITY_TRACK_SECONDS = 300
@@ -1409,7 +1415,14 @@ class QuestionnaireModal(discord.ui.Modal, title="Заявка в клан"):
             self.add_item(it)
 
     async def on_submit(self, i):
-        await i.response.defer(ephemeral=False)
+        # Отвечаем сразу (defer) — Discord ждёт 3 секунды. Дальше идут
+        # проверки БД (бан, дубликат заявки): они уже не тормозят ответ.
+        try:
+            await i.response.defer(ephemeral=False)
+        except discord.InteractionResponded:
+            pass
+        except discord.HTTPException as e:
+            log(f"⚠️ defer формы заявки: {e}")
         blocked, rt = await is_user_blocked(i.user.id)
         if blocked:
             await safe_send(i.followup, rt, ephemeral=True)
@@ -1518,22 +1531,97 @@ async def _create_application_thread(i, e, app_id: str = ""):
         log(f"⚠️ Ветка: {ex}")
 
 
+async def open_application_modal(i, clan_name: str) -> None:
+    """Открывает модальное окно заявки. Первое действие — сам ответ.
+
+    Discord даёт 3 секунды на ответ, иначе взаимодействие протухает
+    (10062 «Приложение не ответило вовремя»). Поэтому здесь нет ни
+    запросов к БД, ни обращений к API: проверки выполняются уже внутри
+    модального окна (QuestionnaireModal.on_submit).
+    """
+    try:
+        await i.response.send_modal(QuestionnaireModal(clan_name))
+        return
+    except discord.InteractionResponded:
+        pass  # уже отвечено — отправим через followup
+    except discord.HTTPException as e:
+        log(f"⚠️ send_modal: {e}")
+    try:
+        await i.followup.send_modal(QuestionnaireModal(clan_name))
+    except discord.HTTPException as e:
+        log(f"⚠️ followup.send_modal: {e}")
+        await safe_send(i.followup,
+                        "❌ Не удалось открыть форму заявки. Попробуйте ещё раз.",
+                        ephemeral=True)
+
+
 class ClanSelect(discord.ui.Select):
+    """Выбор клана для подачи заявки.
+
+    Фиксированный custom_id обязателен: без него discord.py не находит
+    обработчик после рестарта бота (Render redeploy) и Discord отвечает
+    «Приложение не ответило вовремя» (10062).
+    """
+
     def __init__(self):
-        super().__init__(placeholder="Выберите клан", min_values=1, max_values=1,
-                         options=[discord.SelectOption(label=CLAN_NAME,
-                                                         description=f"Клан {CLAN_NAME}")])
+        super().__init__(
+            custom_id=CLAN_SELECT_CUSTOM_ID,
+            placeholder="Выберите клан",
+            min_values=1,
+            max_values=1,
+            options=[discord.SelectOption(label=CLAN_NAME,
+                                          description=f"Клан {CLAN_NAME}")],
+        )
 
     async def callback(self, i):
-        # Отвечаем мгновенно (modal), чтобы не получить 10062 Unknown interaction.
-        # Проверку дубликатов делаем внутри модального окна (on_submit).
-        await i.response.send_modal(QuestionnaireModal(self.values[0]))
+        # Первое и единственное действие — ответ модальным окном.
+        # Никаких запросов к БД/API до ответа: Discord ждёт 3 секунды,
+        # иначе взаимодействие протухает (10062).
+        # Проверки (дубликат заявки, бан) делаются внутри on_submit.
+        await open_application_modal(i, self.values[0])
+
+
+class LegacyClanSelect(discord.ui.DynamicItem, template=r"^[0-9a-f]{32}$"):
+    """Обработчик старых выпадающих списков.
+
+    До фикса custom_id генерировался случайно, поэтому после рестарта
+    бота Discord не находил обработчик и возвращал 10062. Этот item
+    ловит такие (уже опубликованные) списки по их случайному custom_id.
+    """
+
+    def __init__(self, item):
+        super().__init__(item)
+        self.clan_name = CLAN_NAME
+
+    async def callback(self, i):
+        # Проверку делаем здесь, а не в interaction_check: если проверка
+        # отклонит взаимодействие, ответ не уйдёт и снова будет 10062.
+        msg = getattr(i, "message", None)
+        user = getattr(getattr(i, "client", None), "user", None)
+        author_id = getattr(getattr(msg, "author", None), "id", None)
+        if msg is None or user is None or author_id != user.id:
+            try:
+                await i.response.send_message(
+                    "❌ Этот список устарел. Напишите в чат клана — пришлём "
+                    "новую форму заявки.", ephemeral=True)
+            except discord.HTTPException as e:
+                log(f"⚠️ ответ на устаревший список: {e}")
+            return
+        await open_application_modal(i, self.clan_name)
 
 
 class ClanView(discord.ui.View):
+    """Персистентный view: работает и после рестарта бота.
+
+    timeout=None + явный custom_id у select'а позволяют зарегистрировать
+    view через bot.add_view() — тогда старое сообщение в канале продолжает
+    работать, даже если бот перезапустили.
+    """
+
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(ClanSelect())
+        self.add_item(discord.ui.Button(label=CLAN_NAME, url=CLAN_URL, row=1))
 
 
 # ============================================================
@@ -1597,6 +1685,16 @@ class MyBot(commands.Bot):
             # заявок не работают и фоновые задачи не крутятся.
             self.add_view(ApplicationManagement())
             log("✅ ApplicationManagement view добавлен")
+            # Персистентный view выбора клана: опубликованное ранее сообщение
+            # со списком продолжает работать после рестарта бота.
+            self.add_view(ClanView())
+            log("✅ ClanView (выбор клана) добавлен")
+            # Ловим старые списки со случайным custom_id (иначе 10062).
+            try:
+                self.add_dynamic_items(LegacyClanSelect)
+                log("✅ LegacyClanSelect добавлен")
+            except Exception as e:
+                log(f"⚠️ LegacyClanSelect: {e}")
             restored = await self._restore_application_views()
             log(f"✅ Кнопки открытых заявок восстановлены: {restored}")
             self.add_view(PanelView())
@@ -3134,7 +3232,6 @@ async def setup(ctx):
         "По вопросам вступления: обратитесь к администрации."
     )
     v = ClanView()
-    v.add_item(discord.ui.Button(label=CLAN_NAME, url=CLAN_URL, row=1))
     await safe_send(ctx.channel, embed=e, view=v)
 
 
@@ -3417,7 +3514,7 @@ async def before_hourly_clan_sync():
 # ============================================================
 # ИИ-АГЕНТ: НАБЛЮДЕНИЕ ЗА СИСТЕМОЙ, ОТЧЁТЫ, ИДЕИ
 # ============================================================
-AGENT_CHECK_MINUTES = int(os.getenv("AGENT_CHECK_MINUTES", "30") or 30)
+AGENT_CHECK_MINUTES = env_int("AGENT_CHECK_MINUTES", 30)
 
 
 @tasks.loop(minutes=AGENT_CHECK_MINUTES)

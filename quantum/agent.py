@@ -15,11 +15,11 @@ from __future__ import annotations
 
 import datetime
 import json
-import os
 import time
 
 import discord
 
+from .env import env_int
 from .repositories import applications as applications_repo
 from .repositories import links as links_repo
 from .repositories import moderation as moderation_repo
@@ -29,10 +29,8 @@ from .repositories import users as users_repo
 from .repositories import votes as votes_repo
 
 # Канал агента и расписание (в минутах).
-AGENT_HEALTH_INTERVAL_MINUTES = int(
-    os.getenv("AGENT_HEALTH_INTERVAL_MINUTES", "120") or 120)
-AGENT_IDEA_INTERVAL_MINUTES = int(
-    os.getenv("AGENT_IDEA_INTERVAL_MINUTES", "360") or 360)
+AGENT_HEALTH_INTERVAL_MINUTES = env_int("AGENT_HEALTH_INTERVAL_MINUTES", 120)
+AGENT_IDEA_INTERVAL_MINUTES = env_int("AGENT_IDEA_INTERVAL_MINUTES", 360)
 
 # Сколько последних идей помним, чтобы не повторяться.
 MAX_IDEAS = 12

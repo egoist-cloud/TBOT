@@ -23,10 +23,12 @@ import os
 
 import aiohttp
 
+from ..env import env_float
+
 log = logging.getLogger("quantum.ai")
 
 # Общий таймаут на один запрос к провайдеру (сек).
-DEFAULT_TIMEOUT = float(os.getenv("AI_REQUEST_TIMEOUT", "30"))
+DEFAULT_TIMEOUT = env_float("AI_REQUEST_TIMEOUT", 30.0)
 
 
 class AIProvider:

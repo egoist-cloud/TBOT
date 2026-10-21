@@ -107,7 +107,7 @@ async def count_pending_applications() -> int:
 ACTIVE_STATUSES = ("pending", "voting")
 
 # Основной клан — по нему считаем «заявки в клан» и «заявки в другие кланы».
-DEFAULT_CLAN_NAME = os.getenv("CLAN_NAME", "TALENT")
+DEFAULT_CLAN_NAME = (os.getenv("CLAN_NAME") or "TALENT").strip() or "TALENT"
 
 
 async def get_user_stats(user_id) -> dict:
