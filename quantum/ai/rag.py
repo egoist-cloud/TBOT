@@ -62,8 +62,8 @@ _TRANS = {
 # «паблик» ~ PUBLIC, «ультра» ~ ULTRA и т.д.). Применяется до транслитерации.
 
 _WORD_MAP = {
-    "паблик": "public", "паблике": "public", "паблике": "public",
-    "паблик": "public", "паблика": "public", "паблика": "public",
+    "паблик": "public", "паблике": "public",
+    "паблика": "public",
     "ультра": "ultra", "ультры": "ultra", "ультре": "ultra",
     "экстрим": "extreme", "экстрима": "extreme",
     "медиум": "medium", "медиума": "medium",
@@ -88,11 +88,11 @@ _WORD_MAP = {
     "чит": "cheat", "читы": "cheat", "читов": "cheat", "софт": "cheat",
     "скрипт": "script", "скрипты": "script",
     # Оскорбления/мат/ругань -> общий токен (правило 2.2 и вопросы игроков)
-    "оскорбление": "insult", "оскорбления": "insult", "оскорбление": "insult",
+    "оскорбление": "insult", "оскорбления": "insult",
     "оскорблять": "insult", "оскорбляет": "insult", "оскорбляешь": "insult",
     "оскорбляют": "insult", "оскорбил": "insult",
     "оскает": "insult", "оскабляет": "insult", "оскарбляет": "insult",
-    "оскабляет": "insult", "оскарблеет": "insult",
+    "оскарблеет": "insult",
     "обзывается": "insult", "обзывает": "insult", "обозвал": "insult",
     "мат": "insult", "ругань": "insult", "перепалка": "insult",
     "перепалки": "insult",
@@ -261,7 +261,6 @@ class RulesIndex:
             docs = list(self._docs)
             tokens = list(self._tokens)
             doc_len = list(self._doc_len)
-            n = self._n
             avgdl = self._avgdl
             idf_cache = dict(self._idf_cache)
         q_tokens = _tokenize(query)

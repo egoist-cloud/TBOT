@@ -23,7 +23,6 @@ from discord.ext import commands, tasks
 from discord import app_commands
 from dotenv import load_dotenv
 from flask import Flask
-from bs4 import BeautifulSoup
 
 from quantum.db import init_db, close_db
 from quantum.migrations import import_json_to_sqlite
@@ -1002,7 +1001,7 @@ async def sync_role_by_id(guild, member, steam_id):
         await member.add_roles(target)
         return f"✅ {member.display_name}: '{tn}'"
     except discord.Forbidden:
-        return f"❌ нет прав"
+        return "❌ нет прав"
 
 
 CLAN_ROLE_COLOR = 0x8E7CF3  # приятный фиолетовый — Discord не умеет градиенты через бота
@@ -1050,7 +1049,7 @@ async def sync_clan_role_by_id(guild, member, steam_id):
     # Проверяем права бота заранее (Manage Roles нужен для создания роли).
     me = guild.me
     if me is not None and not me.guild_permissions.manage_roles:
-        log(f"⚠️ sync_clan: бот не имеет права Manage Roles — роль создать не удастся")
+        log("⚠️ sync_clan: бот не имеет права Manage Roles — роль создать не удастся")
 
     user = await api.cs2red_user(steam_id)
     if user is None:
@@ -1081,12 +1080,12 @@ async def sync_clan_role_by_id(guild, member, steam_id):
                     await member.remove_roles(r)
                 except discord.Forbidden:
                     pass
-            return f"🔄 клан снят"
-        return f"ℹ️ без клана"
+            return "🔄 клан снят"
+        return "ℹ️ без клана"
 
     clan_name = clan.get("clan_name") or ""
     if not clan_name:
-        return f"ℹ️ клан без имени"
+        return "ℹ️ клан без имени"
 
     # Ищем роль по имени (или по зарезервированному id в CLAN_ROLE_MAP).
     target = discord.utils.get(guild.roles, name=clan_name)
@@ -1116,7 +1115,7 @@ async def sync_clan_role_by_id(guild, member, steam_id):
         await member.add_roles(target)
         return f"✅ выдан клан '{clan_name}'" + (f" ({created_status})" if created_status else "")
     except discord.Forbidden:
-        return f"❌ нет прав выдать роль"
+        return "❌ нет прав выдать роль"
 
 
 # ============================================================
@@ -2224,7 +2223,6 @@ async def run_auto_link(i, ephemeral: bool = False):
             now = time.time()
             if now - last_update >= 10.0:
                 last_update = now
-                last_progress_update = processed
                 try:
                     await msg.edit(embed=_progress_embed(processed, total, len(added)))
                 except Exception:
@@ -3021,7 +3019,7 @@ async def build_auto_sync_embeds(guild: discord.Guild) -> list:
     current_lines = []
     current_len = len(header_block)
 
-    for disc, sid, nick_cs2, clan_name in rows:
+    for disc, sid, _nick_cs2, clan_name in rows:
         line = f"{_pad(disc, W_DISC)} | {_pad(sid, W_STEAM)} | {_pad(clan_name, W_CLAN)}"
         line_len = len(line) + 1
         if current_len + line_len > MAX_PAGE_CHARS and current_lines:

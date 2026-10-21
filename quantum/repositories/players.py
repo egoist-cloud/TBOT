@@ -1,6 +1,5 @@
 """Репозиторий игроков: таблица players (steamid64 -> данные)."""
 import json
-from typing import Any
 
 from ..db import get_db
 
