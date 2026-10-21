@@ -1,0 +1,8 @@
+# Дополнительные зависимости для разработки и CI.
+# Установка: pip install -r requirements.txt -r requirements-dev.txt
+
+# Линтер (запускается в .github/workflows/ci.yml)
+ruff>=0.6
+
+# Тесты (запускаются в .github/workflows/ci.yml)
+pytest>=8.0

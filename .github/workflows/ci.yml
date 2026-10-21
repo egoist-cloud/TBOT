@@ -1,0 +1,50 @@
+# CI для проекта Quantum (TBOT).
+#
+# Что проверяем:
+#   1) ruff — ошибки, которые обычно находит pyflakes (неиспользуемые
+#      импорты, неопределённые имена), плюс bugbear и asyncio.
+#   2) pytest — тесты: утечка cookie на сторонние хосты, маскирование
+#      секретов в логах, атомарность голосования, единый app_id заявки,
+#      миграции БД.
+
+name: CI
+
+on:
+  push:
+    branches: [main, "fix/**", "feat/**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ruff + pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Ruff (lint)
+        run: ruff check .
+
+      - name: Pytest
+        run: pytest -v
