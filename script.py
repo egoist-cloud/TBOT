@@ -79,6 +79,8 @@ APPLICATIONS_CHANNEL_ID = 1511463623703265361
 THREADS_CHANNEL_ID = 1236678127778795660
 DB_CHANNEL_ID = 1554883485834149888
 ERROR_LOG_CHANNEL_ID = 1511463623703265361
+# Куда /check присылает мини-отчёт о найденных мутах/банах.
+CHECK_LOG_CHANNEL_ID = env_int("CHECK_LOG_CHANNEL_ID", LOG_CHANNEL_ID)
 
 # Канал ИИ-агента: ошибки команд, отчёты о состоянии, идеи по улучшению.
 AGENT_CHANNEL_ID = env_int("AGENT_CHANNEL_ID", 1556427610160889907)
@@ -1233,6 +1235,55 @@ def _known_clan_role_names(clans: list | None) -> set:
     return names
 
 
+# Кто какую роль клана получил: discord_id -> role_id. Нужно, чтобы снять
+# роль даже если клан переименовали или он исчез из /api/clans.
+CLAN_MEMBERS_FILE = "clan_members.json"
+
+
+def _load_clan_members() -> dict:
+    try:
+        p = data_path(CLAN_MEMBERS_FILE)
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {str(k): int(v) for k, v in data.items() if str(v).isdigit()}
+    except Exception as e:
+        log(f"⚠️ не прочитал {CLAN_MEMBERS_FILE}: {e}")
+    return {}
+
+
+def _save_clan_members(data: dict) -> None:
+    try:
+        data_path(CLAN_MEMBERS_FILE).write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        log(f"⚠️ не записал {CLAN_MEMBERS_FILE}: {e}")
+
+
+def _remember_member_clan_role(discord_id, role_id) -> None:
+    data = _load_clan_members()
+    if data.get(str(discord_id)) == int(role_id):
+        return
+    data[str(discord_id)] = int(role_id)
+    _save_clan_members(data)
+
+
+def _forget_member_clan_role(discord_id) -> None:
+    data = _load_clan_members()
+    if str(discord_id) not in data:
+        return
+    data.pop(str(discord_id))
+    _save_clan_members(data)
+
+
+def _clan_roles_above_bot(guild, roles) -> list:
+    """Роли, которые бот не сможет снять/выдать: они не ниже его top_role."""
+    me = guild.me
+    if me is None or me.top_role is None:
+        return list(roles)
+    return [r for r in roles if r.position >= me.top_role.position]
+
+
 async def _remove_roles_checked(member, roles, reason: str = "Синхронизация клана") -> list:
     """Снимает роли и возвращает список ошибок (пустой — всё снято)."""
     errors = []
@@ -1333,12 +1384,22 @@ async def sync_clan_role_by_id(guild, member, steam_id):
 
     if clan is None:
         # Игрок не в клане — снимаем все управляемые роли клана.
-        held = [r for r in member.roles if r.id in managed or r.name in known_names]
+        stored = _load_clan_members().get(str(member.id))
+        managed_ids = managed | ({stored} if stored else set())
+        held = [r for r in member.roles
+                if r.id in managed_ids or r.name in known_names]
         if held:
+            above = _clan_roles_above_bot(guild, held)
+            if above:
+                return ("⚠️ не удалось снять роль клана: "
+                        + ", ".join(f"«{r.name}»" for r in above)
+                        + " — поднимите роль бота выше ролей клана")
             errors = await _remove_roles_checked(member, held)
             if errors:
                 return "⚠️ клан снят не полностью: " + "; ".join(errors)
+            _forget_member_clan_role(member.id)
             return "🔄 клан снят"
+        _forget_member_clan_role(member.id)  # запись без роли — чистим
         return "ℹ️ без клана"
 
     clan_name = (clan.get("clan_name") or "").strip()
@@ -1360,17 +1421,33 @@ async def sync_clan_role_by_id(guild, member, steam_id):
 
     _remember_clan_role_name(clan_name)
 
-    # Снимаем прочие управляемые роли клана.
+    above_target = _clan_roles_above_bot(guild, [target])
+    if above_target:
+        return (f"⚠️ роль «{target.name}» выше роли бота — "
+                "поднимите роль бота выше ролей клана")
+
+    # Снимаем прочие управляемые роли клана (включая запомненную за игроком).
+    stored = _load_clan_members().get(str(member.id))
     held = [r for r in member.roles
-            if (r.id in managed or r.name in known_names) and r != target]
-    errors = await _remove_roles_checked(member, held) if held else []
+            if (r.id in managed or r.name in known_names
+                or (stored is not None and r.id == stored)) and r != target]
+    errors = []
+    if held:
+        above = _clan_roles_above_bot(guild, held)
+        if above:
+            errors.append("выше роли бота: " + ", ".join(f"«{r.name}»" for r in above))
+            held = [r for r in held if r not in above]
+        if held:
+            errors.extend(await _remove_roles_checked(member, held))
     suffix = (" (не сняты: " + "; ".join(errors) + ")") if errors else ""
 
     if target in member.roles:
+        _remember_member_clan_role(member.id, target.id)
         return (f"✅ уже в '{clan_name}'"
                 + (f" ({created_status})" if created_status else "") + suffix)
     try:
         await member.add_roles(target)
+        _remember_member_clan_role(member.id, target.id)
         return (f"✅ выдан клан '{clan_name}'"
                 + (f" ({created_status})" if created_status else "") + suffix)
     except discord.Forbidden:
@@ -1952,6 +2029,9 @@ class MyBot(commands.Bot):
             activity_tracker.start()
             hourly_clan_sync.start()
             agent_watch.start()
+            if not GUILD_ID:
+                log("⚠️ GUILD_ID = 0 — автосинхронизация ролей клана и /check "
+                    "не смогут найти сервер (задайте GUILD_ID)")
             log("✅ Фоновые задачи запущены")
         except Exception as e:
             log(f"❌ ОШИБКА в setup_hook: {type(e).__name__}: {e}")
@@ -2258,13 +2338,21 @@ async def run_sync_all(i, ephemeral: bool = False):
             if m is None:
                 res.append(f"⚠️ {did}: нет")
             else:
-                r1 = await sync_role_by_id(i.guild, m, sid)
+                try:
+                    r1 = await sync_role_by_id(i.guild, m, sid)
+                except Exception as e:
+                    await log_error(bot, f"sync_all:{did}", e)
+                    r1 = f"⚠️ ошибка роли: {str(e)[:150]}"
                 if api.blocked_reason in ("403", "429"):
                     res.append(f"⛔ остановлено: {api.blocked_reason} ({r1})")
                     stopped = True
                 else:
                     res.append(r1)
-                    r2 = await sync_clan_role_by_id(i.guild, m, sid)
+                    try:
+                        r2 = await sync_clan_role_by_id(i.guild, m, sid)
+                    except Exception as e:
+                        await log_error(bot, f"sync_all:clan:{did}", e)
+                        r2 = f"⚠️ ошибка клана: {str(e)[:150]}"
                     if api.blocked_reason in ("403", "429"):
                         res.append(f"⛔ остановлено: {api.blocked_reason} ({r2})")
                         stopped = True
@@ -2868,6 +2956,31 @@ async def _resolve_nick(steam_id: str, blocks: list) -> str:
     return steam_id
 
 
+def _build_check_log_text(initiator: str, checked: int, offenders: list,
+                          skipped: int, errors: int) -> str:
+    """Текст мини-отчёта для лог-канала: кто получал мут/бан и когда."""
+    lines = [
+        f"Инициатор: {initiator}",
+        f"Проверено: {checked} · с блокировками: {len(offenders)} · "
+        f"без SteamID: {skipped} · ошибок: {errors}",
+    ]
+    if offenders:
+        lines.append("\nКто получал блокировку и когда:")
+        for m, sid, active in offenders:
+            for b in active:
+                when = _fmt_block_ts(b.get("start_ts") or 0)
+                duration = _fmt_block_duration(b.get("start_ts") or 0, b.get("end_ts") or 0)
+                nick = b.get("player_nick") or m.display_name
+                lines.append(
+                    f"• {m.display_name} ({m.id}, {nick}, {sid}) — "
+                    f"{b.get('kind') or 'Бан'} · {when} · {duration} · "
+                    f"{(b.get('reason') or '—')[:120]} · "
+                    f"выдал: {b.get('admin') or '—'}")
+    else:
+        lines.append("\n✅ Активных блокировок нет.")
+    return "\n".join(lines)
+
+
 @bot.tree.command(name="check_mutes", description="Проверить муты игрока на cs2red")
 @app_commands.describe(steam_id="SteamID64 (17 цифр)")
 async def check_mutes(i, steam_id: str):
@@ -3009,6 +3122,20 @@ async def check(i):
             embed.add_field(name="Нарушители", value="✅ Не найдено", inline=False)
         embed.set_footer(text=f"Quantum • {utc_stamp()}")
         await safe_send(i.followup, embed=embed, ephemeral=True)
+
+        # Мини-отчёт в лог-канал: кто получал мут/бан, когда и на какой срок.
+        try:
+            log_ch = bot.get_channel(CHECK_LOG_CHANNEL_ID) if CHECK_LOG_CHANNEL_ID else None
+            if log_ch is None:
+                await log_error(bot, "/check.log",
+                                f"канал {CHECK_LOG_CHANNEL_ID} не найден")
+            else:
+                text = _build_check_log_text(i.user.display_name, checked, offenders,
+                                             skipped, errors)
+                await safe_send(log_ch, text,
+                                title=f"🛡 /check — клан «{CLAN_NAME}»")
+        except Exception as e:
+            await log_error(bot, "/check.log", e)
     except Exception as e:
         await log_error(i.client, "/check", e)
         try:
@@ -4068,16 +4195,32 @@ async def auto_sync():
         if not links or guild is None:
             return
 
+        clan_results = []
         for did, sid in links.items():
             m = guild.get_member(int(did))
             if m is None:
                 continue
+            # Раздельные try: ошибка выдачи роли по cs2red-роли не должна
+            # отменять синхронизацию роли клана (иначе роли «залипают»).
             try:
                 await sync_role_by_id(guild, m, sid)
-                await sync_clan_role_by_id(guild, m, sid)
             except Exception as e:
                 await log_error(bot, f"auto_sync:{did}", e)
+            try:
+                result = await sync_clan_role_by_id(guild, m, sid)
+                clan_results.append((m, result))
+            except Exception as e:
+                await log_error(bot, f"auto_sync:clan:{did}", e)
+                clan_results.append((m, f"⚠️ ошибка синхронизации: {str(e)[:150]}"))
             await asyncio.sleep(REQUEST_DELAY)
+
+        try:
+            updated = len([1 for _, r in clan_results
+                           if any(k in r for k in ("выдан", "создан", "клан снят", "уже в"))])
+            await _report_clan_sync(clan_results, len(clan_results), updated,
+                                    "Автосинхронизация кланов", silent_if_empty=True)
+        except Exception as e:
+            await log_error(bot, "auto_sync.clan_report", e)
 
         try:
             channel = bot.get_channel(LOG_CHANNEL_ID)
@@ -4110,6 +4253,37 @@ async def before_auto_sync():
 # ============================================================
 # ЧАСОВАЯ СИНХРОНИЗАЦИЯ КЛАНОВ
 # ============================================================
+async def _report_clan_sync(results, checked: int, updated: int, source: str,
+                            note: str = "", silent_if_empty: bool = False):
+    """Пишет в лог-канал, что изменилось и где не хватило прав.
+
+    Без этого автоматическое снятие ролей «молчало»: в канал уходила
+    только цифра «обновлено N», а причина (роль выше роли бота) терялась.
+    """
+    ch = bot.get_channel(LOG_CHANNEL_ID) if LOG_CHANNEL_ID else None
+    if ch is None:
+        return
+    problems = [(m, r) for m, r in results if r.startswith(("⚠️", "❌"))]
+    changes = [(m, r) for m, r in results if r.startswith(("🔄", "✅"))]
+    if silent_if_empty and not problems and not changes and not note:
+        return
+
+    lines = [f"Проверено: {checked} · изменений: {updated} · проблем: {len(problems)}"]
+    if changes:
+        lines.append("\nИзменения ролей:")
+        lines += [f"• {m.display_name} — {r}" for m, r in changes[:30]]
+    if problems:
+        lines.append("\n⚠️ Не удалось изменить роль:")
+        lines += [f"• {m.display_name} — {r}" for m, r in problems[:30]]
+    if note:
+        lines.append("")
+        lines.append(note)
+    try:
+        await safe_send(ch, "\n".join(lines), title=f"⏰ {source}")
+    except Exception as e:
+        log(f"⚠️ {source} лог: {e}")
+
+
 @tasks.loop(hours=1)
 async def hourly_clan_sync():
     """Автоматически, раз в час, обновляет роли кланов для всех привязанных игроков."""
@@ -4121,37 +4295,64 @@ async def hourly_clan_sync():
 
         checked = 0
         updated = 0
+        results = []
+        stopped = ""
         # Реально обрабатываем кланы: проверим клан игрока через cs2red и применим роль.
         for did, sid in links.items():
             m = guild.get_member(int(did)) if str(did).isdigit() else None
             if m is None:
                 continue
 
-            result = await sync_clan_role_by_id(guild, m, sid)
-            # Статус: "создана роль"/"выдан"/"уже в"/"клан снят"/"без клана" = изменений; 
-            # при отсутствии изменений тоже считаем проверенным.
+            try:
+                result = await sync_clan_role_by_id(guild, m, sid)
+            except Exception as e:
+                # Один упавший игрок не должен останавливать весь цикл.
+                await log_error(bot, f"hourly_clan_sync:{did}", e)
+                result = f"⚠️ ошибка синхронизации: {str(e)[:150]}"
+
             checked += 1
-            if any(k in result for k in ("выдан", "создана", "клан снят", "уже в")):
+            results.append((m, result))
+            if any(k in result for k in ("выдан", "создан", "клан снят", "уже в")):
                 updated += 1
 
             await asyncio.sleep(api.RATE_LIMIT_SECONDS)
 
             # Если cs2red начал блокировать (403/429) — прерываем цикл и ждём следующего запуска.
             if api.blocked_reason in ("403", "429"):
-                reason = api.blocked_reason
-                log(f"⏰ hourly_clan_sync: cs2red блокирует ({reason}) — пауза до следующего цикла")
+                stopped = api.blocked_reason
+                log(f"⏰ hourly_clan_sync: cs2red блокирует ({stopped}) — пауза до следующего цикла")
                 break
 
-        log(f"⏰ hourly_clan_sync: проверено {checked}, ролей обновлено {updated}")
-        # Логируем в канал, если он доступен.
-        if LOG_CHANNEL_ID:
-            ch = bot.get_channel(LOG_CHANNEL_ID)
-            if ch is not None:
-                try:
-                    await safe_send(ch, f"⏰ Кланы: проверено {checked}, обновлено {updated}.",
-                                    title="⏰ Часовая синхронизация кланов")
-                except Exception as e:
-                    log(f"⚠️ hourly_clan_sync лог: {e}")
+        # Диагностика: роли выше роли бота снять нельзя, а участников без
+        # /link автоматика вообще не видит.
+        me = guild.me
+        managed_ids = set(CLAN_ROLE_MAP.values())
+        known_names = _load_clan_role_names()
+        above = []
+        if me is not None and me.top_role is not None:
+            above = [r for r in guild.roles
+                     if (r.id in managed_ids or r.name in known_names)
+                     and r.position >= me.top_role.position]
+        linked_ids = {int(k) for k in links if str(k).isdigit()}
+        unlinked = [m for m in guild.members
+                    if not m.bot and m.id not in linked_ids
+                    and any(r.id in managed_ids or r.name in known_names for r in m.roles)]
+
+        notes = []
+        if stopped:
+            notes.append(f"⛔ Остановлено: cs2red блокирует ({stopped}), остальные не проверены.")
+        if above:
+            notes.append("⚠️ Эти роли клана выше роли бота, автоматически снять их нельзя: "
+                         + ", ".join(f"«{r.name}»" for r in above[:20])
+                         + ". Поднимите роль бота выше них в настройках сервера.")
+        if unlinked:
+            notes.append(f"🔗 С ролью клана, но без /link: {len(unlinked)} — "
+                         "автоматически не проверяются (привяжите SteamID).")
+
+        log(f"⏰ hourly_clan_sync: проверено {checked}, ролей обновлено {updated}, "
+            f"проблем {len([1 for _, r in results if r.startswith(('⚠️', '❌'))])}")
+        await _report_clan_sync(results, checked, updated,
+                                "Часовая синхронизация кланов", note="\n".join(notes))
     except Exception as e:
         await log_error(bot, "hourly_clan_sync", e)
 
