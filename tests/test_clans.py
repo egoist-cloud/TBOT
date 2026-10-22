@@ -187,9 +187,29 @@ def test_auto_remove_reports_hierarchy(monkeypatch):
                              "members": [{"userId": 99}]}])
 
     result = asyncio.run(botmod.sync_clan_role_by_id(guild, member, STEAM))
-    assert "выше" in result
-    assert "поднимите роль бота" in result
+    assert "не полностью" in result
+    assert "выше роли бота" in result
     assert high_role not in member.removed
+    assert high_role in member.roles
+
+
+def test_auto_remove_succeeds_for_low_role_even_if_high_stays(monkeypatch):
+    """Одна роль выше бота не мешает снять остальные роли клана."""
+    high_role = _FakeRole(888, "HighClan", position=12)
+    low_role = _FakeRole(889, "LowClan", position=3)
+    guild = _FakeGuild([high_role, low_role], me_top=10)
+    member = _FakeMember(777888990, [high_role, low_role])
+
+    # Низкая роль известна боту (запомнена при прошлой синхронизации).
+    botmod._remember_clan_role_name("LowClan")
+
+    _fake_api(monkeypatch, [{"id": 3, "name": "HighClan",
+                             "members": [{"userId": 99}]}])
+
+    result = asyncio.run(botmod.sync_clan_role_by_id(guild, member, STEAM))
+    assert "не полностью" in result
+    assert low_role in member.removed
+    assert low_role not in member.roles
     assert high_role in member.roles
 
 
@@ -213,3 +233,114 @@ def test_auto_switch_clan_removes_old_role(monkeypatch):
     assert new_role in member.roles
     assert botmod._load_clan_members()[str(member.id)] == new_role.id
     botmod._forget_member_clan_role(member.id)
+
+
+def test_all_blocks_falls_back_only_for_missing_array(monkeypatch):
+    """Если в админ-профиле нет mutes, публичный fallback нужен только для них."""
+    now = int(time.time())
+    raw_ban = {
+        "id": 1, "adminId": 42, "reason": "test",
+        "timestamp": now - 60, "endTimeStamp": now + 3600, "unbanId": None,
+        "user": {"id": 42, "nick": "lilcom"},
+        "action": {"id": 7, "nick": "Miki", "steamid64": STEAM},
+    }
+
+    async def fake_user(_sid):
+        return {"id": 7, "nick": "Miki"}
+
+    async def fake_full(_sid, user=None):
+        return {"bans": [raw_ban], "user": {"id": 7}}
+
+    calls = []
+
+    async def fake_public(sid, category, uid=0):
+        calls.append(category)
+        return [], ""
+
+    monkeypatch.setattr(botmod.api, "cs2red_user", fake_user)
+    monkeypatch.setattr(botmod.api, "cs2red_full_user", fake_full)
+    monkeypatch.setattr(botmod.api, "_public_blocks", fake_public)
+
+    bans, mutes, err = asyncio.run(botmod.api.cs2red_all_blocks(STEAM))
+    assert err == ""
+    assert len(bans) == 1
+    assert mutes == []
+    assert calls == ["MUTES"]
+
+
+def test_clan_report_skips_unchanged_roles(monkeypatch):
+    """В «Изменения ролей» не должны попадать игроки, у которых всё уже верно."""
+    sent = {}
+
+    async def fake_safe_send(_target, *args, **kwargs):
+        sent["text"] = args[0]
+        sent["title"] = kwargs.get("title")
+
+    monkeypatch.setattr(botmod, "safe_send", fake_safe_send)
+    monkeypatch.setattr(botmod.bot, "get_channel", lambda _cid: object())
+
+    same = SimpleNamespace(display_name="Same")
+    removed = SimpleNamespace(display_name="Removed")
+    results = [(same, "✅ уже в 'X'"), (removed, "🔄 клан снят")]
+    asyncio.run(botmod._report_clan_sync(results, 2, 1, "Тест"))
+
+    assert "🔄 клан снят" in sent["text"]
+    assert "уже в" not in sent["text"]
+    assert "Тест" in sent["title"]
+
+
+def test_auto_remove_skips_when_user_id_missing(monkeypatch):
+    """Некорректный ответ cs2red (без id) не должен снимать роль клана."""
+    old_role = _FakeRole(555, "OldClan", position=3)
+    guild = _FakeGuild([old_role])
+    member = _FakeMember(999888777, [old_role])
+
+    async def fake_user(_sid):
+        return {"nick": "Miki"}  # нет ни id, ни roleId
+
+    async def fake_clans():
+        return [{"id": 1, "name": "OldClan", "members": []}]
+
+    monkeypatch.setattr(botmod.api, "cs2red_user", fake_user)
+    monkeypatch.setattr(botmod.api, "cs2red_clans", fake_clans)
+
+    result = asyncio.run(botmod.sync_clan_role_by_id(guild, member, STEAM))
+    assert "роли не тронуты" in result, result
+    assert old_role in member.roles
+    assert member.removed == []
+
+
+def test_sync_role_skips_when_user_id_missing(monkeypatch):
+    """sync_role_by_id не трогает роли, если в ответе cs2red нет id."""
+    role = _FakeRole(601, "VIP", position=3)
+    guild = _FakeGuild([role])
+    member = _FakeMember(555444333, [role])
+
+    async def fake_user(_sid):
+        return {"nick": "Miki"}
+
+    monkeypatch.setattr(botmod.api, "cs2red_user", fake_user)
+
+    result = asyncio.run(botmod.sync_role_by_id(guild, member, STEAM))
+    assert "роль не тронута" in result, result
+    assert role in member.roles
+    assert member.removed == []
+
+
+def test_normalize_block_active_none_is_active():
+    """active=null в ответе cs2red — блокировка всё ещё активна."""
+    now = int(time.time())
+    block = botmod.api.normalize_block(
+        {"active": None, "timestamp": now - 60, "endTimeStamp": now + 3600,
+         "action": {"steamid64": STEAM, "nick": "Miki"}},
+        "Бан", from_admin=True)
+    assert block["active"] is True
+
+
+def test_normalize_block_explicit_false_is_inactive():
+    now = int(time.time())
+    block = botmod.api.normalize_block(
+        {"active": False, "timestamp": now - 60, "endTimeStamp": now + 3600,
+         "action": {"steamid64": STEAM, "nick": "Miki"}},
+        "Бан", from_admin=True)
+    assert block["active"] is False

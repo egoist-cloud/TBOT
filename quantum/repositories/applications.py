@@ -22,7 +22,7 @@ async def get_active_application(user_id) -> dict | None:
     cursor = await db.execute(
         "SELECT user_id, status, clan_name, message_id, channel_id, app_id, "
         "created_at, updated_at FROM applications "
-        "WHERE user_id = ? AND status = 'pending'",
+        "WHERE user_id = ? AND status IN ('pending', 'voting')",
         (str(user_id),),
     )
     row = await cursor.fetchone()
