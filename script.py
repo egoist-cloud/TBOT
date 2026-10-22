@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 from flask import Flask
 
 from quantum.db import init_db, close_db
-from quantum.env import env_int
+from quantum.env import env_int, env_float
 from quantum.migrations import import_json_to_sqlite
 from quantum.agent import Agent
 from quantum.repositories import votes as votes_repo
@@ -38,6 +38,16 @@ from quantum.repositories import applications as applications_repo
 from quantum.ai import AIService
 from github_sync import GitHubSync
 from quantum.ai.cache import count_cache, clear_cache
+
+# BeautifulSoup нужен для парсинга HTML админки cs2red (вкладка «Активность»).
+# Если пакет не установлен — бот не должен падать: команда тогда вернёт
+# понятную ошибку, а остальные функции работают как обычно.
+try:
+    from bs4 import BeautifulSoup
+    _HAS_BS4 = True
+except Exception:  # pragma: no cover - зависит от окружения
+    BeautifulSoup = None
+    _HAS_BS4 = False
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -115,6 +125,9 @@ TALENT_ROLE_ID = env_int("TALENT_ROLE_ID", 1448368118190837800)
 CHECK_ALL_DAYS = env_int("CHECK_ALL_DAYS", 14)
 # Сколько игроков с мутами показывать в embed'е /check_all.
 CHECK_ALL_MAX_MEMBERS = env_int("CHECK_ALL_MAX_MEMBERS", 10)
+# Минимальный недельный онлайн (часы) для /check_onlineall: кто меньше —
+# попадает в отдельное поле «малоактивные».
+ONLINE_MIN_HOURS = env_float("ONLINE_MIN_HOURS", 9.0)
 
 # Фиксированный custom_id выпадающего списка заявок. Нужен, чтобы список
 # работал после рестарта бота: со случайным custom_id discord.py теряет
@@ -504,6 +517,267 @@ async def run_with_timeout(coro, timeout: float, fallback_msg: str,
 
 
 # ============================================================
+# ПАРСИНГ АКТИВНОСТИ cs2red (вкладка «Активность»/AFK)
+# ============================================================
+# Разметка админки cs2red может меняться, поэтому парсер не привязан к
+# CSS-классам: он работает по текстовым меткам («Текущая неделя»,
+# «Наблюдатель», «Рассмотрено репортов» и т.п.). Числа ищем рядом с
+# метками в пределах небольшого окна текста.
+
+# «26 ч.», «20 м.», «1 ч. 30 м.», «45 мин», «1.5 ч.», «26:30», «—».
+_TIME_RE = re.compile(
+    r"(?P<h>\d+(?:[.,]\d+)?)\s*(?:ч|час|h|hour)"
+    r"(?:\s*(?P<m>\d+)\s*(?:м|мин))?"
+    r"|(?P<m2>\d+)\s*(?:м|мин)"
+)
+
+_WEEK_LABELS = ("текущая неделя", "эта неделя", "за неделю", "current week")
+_PREV_LABELS = ("прошлая неделя", "предыдущая неделя", "пред. неделя",
+                "previous week", "last week")
+_OBSERVER_LABELS = ("наблюдатель", "observer", "afk")
+_TOTAL_LABELS = ("общее время", "всего времени", "время", "total")
+
+
+def _normalize_ws(text: str) -> str:
+    """Схлопывает все пробельные символы в один пробел."""
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _parse_time_to_hours(token: str):
+    """Превращает «1 ч. 30 м.», «20 м.», «1.5 ч.» или «26:30» в часы (float)."""
+    if not token:
+        return None
+    token = token.strip()
+    # «26:30» = 26 ч. 30 м.
+    m = re.fullmatch(r"(\d+)\s*[:.]\s*(\d{1,2})", token)
+    if m:
+        return int(m.group(1)) + int(m.group(2)) / 60.0
+    total = 0.0
+    found = False
+    for mm in _TIME_RE.finditer(token.lower()):
+        if mm.group("h") is not None:
+            total += float(mm.group("h").replace(",", "."))
+            if mm.group("m"):
+                total += int(mm.group("m")) / 60.0
+            found = True
+        elif mm.group("m2") is not None:
+            total += int(mm.group("m2")) / 60.0
+            found = True
+    return total if found else None
+
+
+def _find_label_block(text: str, labels: tuple, limit: int = 200) -> str:
+    """Возвращает фрагмент текста сразу после первого вхождения метки.
+
+    Фрагмент ограничен ``limit`` символами и **обрезается** на следующей
+    метке недели («Прошлая неделя» и т.п.): иначе окно захватывает соседнюю
+    неделю, и время наблюдателя суммировалось с общим временем следующей.
+    """
+    low = text.lower()
+    best = -1
+    for lab in labels:
+        idx = low.find(lab)
+        if idx != -1 and (best == -1 or idx < best):
+            best = idx
+    if best == -1:
+        return ""
+    chunk = text[best:best + limit]
+    # Обрезаем на следующей метке недели, если она попала в окно.
+    cut = len(chunk)
+    for lab in _WEEK_LABELS + _PREV_LABELS:
+        pos = chunk.lower().find(lab, 1)
+        if pos != -1:
+            cut = min(cut, pos)
+    return chunk[:cut]
+
+
+def _extract_number(text: str):
+    """Первое целое число в тексте (для репортов)."""
+    m = re.search(r"\d+", text or "")
+    return int(m.group(0)) if m else None
+
+
+def _extract_total_hours(block: str):
+    """Часы «общего времени» из блока недели.
+
+    Сначала пробуем взять значение сразу после метки «Общее время», затем —
+    любое время в блоке, исключая «наблюдателя» (AFK-время идёт отдельно).
+    """
+    if not block:
+        return None
+    total_block = _find_label_block(block, _TOTAL_LABELS)
+    if total_block:
+        # Убираем часть с «наблюдателем», чтобы не поймать её время.
+        cut = re.split(r"наблюдател|observer", total_block, flags=re.IGNORECASE)[0]
+        val = _parse_time_to_hours(cut)
+        if val is not None:
+            return val
+    cut = re.split(r"наблюдател|observer", block, flags=re.IGNORECASE)[0]
+    return _parse_time_to_hours(cut)
+
+
+def _extract_observer_hours(block: str):
+    """Время «наблюдателя» (AFK) из блока недели."""
+    if not block:
+        return None
+    obs = _find_label_block(block, _OBSERVER_LABELS)
+    if not obs:
+        return None
+    return _parse_time_to_hours(obs)
+
+
+def _row_cells(tr) -> list:
+    """Тексты ячеек строки таблицы (th/td)."""
+    return [_normalize_ws(td.get_text(" ")) for td in tr.find_all(["th", "td"])]
+
+
+def _match_week_col(cells: list):
+    """Определяет, есть ли в строке заголовки недель.
+
+    Возвращает ``(week_idx, prev_idx, total_idx)`` — индексы колонок
+    «текущая неделя», «прошлая неделя» и «всего» (любой может быть None),
+    либо ``None``, если недельных заголовков в строке нет.
+    """
+    week_idx = prev_idx = total_idx = None
+    for idx, cell in enumerate(cells):
+        low = cell.lower()
+        if any(lab in low for lab in _WEEK_LABELS):
+            week_idx = idx
+        elif any(lab in low for lab in _PREV_LABELS):
+            prev_idx = idx
+        elif "всего" in low or "total" in low:
+            total_idx = idx
+    if week_idx is None and prev_idx is None:
+        return None
+    return week_idx, prev_idx, total_idx
+
+
+def _parse_activity_table(soup):
+    """Парсит активность из HTML-таблиц (основной, надёжный путь).
+
+    Сначала находим строку с заголовками «Текущая неделя»/«Прошлая неделя»
+    и запоминаем индексы колонок. Затем в строках с метками («Общее время»,
+    «Наблюдатель», «Репортов») берём значения из этих колонок.
+    """
+    result = {"week": {"total": None, "observer": None},
+              "prev": {"total": None, "observer": None},
+              "reports": {"week": None, "prev": None, "total": None}}
+    found_any = False
+    cols = None
+    for tr in soup.find_all("tr"):
+        cells = _row_cells(tr)
+        if not cells:
+            continue
+        detected = _match_week_col(cells)
+        # Заголовочная строка: в первой ячейке нет метрики (время/наблюдатель).
+        if detected is not None and not any(
+                lab in cells[0].lower()
+                for lab in _TOTAL_LABELS + _OBSERVER_LABELS):
+            cols = detected
+            continue
+        if cols is None:
+            continue
+        week_idx, prev_idx, total_idx = cols
+        first = cells[0].lower()
+
+        _cell = lambda idx, _c=cells: (  # noqa: E731
+            _c[idx] if idx is not None and 0 <= idx < len(_c) else None)
+        if any(lab in first for lab in _TOTAL_LABELS):
+            w = _parse_time_to_hours(_cell(week_idx) or "")
+            p = _parse_time_to_hours(_cell(prev_idx) or "")
+            if w is not None:
+                result["week"]["total"] = w
+                found_any = True
+            if p is not None:
+                result["prev"]["total"] = p
+                found_any = True
+        elif any(lab in first for lab in _OBSERVER_LABELS):
+            w = _parse_time_to_hours(_cell(week_idx) or "")
+            p = _parse_time_to_hours(_cell(prev_idx) or "")
+            if w is not None:
+                result["week"]["observer"] = w
+                found_any = True
+            if p is not None:
+                result["prev"]["observer"] = p
+                found_any = True
+        elif "репорт" in first or "report" in first:
+            nw = _extract_number(_cell(week_idx) or "")
+            np_ = _extract_number(_cell(prev_idx) or "")
+            if nw is not None:
+                result["reports"]["week"] = nw
+                found_any = True
+            if np_ is not None:
+                result["reports"]["prev"] = np_
+                found_any = True
+            tv = _extract_number(_cell(total_idx) or "")
+            if tv is not None:
+                result["reports"]["total"] = tv
+            elif nw is not None and np_ is not None:
+                result["reports"]["total"] = nw + np_
+            found_any = True
+    return result if found_any else None
+
+
+def parse_activity_html(html: str):
+    """Парсит HTML страницы ``/admin/user/<id>`` в словарь активности.
+
+    Сначала пробуем табличную раскладку (заголовки недель + строки метрик),
+    затем — плоский текст (метки и значения идут подряд). Возвращает
+    ``None``, если не удалось найти ни одного показателя.
+    """
+    if not html or not _HAS_BS4:
+        return None
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return None
+
+    # Убираем скрипты/стили: в них бывают числа, которые собьют парсер.
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    table_data = _parse_activity_table(soup)
+
+    # Плоский текст — запасной путь для вёрстки без таблиц.
+    text = _normalize_ws(soup.get_text(" "))
+    week_block = _find_label_block(text, _WEEK_LABELS)
+    prev_block = _find_label_block(text, _PREV_LABELS)
+    flat = {
+        "week": {"total": _extract_total_hours(week_block),
+                 "observer": _extract_observer_hours(week_block)},
+        "prev": {"total": _extract_total_hours(prev_block),
+                 "observer": _extract_observer_hours(prev_block)},
+        "reports": {"week": None, "prev": None, "total": None},
+    }
+    rep_idx = text.lower().find("репорт")
+    if rep_idx == -1:
+        rep_idx = text.lower().find("report")
+    if rep_idx != -1:
+        nums = [int(x) for x in re.findall(r"\d+", text[rep_idx:rep_idx + 120])]
+        if len(nums) >= 3:
+            flat["reports"]["week"], flat["reports"]["prev"], flat["reports"]["total"] = nums[:3]
+        elif len(nums) == 2:
+            flat["reports"]["week"], flat["reports"]["total"] = nums
+        elif len(nums) == 1:
+            flat["reports"]["total"] = nums[0]
+
+    # Объединяем: табличные значения приоритетнее, плоские добивают пропуски.
+    data = table_data or {"week": {"total": None, "observer": None},
+                          "prev": {"total": None, "observer": None},
+                          "reports": {"week": None, "prev": None, "total": None}}
+    for section in ("week", "prev", "reports"):
+        for key in data[section]:
+            if data[section][key] is None:
+                data[section][key] = flat[section][key]
+
+    if all(data[s][k] is None for s in ("week", "prev", "reports")
+           for k in data[s]):
+        return None
+    data["raw"] = text[:1500]
+    return data
+
+
+# ============================================================
 # API: cs2red / Steam
 # ============================================================
 class API:
@@ -644,6 +918,107 @@ class API:
                 return None
             except Exception as e:
                 log(f"⚠️ GET {url}: {e}")
+                return None
+        return None
+
+    async def _get_html(self, url, params=None):
+        """GET HTML-страницы cs2red с теми же защитами, что и ``_get_json``.
+
+        Возвращает ``(html | None, error)``: при успехе ``error == ""``,
+        иначе — человекочитаемая причина («403», «429», «сеть», «5xx»).
+        Отдельный метод нужен, потому что страницы админки отдают HTML,
+        а ``_get_json`` пытается разобрать ответ как JSON.
+        """
+        session = self.session_for(url)
+        if not session:
+            return None, "нет сессии"
+        is_cs2red = _is_cs2red_host(url)
+        consecutive_5xx = 0
+        for attempt in range(self.RETRY_MAX + 1):
+            try:
+                if is_cs2red:
+                    await self._acquire_rate_slot()
+                async with self.sem:
+                    async with session.get(url, params=params) as r:
+                        self.last_status = r.status
+                        if r.status == 403:
+                            self.blocked_reason = "403"
+                            log(f"🔴 403 на {url} — авторизация на cs2red. "
+                                f"Проверьте куки.")
+                            return None, "403 (нужны актуальные cookie cs2red)"
+                        if r.status == 429:
+                            self.blocked_reason = "429"
+                            log(f"🐢 429 на {url} — cs2red временно блокирует "
+                                f"запросы. Пауза {self.RATE_LIMIT_429_WAIT} сек.")
+                            await asyncio.sleep(self.RATE_LIMIT_429_WAIT)
+                            return None, "429 (cs2red временно блокирует запросы)"
+                        if r.status >= 500:
+                            consecutive_5xx += 1
+                            log(f"⚠️ {r.status} на {url} "
+                                f"({attempt + 1}-я попытка из {self.RETRY_MAX + 1})")
+                            if consecutive_5xx > self.RETRY_MAX:
+                                self.blocked_reason = f"{r.status}"
+                                return None, f"{r.status} (сервер cs2red не отвечает)"
+                            await asyncio.sleep(self.RETRY_5xx_WAIT)
+                            continue
+                        consecutive_5xx = 0
+                        r.raise_for_status()
+                        if is_cs2red:
+                            self.blocked_reason = ""
+                        # Кодировку не форсируем: aiohttp берёт её из
+                        # Content-Type/мета-тега, а у cs2red это UTF-8.
+                        html = await r.text()
+                        return html, ""
+            except NET_ERRORS as e:
+                log(f"⚠️ GET {url}: сетевой сбой: {e}")
+                if attempt < self.RETRY_MAX:
+                    await asyncio.sleep(self.RETRY_5xx_WAIT)
+                    continue
+                self.blocked_reason = "network"
+                return None, "сеть"
+            except Exception as e:
+                log(f"⚠️ GET {url}: {e}")
+                return None, str(e)[:120]
+        return None, "не удалось получить страницу"
+
+    async def cs2red_internal_id(self, steam_id: str):
+        """Внутренний ID игрока в админке cs2red (например, 8081).
+
+        Шаг 1 — быстрый путь через API: ``/api/admin/users?search=`` отдаёт
+        ``id``. Если API не ответил или не нашёл игрока, пробуем HTML-поиск
+        ``/admin?search=<steam_id>`` и вытаскиваем ``/admin/user/<id>``.
+        Возвращает ``(internal_id | None, user | None, error)``.
+        """
+        user = await self.cs2red_user(steam_id)
+        if user is not None and not user.get("_not_found") and user.get("id"):
+            try:
+                return int(user["id"]), user, ""
+            except (TypeError, ValueError):
+                pass
+        if user is not None and user.get("_not_found"):
+            return None, None, "не найден"
+        if user is None:
+            # API не ответил — пробуем HTML-поиск.
+            html, err = await self._get_html(
+                "https://cs2red.ru/admin", params={"search": steam_id})
+            if not html:
+                return None, None, err or "поиск не удался"
+            uid = self._extract_internal_id(html)
+            if uid:
+                return uid, None, ""
+            return None, None, "не найден"
+        return None, None, "не найден"
+
+    @staticmethod
+    def _extract_internal_id(html: str):
+        """Достаёт внутренний ID из HTML админки (ссылка ``/admin/user/<id>``)."""
+        if not html:
+            return None
+        m = re.search(r"/admin/user/(\d+)", html)
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
                 return None
         return None
 
@@ -918,6 +1293,44 @@ class API:
                 if nick:
                     result[nick] = max(result.get(nick, 0), t)
         return result
+
+    async def cs2red_activity(self, steam_id: str):
+        """Активность игрока со страницы ``/admin/user/<id>`` (вкладка «Активность»).
+
+        Возвращает ``(data | None, error)``. ``data`` — словарь вида::
+
+            {
+              "nick": "Nick",
+              "internal_id": 8081,
+              "week": {"total": 26.0, "observer": 0.33},   # часы/доли часа
+              "prev": {"total": 12.0, "observer": 0.0},
+              "reports": {"week": 3, "prev": 1, "total": 9},
+              "raw": "…"   # отладочный текст блока (для диагностики)
+            }
+
+        ``error``: ``""`` при успехе, иначе «не найден», «403 …», «429 …»,
+        «нет bs4», «нет данных активности» и т.п.
+        """
+        if not _HAS_BS4:
+            return None, "нет bs4 (beautifulsoup4 не установлен)"
+        internal_id, user, err = await self.cs2red_internal_id(steam_id)
+        if err and not internal_id:
+            return None, err
+        if not internal_id:
+            return None, "не найден"
+        # Задержка между запросами к cs2red (анти-DDoS) — как и везде.
+        await asyncio.sleep(REQUEST_DELAY)
+        html, herr = await self._get_html(
+            f"https://cs2red.ru/admin/user/{internal_id}")
+        if not html:
+            return None, herr or "нет доступа к странице игрока"
+        data = parse_activity_html(html)
+        if data is None:
+            return None, "нет данных активности (нет вкладки «Активность»?)"
+        data["internal_id"] = internal_id
+        if user:
+            data.setdefault("nick", user.get("nick"))
+        return data, ""
 
     async def _steam_get(self, iface: str, params: dict):
         key = os.getenv("STEAM_API_KEY")
@@ -3419,6 +3832,270 @@ async def check_all(i):
             await log_error(bot, "/check_all.log", e)
     except Exception as e:
         await log_error(i.client, "/check_all", e)
+        try:
+            await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}", ephemeral=True)
+        except Exception:
+            pass
+
+
+# ============================================================
+# /check_onlineall — недельный онлайн всех игроков с ролью TALENT
+# ============================================================
+def _fmt_hours(value) -> str:
+    """Часы в читаемый вид: «26 ч.» или «20 м.» для значений < 1 часа."""
+    if value is None:
+        return "—"
+    if value < 1:
+        return f"{int(round(value * 60))} м."
+    return f"{value:.1f} ч."
+
+
+def _build_onlineall_embed(rows: list, low: list, no_link: list,
+                           errors: list, checked: int, total: int) -> discord.Embed:
+    """Собирает embed отчёта о недельном онлайне участников клана.
+
+    ``rows`` — список кортежей (member, data) для тех, кто в норме;
+    ``low``  — то же для тех, у кого онлайн ниже порога.
+    """
+    embed = discord.Embed(
+        title=f"📊 Недельный онлайн — клан «{CLAN_NAME}»",
+        color=0x000000, timestamp=now_utc())
+    embed.add_field(name="👥 Игроков с ролью", value=str(total), inline=True)
+    embed.add_field(name="✅ Проверено", value=str(checked), inline=True)
+    embed.add_field(name=f"⚠️ Онлайн < {ONLINE_MIN_HOURS:g} ч.",
+                    value=str(len(low)), inline=True)
+
+    if low:
+        lines = []
+        for m, data in low[:CHECK_ALL_MAX_MEMBERS]:
+            w = (data.get("week") or {}).get("total")
+            p = (data.get("prev") or {}).get("total")
+            lines.append(f"• {m.mention} — сейчас {_fmt_hours(w)}, "
+                         f"прошлая {_fmt_hours(p)}")
+        if len(low) > CHECK_ALL_MAX_MEMBERS:
+            lines.append(f"…и ещё {len(low) - CHECK_ALL_MAX_MEMBERS}")
+        embed.add_field(name="⚠️ Малоактивные", value="\n".join(lines)[:1024],
+                        inline=False)
+    else:
+        embed.add_field(name="⚠️ Малоактивные",
+                        value=f"✅ У всех онлайн ≥ {ONLINE_MIN_HOURS:g} ч.",
+                        inline=False)
+
+    if rows:
+        lines = []
+        for m, data in rows[:CHECK_ALL_MAX_MEMBERS]:
+            w = (data.get("week") or {}).get("total")
+            p = (data.get("prev") or {}).get("total")
+            o = (data.get("week") or {}).get("observer")
+            obs = f", наблюд. {_fmt_hours(o)}" if o else ""
+            lines.append(f"• {m.display_name} — {_fmt_hours(w)} "
+                         f"(прошлая {_fmt_hours(p)}{obs})")
+        if len(rows) > CHECK_ALL_MAX_MEMBERS:
+            lines.append(f"…и ещё {len(rows) - CHECK_ALL_MAX_MEMBERS}")
+        embed.add_field(name="✅ В норме", value="\n".join(lines)[:1024], inline=False)
+
+    if no_link:
+        embed.add_field(name="🔗 Без /link",
+                        value=", ".join(m.display_name for m in no_link[:20])[:1024],
+                        inline=False)
+    if errors:
+        lines = [f"• {m.display_name} — {txt[:80]}" for m, txt in errors[:10]]
+        embed.add_field(name="⚠️ Не удалось проверить",
+                        value="\n".join(lines)[:1024], inline=False)
+
+    embed.set_footer(text=f"Quantum • {utc_stamp()}")
+    return embed
+
+
+async def collect_online_stats(members: list, progress=None):
+    """Обходит участников и собирает их недельный онлайн.
+
+    Возвращает ``(rows, low, no_link, errors, checked)``. Пауза
+    ``BLOCK_CHECK_DELAY`` между игроками — требование cs2red.
+    """
+    rows, low, no_link, errors = [], [], [], []
+    checked = 0
+    for idx, m in enumerate(members, 1):
+        sid = await links_repo.get_link(m.id)
+        if not sid:
+            no_link.append(m)
+        else:
+            try:
+                data, err = await asyncio.wait_for(
+                    api.cs2red_activity(sid), timeout=CMD_API_TIMEOUT)
+                if err:
+                    errors.append((m, err))
+                else:
+                    checked += 1
+                    week = (data.get("week") or {}).get("total")
+                    if week is not None and week < ONLINE_MIN_HOURS:
+                        low.append((m, data))
+                    else:
+                        rows.append((m, data))
+            except asyncio.TimeoutError:
+                errors.append((m, "таймаут"))
+            except Exception as e:
+                errors.append((m, str(e)[:80]))
+                await log_error(bot, f"/check_onlineall:{m.id}", e)
+
+        if progress:
+            try:
+                await progress(idx, len(members))
+            except Exception:
+                pass
+        if idx < len(members):
+            await asyncio.sleep(BLOCK_CHECK_DELAY)
+
+    # Малоактивные — сверху, по возрастанию онлайна.
+    low.sort(key=lambda x: (x[1].get("week") or {}).get("total") or 0)
+    rows.sort(key=lambda x: (x[1].get("week") or {}).get("total") or 0,
+              reverse=True)
+    return rows, low, no_link, errors, checked
+
+
+@bot.tree.command(name="check_onlineall",
+                  description="Недельный онлайн игроков клана TALENT (кто < 9 ч.)")
+async def check_onlineall(i):
+    """Проверяет недельный онлайн всех игроков с ролью TALENT.
+
+    Для каждого берётся страница активности на cs2red: онлайн за текущую
+    и прошлую неделю и время наблюдателя. Кто наиграл меньше
+    ``ONLINE_MIN_HOURS`` (по умолчанию 9 ч.) — выводится отдельным полем.
+    Ответ ephemeral.
+    """
+    await i.response.defer(ephemeral=True)
+    try:
+        guild = i.guild
+        if guild is None:
+            await safe_send(i.followup, "❌ Команда работает только на сервере.",
+                            ephemeral=True)
+            return
+        if not CS2RED_COOKIES:
+            await safe_send(i.followup,
+                            "❌ Нет cookie cs2red (CS2RED_COOKIE_STRING) — "
+                            "страница активности недоступна.", ephemeral=True)
+            return
+        members = _talent_members(guild)
+        if not members:
+            await safe_send(i.followup,
+                            f"ℹ️ Нет участников с ролью «{CLAN_NAME}».",
+                            ephemeral=True)
+            return
+
+        async def progress(done, total):
+            if done % 5 == 0:
+                try:
+                    await i.edit_original_response(
+                        content=f"⏳ Проверено {done}/{total}…")
+                except Exception:
+                    pass
+
+        rows, low, no_link, errors, checked = await collect_online_stats(
+            members, progress=progress)
+        embed = _build_onlineall_embed(rows, low, no_link, errors,
+                                       checked, len(members))
+        await safe_send(i.followup, embed=embed, ephemeral=True)
+
+        # Итог в лог-канал: сколько малоактивных и кто.
+        try:
+            log_ch = bot.get_channel(CHECK_LOG_CHANNEL_ID) if CHECK_LOG_CHANNEL_ID else None
+            if log_ch is not None:
+                who = ", ".join(m.mention for m, _ in low[:20]) or "нет"
+                await safe_send(
+                    log_ch,
+                    f"📊 /check_onlineall от {i.user.display_name}\n"
+                    f"Проверено: {checked}/{len(members)}, "
+                    f"< {ONLINE_MIN_HOURS:g} ч.: {len(low)}\n{who}",
+                    title="📊 /check_onlineall")
+        except Exception as e:
+            await log_error(bot, "/check_onlineall.log", e)
+    except Exception as e:
+        await log_error(i.client, "/check_onlineall", e)
+        try:
+            await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}", ephemeral=True)
+        except Exception:
+            pass
+
+
+# ============================================================
+# /activity <steam_id> — активность одного игрока (вкладка «Активность»)
+# ============================================================
+def _build_activity_embed(steam_id: str, data: dict) -> discord.Embed:
+    """Embed с активностью одного игрока за текущую/прошлую неделю."""
+    nick = data.get("nick") or "—"
+    internal_id = data.get("internal_id") or "?"
+    embed = discord.Embed(
+        title=f"📊 Активность: {nick} (ID: {internal_id})",
+        color=0x000000, timestamp=now_utc())
+    embed.add_field(name="SteamID", value=f"`{steam_id}`", inline=False)
+
+    week = data.get("week") or {}
+    prev = data.get("prev") or {}
+    embed.add_field(
+        name="Текущая неделя",
+        value=f"Время: `{_fmt_hours(week.get('total'))}`\n"
+              f"Наблюдатель: `{_fmt_hours(week.get('observer'))}`",
+        inline=True)
+    embed.add_field(
+        name="Прошлая неделя",
+        value=f"Время: `{_fmt_hours(prev.get('total'))}`\n"
+              f"Наблюдатель: `{_fmt_hours(prev.get('observer'))}`",
+        inline=True)
+    rep = data.get("reports") or {}
+    embed.add_field(
+        name="Репорты",
+        value=f"Неделя: `{rep.get('week') if rep.get('week') is not None else '—'}`\n"
+              f"Прошлая: `{rep.get('prev') if rep.get('prev') is not None else '—'}`\n"
+              f"Всего: `{rep.get('total') if rep.get('total') is not None else '—'}`",
+        inline=True)
+
+    wk = week.get("total")
+    if wk is not None:
+        note = ("⚠️ Ниже нормы" if wk < ONLINE_MIN_HOURS else "✅ В норме")
+        embed.add_field(
+            name="Итог",
+            value=f"{note} (порог {ONLINE_MIN_HOURS:g} ч.)", inline=False)
+    embed.set_footer(text=f"Quantum • {utc_stamp()}")
+    return embed
+
+
+@bot.tree.command(name="activity",
+                  description="Активность игрока на cs2red по SteamID")
+async def activity(i, steam_id: str):
+    """Показывает недельную активность игрока (эта и прошлая неделя).
+
+    ``steam_id`` — SteamID64 (17 цифр). Данные берутся со страницы
+    активности в админке cs2red. Ответ ephemeral.
+    """
+    await i.response.defer(ephemeral=True)
+    try:
+        steam_id = (steam_id or "").strip()
+        if not (steam_id.isdigit() and len(steam_id) == 17):
+            await safe_send(i.followup,
+                            "❌ Укажите SteamID64 (17 цифр).", ephemeral=True)
+            return
+        if not CS2RED_COOKIES:
+            await safe_send(i.followup,
+                            "❌ Нет cookie cs2red (CS2RED_COOKIE_STRING).",
+                            ephemeral=True)
+            return
+        try:
+            data, err = await asyncio.wait_for(
+                api.cs2red_activity(steam_id), timeout=CMD_API_TIMEOUT)
+        except asyncio.TimeoutError:
+            data, err = None, "таймаут"
+        if err or not data:
+            if err == "не найден":
+                await safe_send(i.followup, "❌ Игрок не найден.", ephemeral=True)
+            else:
+                await safe_send(i.followup,
+                                f"❌ Не удалось получить активность: {err}",
+                                ephemeral=True)
+            return
+        await safe_send(i.followup, embed=_build_activity_embed(steam_id, data),
+                        ephemeral=True)
+    except Exception as e:
+        await log_error(i.client, "/activity", e)
         try:
             await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}", ephemeral=True)
         except Exception:
