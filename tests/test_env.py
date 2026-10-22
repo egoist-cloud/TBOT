@@ -46,7 +46,7 @@ def test_import_with_empty_env_vars():
     assert proc.returncode == 0, f"бот не стартует с пустыми переменными:\n{out}"
     assert "GUILD_ID= 0" in out, out
     assert "CLAN_NAME= TALENT" in out, out
-    assert "VOTES_REQUIRED= 2" in out, out
+    assert "VOTES_REQUIRED= 1" in out, out
     commands_line = [ln for ln in out.splitlines() if ln.startswith("COMMANDS=")]
     assert commands_line, out
     # Точное число меняется с каждой новой командой — важен сам факт,

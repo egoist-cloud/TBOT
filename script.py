@@ -93,6 +93,8 @@ EXTRA_REVIEWER_ROLE_2 = env_int("EXTRA_REVIEWER_ROLE_2", 0)
 EXTRA_REVIEWER_ROLE_3 = env_int("EXTRA_REVIEWER_ROLE_3", 0)
 
 AUTO_ROLE_ID = env_int("AUTO_ROLE_ID", 0)
+# Роль, которая выдаётся автоматически при принятии заявки в клан.
+ACCEPT_ROLE_ID = env_int("ACCEPT_ROLE_ID", 1448368118190837800)
 BYPASS_ROLE_ID = env_int("BYPASS_ROLE_ID", 0)
 NO_COOLDOWN_ROLE_ID = env_int("NO_COOLDOWN_ROLE_ID", 0)
 
@@ -100,7 +102,19 @@ ACTIVITY_ROLE_ID = env_int("ACTIVITY_ROLE_ID", 1448368118190837800)
 
 CLAN_NAME = (os.getenv("CLAN_NAME") or "TALENT").strip() or "TALENT"
 CLAN_URL = os.getenv("CLAN_URL", "https://cs2red.ru/clans/id/47")
-VOTES_REQUIRED = env_int("VOTES_REQUIRED", 2)
+VOTES_REQUIRED = env_int("VOTES_REQUIRED", 1)
+
+# Роли, чьих участников бот добавляет в ветку заявки и упоминает в ней.
+APPLICATION_PING_ROLE_IDS = [1447953747161387131, 1524071237796626523,
+                             1378326630031818802]
+
+# Роль клана TALENT, по которой /check и /check_all собирают игроков.
+TALENT_ROLE_ID = env_int("TALENT_ROLE_ID", 1448368118190837800)
+
+# Глубина отчёта /check_all: кого замутили за последние N дней.
+CHECK_ALL_DAYS = env_int("CHECK_ALL_DAYS", 14)
+# Сколько игроков с мутами показывать в embed'е /check_all.
+CHECK_ALL_MAX_MEMBERS = env_int("CHECK_ALL_MAX_MEMBERS", 10)
 
 # Фиксированный custom_id выпадающего списка заявок. Нужен, чтобы список
 # работал после рестарта бота: со случайным custom_id discord.py теряет
@@ -1496,6 +1510,12 @@ async def sync_clan_role_by_id(guild, member, steam_id, user: dict | None = None
 # ВЕТКИ ЗАЯВОК
 # ============================================================
 async def close_application_thread(thread, closed_by, reason):
+    """Закрывает ветку заявки: архив + блокировка (без удаления).
+
+    Ветка остаётся читаемой — участники видят историю заявки, но писать
+    в неё уже нельзя. Раньше закрытие выкидывало из ветки всех, кроме
+    ревьюеров; теперь состав сохраняется.
+    """
     if not isinstance(thread, discord.Thread):
         return
     try:
@@ -1503,24 +1523,41 @@ async def close_application_thread(thread, closed_by, reason):
             await safe_send(thread, f"🔒 **Ветка закрыта.** {reason}\n**Закрыл:** {closed_by.mention}")
         except Exception:
             pass
-        await asyncio.sleep(5)
         try:
             await thread.edit(archived=True, locked=True, reason=f"Заявка {reason}")
-        except Exception:
-            pass
-        keep = collect_reviewer_ids(thread.guild)
-        try:
-            members = await thread.fetch_members()
-        except Exception:
-            members = []
-        for m in members:
-            if m.id not in keep:
-                try:
-                    await thread.remove_user(m)
-                except Exception:
-                    pass
+        except Exception as e:
+            log(f"⚠️ close_thread edit: {e}")
     except Exception as e:
         log(f"⚠️ close_thread: {e}")
+
+
+async def _keep_only_applicant_and_taker(interaction, taker):
+    """Оставляет в ветке только заявителя и модератора, который её взял.
+
+    Вызывается по кнопке «Взять» в ветке: заявку ведёт один модератор,
+    остальных участников бот убирает из ветки.
+    """
+    thread = getattr(interaction, "channel", None)
+    if not isinstance(thread, discord.Thread):
+        return
+    try:
+        applicant_id = extract_discord_id_from_embed(interaction.message.embeds[0])
+    except Exception:
+        applicant_id = None
+    if not applicant_id:
+        return
+    keep = {int(applicant_id), int(taker.id)}
+    try:
+        members = await thread.fetch_members()
+    except Exception:
+        members = []
+    for m in members:
+        if m.id in keep or getattr(m, "bot", False):
+            continue
+        try:
+            await thread.remove_user(m)
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -1565,6 +1602,15 @@ async def _vote(interaction, kind, button=None):
     if not user_can_review(interaction.user):
         await safe_send(interaction.followup, "❌ Нет прав.", ephemeral=True)
         return
+    # Заявитель не должен сам решать свою судьбу — голосовать по своей
+    # заявке ему нельзя (иначе «Принять»/«Отклонить» жмётся в один клик).
+    embed = interaction.message.embeds[0] if interaction.message.embeds else None
+    tid = extract_discord_id_from_embed(embed) if embed else None
+    if tid and str(interaction.user.id) == str(tid):
+        await safe_send(interaction.followup,
+                        "❌ Вы не можете голосовать по своей заявке.", ephemeral=True)
+        return
+
     app_id = _app_id_for(interaction, button)
     st, applied = await votes_repo.apply_vote(
         app_id, kind, interaction.user.id,
@@ -1575,9 +1621,7 @@ async def _vote(interaction, kind, button=None):
         return
 
     view = ApplicationManagement(app_id)
-    await view.update_labels()
     if st[kind] >= VOTES_REQUIRED:
-        embed = interaction.message.embeds[0]
         status = "Принят" if kind == "accept" else "Отклонен"
         embed.set_footer(text=f"Quantum • Статус: {status}")
         for c in view.children:
@@ -1586,17 +1630,19 @@ async def _vote(interaction, kind, button=None):
             await interaction.message.edit(embed=embed, view=view)
         except Exception:
             pass
-        tid = extract_discord_id_from_embed(embed)
-        member = interaction.guild.get_member(tid) if tid else None
-        if kind == "accept" and member and AUTO_ROLE_ID:
-            role_to_give = interaction.guild.get_role(AUTO_ROLE_ID)
+        member = interaction.guild.get_member(int(tid)) if tid else None
+        if kind == "accept" and member and ACCEPT_ROLE_ID:
+            # Приняли заявку — автоматически выдаём роль клана.
+            role_to_give = interaction.guild.get_role(ACCEPT_ROLE_ID)
             if role_to_give:
                 try:
                     await member.add_roles(role_to_give)
                     await log_to_channel(interaction.client,
                         f"✅ Заявка принята. {member.mention} получил {role_to_give.mention}")
                 except discord.Forbidden:
-                    pass
+                    await log_to_channel(interaction.client,
+                        f"⚠️ Не смог выдать роль {role_to_give.mention} игроку "
+                        f"{member.mention} — роль бота ниже роли клана.")
         if member:
             await log_to_channel(interaction.client,
                 f"{'✅' if kind == 'accept' else '❌'} {member.mention}")
@@ -1621,11 +1667,14 @@ async def _vote(interaction, kind, button=None):
 # МЕНЮ ЗАЯВКИ
 # ============================================================
 class ApplicationManagement(discord.ui.View):
-    """Кнопки заявки.
+    """Кнопки заявки в канале заявок и в ветке.
 
-    app_id зашит в custom_id кнопок: заявка публикуется в канале и в
-    ветке, и обе копии должны делить одни и те же голоса. Без app_id
-    в custom_id две заявки конфликтовали бы в реестре persistent-view.
+    app_id зашит в custom_id кнопок: заявка публикуется в канале, в ветке
+    и в лог-канале, и все копии должны делить одни и те же голоса.
+
+    Кнопки: «Взять», «Принять» (синяя), «Отклонить» (красная).
+    Достаточно одного голоса (``VOTES_REQUIRED``). Кнопок запретов здесь
+    нет — они живут в отдельном view ``ApplicationBansView`` в лог-канале.
     """
 
     def __init__(self, app_id: str = ""):
@@ -1639,42 +1688,53 @@ class ApplicationManagement(discord.ui.View):
                     child.custom_id = f"{child.custom_id}:{self.app_id}"
 
     async def update_labels(self, mid=None):
-        st = await _get_votes(self.app_id or mid)
-        for c in self.children:
-            base = (c.custom_id or "").split(":", 1)[0]
-            if base == "accept_btn":
-                c.label = f"Принять {st['accept']}/{VOTES_REQUIRED}"
-            elif base == "deny_btn":
-                c.label = f"Отклонить {st['deny']}/{VOTES_REQUIRED}"
-            elif base == "voted_list_btn":
-                c.label = f"👥 {len(st['voters'])}"
+        # Счётчики «0/2» убраны: достаточно одного голоса, показывать
+        # «Принять 1/1» смысла нет — кнопка просто срабатывает.
+        return
 
-    @discord.ui.button(label="🙋 Взять", style=discord.ButtonStyle.primary,
+    @discord.ui.button(label="🙋 Взять", style=discord.ButtonStyle.secondary,
                        custom_id="take_btn", row=0)
     async def take(self, i, b):
         await i.response.defer()
         if not user_can_review(i.user):
-            await safe_send(i.followup, "❌", ephemeral=True)
+            await safe_send(i.followup, "❌ Нет прав.", ephemeral=True)
             return
         await safe_send(i.followup, f"🙋 Взял {i.user.mention}.")
-        b.disabled = True
+        # В ветке заявку берёт один модератор: оставляем только заявителя
+        # и того, кто взял — остальных убираем из ветки.
         try:
-            await i.message.edit(view=self)
-        except Exception:
-            pass
+            await _keep_only_applicant_and_taker(i, i.user)
+        except Exception as e:
+            await log_error(i.client, "take_btn", e)
 
-    @discord.ui.button(label="Принять 0/2", style=discord.ButtonStyle.success,
+    @discord.ui.button(label="Принять", style=discord.ButtonStyle.primary,
                        custom_id="accept_btn", row=0)
     async def accept(self, i, b):
         await _vote(i, "accept", b)
 
-    @discord.ui.button(label="Отклонить 0/2", style=discord.ButtonStyle.danger,
+    @discord.ui.button(label="Отклонить", style=discord.ButtonStyle.danger,
                        custom_id="deny_btn", row=0)
     async def deny(self, i, b):
         await _vote(i, "deny", b)
 
+
+class ApplicationBansView(discord.ui.View):
+    """Кнопки запретов — только в лог-канале заявок.
+
+    Заявка в логе нужна, чтобы выдавать блокировки удобно: кнопок
+    «Принять»/«Отклонить» здесь нет, они остаются в канале заявок и ветке.
+    """
+
+    def __init__(self, app_id: str = ""):
+        super().__init__(timeout=None)
+        self.app_id = str(app_id or "")
+        if self.app_id:
+            for child in self.children:
+                if child.custom_id:
+                    child.custom_id = f"{child.custom_id}:{self.app_id}"
+
     @discord.ui.button(label="🚫 Выдать запрет", style=discord.ButtonStyle.secondary,
-                       custom_id="tempban_btn", row=1)
+                       custom_id="tempban_btn", row=0)
     async def temp_ban(self, i, b):
         if not user_can_review(i.user):
             await i.response.send_message("❌", ephemeral=True)
@@ -1686,7 +1746,7 @@ class ApplicationManagement(discord.ui.View):
         await i.response.send_modal(TempBanModal(tid))
 
     @discord.ui.button(label="⛔ Перм. запрет", style=discord.ButtonStyle.danger,
-                       custom_id="permban_btn", row=1)
+                       custom_id="permban_btn", row=0)
     async def perm_ban(self, i, b):
         await i.response.defer()
         if not user_can_review(i.user):
@@ -1702,7 +1762,7 @@ class ApplicationManagement(discord.ui.View):
         await log_to_channel(i.client, f"⛔ perm <@{tid}> от {i.user.mention}")
 
     @discord.ui.button(label="✅ Снять запрет", style=discord.ButtonStyle.success,
-                       custom_id="unban_btn", row=1)
+                       custom_id="unban_btn", row=0)
     async def unban(self, i, b):
         await i.response.defer()
         if not user_can_review(i.user):
@@ -1717,16 +1777,6 @@ class ApplicationManagement(discord.ui.View):
         await safe_send(i.followup, f"✅ снят с <@{tid}>" if had else "ℹ️ нет")
         if had:
             await log_to_channel(i.client, f"✅ unban <@{tid}> от {i.user.mention}")
-
-    @discord.ui.button(label="👥 0", style=discord.ButtonStyle.secondary,
-                       custom_id="voted_list_btn", row=1)
-    async def voted_list(self, i, b):
-        st = await _get_votes(_app_id_for(i, b))
-        if not st["voters"]:
-            await i.response.send_message("Пусто", ephemeral=True)
-            return
-        await i.response.send_message("Голосовали: " + ", ".join(f"<@{u}>" for u in st["voters"]),
-                                      ephemeral=True)
 
 
 class TempBanModal(discord.ui.Modal, title="Запрет"):
@@ -1818,20 +1868,29 @@ class QuestionnaireModal(discord.ui.Modal, title="Заявка в клан"):
         e.set_footer(text=f"{CLAN_NAME} • {utc_stamp()}")
 
         ch = i.guild.get_channel(APPLICATIONS_CHANNEL_ID) if APPLICATIONS_CHANNEL_ID else None
-        # Один app_id на заявку: сообщение в канале и сообщение в ветке
+        # Один app_id на заявку: сообщение в канале, в ветке и в логе
         # должны показывать одни и те же счётчики голосов.
         app_id = _new_app_id()
         msg = None
         if ch:
             try:
+                # В канале заявок — только «Взять / Принять / Отклонить».
                 view = ApplicationManagement(app_id)
                 msg = await safe_send(ch, content=f"🔔 Новая заявка от {i.user.mention}",
                                       embed=e, view=view)
-                if msg:
-                    await view.update_labels()
-                    await msg.edit(view=view)
             except Exception as ex:
                 log(f"⚠️ Канал заявок: {ex}")
+
+        # Копия заявки в лог-канал: только кнопки запретов, без
+        # «Принять»/«Отклонить» — блокировки удобно выдавать из лога.
+        log_ch = (i.guild.get_channel(APPLICATION_LOGS_CHANNEL_ID)
+                  if APPLICATION_LOGS_CHANNEL_ID else None)
+        if log_ch and (ch is None or log_ch.id != getattr(ch, "id", None)):
+            try:
+                await safe_send(log_ch, content=f"🛡 Копия заявки {i.user.mention}",
+                                embed=e, view=ApplicationBansView(app_id))
+            except Exception as ex:
+                log(f"⚠️ Лог заявок: {ex}")
 
         # Фиксируем заявку в БД (анти-дубликат + ссылка на сообщение заявки).
         try:
@@ -1851,6 +1910,12 @@ class QuestionnaireModal(discord.ui.Modal, title="Заявка в клан"):
 
 
 async def _create_application_thread(i, e, app_id: str = ""):
+    """Создаёт приватную ветку заявки.
+
+    В ветку добавляются: заявитель, все ревьюеры и участники ролей из
+    ``APPLICATION_PING_ROLE_IDS``. Первое сообщение упоминает эти роли,
+    чтобы уведомление ушло всем заинтересованным сразу.
+    """
     try:
         if not THREADS_CHANNEL_ID:
             return
@@ -1864,8 +1929,11 @@ async def _create_application_thread(i, e, app_id: str = ""):
             await t.add_user(i.user)
         except Exception:
             pass
+
+        # Кого позвать в ветку: ревьюеры + участники ролей пинга.
         added, tasks_ = set(), []
-        for rid in get_all_reviewer_role_ids():
+        role_ids = list(get_all_reviewer_role_ids()) + list(APPLICATION_PING_ROLE_IDS)
+        for rid in role_ids:
             role = i.guild.get_role(rid) if rid else None
             if role:
                 for m in role.members:
@@ -1874,13 +1942,15 @@ async def _create_application_thread(i, e, app_id: str = ""):
                         tasks_.append(t.add_user(m))
         for x in range(0, len(tasks_), 20):
             await asyncio.gather(*tasks_[x:x + 20], return_exceptions=True)
+
+        # Упоминание ролей идёт выше текста заявки.
+        pings = " ".join(f"<@&{rid}>" for rid in APPLICATION_PING_ROLE_IDS
+                         if i.guild.get_role(rid))
+        header = (f"{i.user.mention}, ваша заявка на рассмотрении."
+                  + (f"\n{pings}" if pings else ""))
         # Тот же app_id, что и у сообщения в канале: голоса общие.
         view = ApplicationManagement(app_id)
-        msg = await safe_send(t, content=f"{i.user.mention}, ваша заявка на рассмотрении.",
-                              embed=e, view=view)
-        if msg:
-            await view.update_labels()
-            await msg.edit(view=view)
+        await safe_send(t, content=header, embed=e, view=view)
     except Exception as ex:
         log(f"⚠️ Ветка: {ex}")
 
@@ -2039,6 +2109,9 @@ class MyBot(commands.Bot):
             # заявок не работают и фоновые задачи не крутятся.
             self.add_view(ApplicationManagement())
             log("✅ ApplicationManagement view добавлен")
+            # Кнопки запретов в лог-канале — отдельный persistent view.
+            self.add_view(ApplicationBansView())
+            log("✅ ApplicationBansView view добавлен")
             # Персистентный view выбора клана: опубликованное ранее сообщение
             # со списком продолжает работать после рестарта бота.
             self.add_view(ClanView())
@@ -2067,6 +2140,8 @@ class MyBot(commands.Bot):
             activity_tracker.start()
             hourly_clan_sync.start()
             agent_watch.start()
+            health_watch.start()
+            daily_summary.start()
             if not GUILD_ID:
                 log("⚠️ GUILD_ID = 0 — автосинхронизация ролей клана и /check "
                     "не смогут найти сервер (задайте GUILD_ID)")
@@ -2096,6 +2171,7 @@ class MyBot(commands.Bot):
                 continue
             try:
                 self.add_view(ApplicationManagement(app_id))
+                self.add_view(ApplicationBansView(app_id))
                 count += 1
             except Exception as e:
                 log(f"⚠️ Не поднял view заявки {app_id}: {e}")
@@ -2195,6 +2271,12 @@ async def on_member_join(member):
 def admin_only(i):
     # В ЛС у User нет guild_permissions — не роняем команду, просто отказываем.
     perms = getattr(getattr(i, "user", None), "guild_permissions", None)
+    return bool(perms and perms.administrator)
+
+
+def admin_only_ctx(ctx):
+    """То же, что admin_only, но для текстовых команд (ctx.author, а не i.user)."""
+    perms = getattr(getattr(ctx, "author", None), "guild_permissions", None)
     return bool(perms and perms.administrator)
 
 
@@ -2308,17 +2390,17 @@ async def unlink(i):
 @app_commands.describe(user="Участник Discord", steam_id="SteamID64 (17 цифр)")
 @app_commands.default_permissions(administrator=True)
 async def admlink(i, user: discord.Member, steam_id: str):
-    await i.response.defer(ephemeral=False)
+    await i.response.defer(ephemeral=True)
     if not await _admin_guard(i):
         return
     steam_id = steam_id.strip()
     if not (steam_id.isdigit() and len(steam_id) == 17 and steam_id.startswith("7656119")):
         await safe_send(i.followup, "❌ Неверный SteamID (ожидается SteamID64 из 17 цифр, "
-                                    "начинающийся с 7656119).", ephemeral=False)
+                                    "начинающийся с 7656119).", ephemeral=True)
         return
     try:
         if user.bot:
-            await safe_send(i.followup, "❌ Нельзя привязать бота.", ephemeral=False)
+            await safe_send(i.followup, "❌ Нельзя привязать бота.", ephemeral=True)
             return
         # Проверяем, есть ли уже привязка (для информативного лога).
         was_linked = await links_repo.get_link(user.id)
@@ -2338,9 +2420,9 @@ async def admlink(i, user: discord.Member, steam_id: str):
 
         await safe_send(i.followup,
             f"✅ Пользователь {user.mention} успешно привязан к Steam ID: `{steam_id}`.",
-            ephemeral=False
+            ephemeral=True
         )
-        await safe_send(i.followup, embed=embed, ephemeral=False)
+        await safe_send(i.followup, embed=embed, ephemeral=True)
         await log_to_channel(i.client,
             f"🔗 /admlink: {user.mention} ({user.id}) "
             f"{'обновлён' if was_linked else 'привязан'} → `{steam_id}` "
@@ -2352,10 +2434,10 @@ async def admlink(i, user: discord.Member, steam_id: str):
 
 @bot.tree.command(name="sync_all", description="Синхронизировать всех")
 async def sync_all(i):
-    await i.response.defer(ephemeral=False)
+    await i.response.defer(ephemeral=True)
     if not await _admin_guard(i):
         return
-    await run_sync_all(i)
+    await run_sync_all(i, ephemeral=True)
 
 
 async def run_sync_all(i, ephemeral: bool = False):
@@ -2489,7 +2571,7 @@ async def linked_member_autocomplete(i, current):
 # ============================================================
 @bot.tree.command(name="link_all", description="Массовая привязка/синхронизация из базы SQLite")
 async def link_all(i):
-    await i.response.defer(ephemeral=False)
+    await i.response.defer(ephemeral=True)
     if not await _admin_guard(i):
         return
 
@@ -2499,7 +2581,7 @@ async def link_all(i):
         if not data:
             await safe_send(i.followup,
                             "ℹ️ В базе нет привязок. Добавьте их через /link или /admlink.",
-                            ephemeral=False)
+                            ephemeral=True)
             return
 
         total = len(data)
@@ -2561,7 +2643,7 @@ async def link_all(i):
                 try:
                     await safe_send(i.followup,
                         f"⏳ Прогресс: {processed}/{total}…",
-                        ephemeral=False
+                        ephemeral=True
                     )
                 except Exception:
                     pass
@@ -2586,7 +2668,7 @@ async def link_all(i):
         if other:
             text += "**Прочее:**\n" + "\n".join(other[:10])
         await safe_send(i.followup, text[:1900], title="🔗 Массовая привязка",
-                        ephemeral=False)
+                        ephemeral=True)
         await log_to_channel(i.client,
             f"📊 /link_all: +{len(added)} / уже {len(already)} / "
             f"не SID {len(skip_not_sid)} / нет на сервере {len(no_member)} / "
@@ -2599,10 +2681,10 @@ async def link_all(i):
 @bot.tree.command(name="auto_link", description="Авто-привязка по никам через админ-панель cs2red (админ)")
 @app_commands.default_permissions(administrator=True)
 async def auto_link(i):
-    await i.response.defer(ephemeral=False)
+    await i.response.defer(ephemeral=True)
     if not await _admin_guard(i):
         return
-    await run_auto_link(i)
+    await run_auto_link(i, ephemeral=True)
 
 
 async def run_auto_link(i, ephemeral: bool = False):
@@ -2765,7 +2847,7 @@ async def run_auto_link(i, ephemeral: bool = False):
         try:
             await msg.edit(embed=embed)
         except Exception:
-            await safe_send(i.followup, embed=embed, ephemeral=False)
+            await safe_send(i.followup, embed=embed, ephemeral=True)
         await log_to_channel(i.client,
             f"🔗 /auto_link: привязано {len(added)}, неоднозначно "
             f"{len(skipped_ambigu)}, не найдено {len(skipped_none)}, ошибок {len(errors)}")
@@ -2776,13 +2858,13 @@ async def run_auto_link(i, ephemeral: bool = False):
 
 @bot.tree.command(name="export_members", description="Выгрузить привязки в mass_links.json")
 async def export_members(i):
-    await i.response.defer(ephemeral=False)
+    await i.response.defer(ephemeral=True)
     if not await _admin_guard(i):
         return
     try:
         links = await links_repo.get_all_links()
         if not links:
-            await safe_send(i.followup, "ℹ️ Нет привязанных.", ephemeral=False)
+            await safe_send(i.followup, "ℹ️ Нет привязанных.", ephemeral=True)
             return
         valid = {}
         for did, sid in links.items():
@@ -2793,11 +2875,11 @@ async def export_members(i):
                 json.dump(valid, f, ensure_ascii=False, indent=2)
         except Exception as e:
             await log_error(i.client, "/export_members.write", e)
-            await safe_send(i.followup, f"❌ {e}", ephemeral=False)
+            await safe_send(i.followup, f"❌ {e}", ephemeral=True)
             return
         await safe_send(i.followup,
             f"✅ Выгружено привязок: **{len(valid)}**",
-            ephemeral=False
+            ephemeral=True
         )
         await log_to_channel(i.client, f"📤 /export_members — {len(valid)}")
     except Exception as e:
@@ -2811,7 +2893,7 @@ async def export_members(i):
 @bot.tree.command(name="player_info", description="База игрока")
 @app_commands.describe(member="Участник Discord")
 async def player_info(i, member: discord.Member):
-    await i.response.defer(ephemeral=False)
+    await i.response.defer(ephemeral=True)
 
     try:
         profile = await run_with_timeout(
@@ -2827,7 +2909,7 @@ async def player_info(i, member: discord.Member):
             return
 
         if not profile.get("steamid64"):
-            await safe_send(i.followup, "❌ Нет SteamID", ephemeral=False)
+            await safe_send(i.followup, "❌ Нет SteamID", ephemeral=True)
             return
 
         old = await players_repo.get_player(profile["steamid64"])
@@ -2841,7 +2923,7 @@ async def player_info(i, member: discord.Member):
 
         await safe_send(i.followup,
             f"✅ Профиль **{member.display_name}** отправлен в <#{DB_CHANNEL_ID}>.",
-            ephemeral=False
+            ephemeral=True
         )
     except Exception as e:
         await log_error(i.client, "/player_info", e)
@@ -2851,13 +2933,13 @@ async def player_info(i, member: discord.Member):
 @bot.tree.command(name="player_note", description="Заметка к профилю")
 @app_commands.describe(member="Участник Discord", note="Заметка")
 async def player_note(i, member: discord.Member, note: str):
-    await i.response.defer(ephemeral=False)
+    await i.response.defer(ephemeral=True)
     if not await _admin_guard(i):
         return
     try:
         sid = await links_repo.get_link(member.id)
         if not sid:
-            await safe_send(i.followup, "❌ Нет SteamID", ephemeral=False)
+            await safe_send(i.followup, "❌ Нет SteamID", ephemeral=True)
             return
 
         async def _make():
@@ -2866,7 +2948,7 @@ async def player_note(i, member: discord.Member, note: str):
         profile["notes"] = note
         profile["updated_at"] = now_utc().isoformat()
         await players_repo.save_player(sid, profile)
-        await safe_send(i.followup, f"✅ Заметка для {member.mention}", ephemeral=False)
+        await safe_send(i.followup, f"✅ Заметка для {member.mention}", ephemeral=True)
         await send_player_report(i.client, profile)
     except Exception as e:
         await log_error(i.client, "/player_note", e)
@@ -2875,13 +2957,13 @@ async def player_note(i, member: discord.Member, note: str):
 
 @bot.tree.command(name="player_list", description="Вся база")
 async def player_list(i):
-    await i.response.defer(ephemeral=False)
+    await i.response.defer(ephemeral=True)
     if not await _admin_guard(i):
         return
     try:
         db = await players_repo.get_all_players()
         if not db:
-            await safe_send(i.followup, "ℹ️ Пусто", ephemeral=False)
+            await safe_send(i.followup, "ℹ️ Пусто", ephemeral=True)
             return
         links = await links_repo.get_all_links()
         rev = {s: d for d, s in links.items()}
@@ -2896,7 +2978,7 @@ async def player_list(i):
         text = "📊 **База:**\n" + "\n".join(lines[:50])
         if len(lines) > 50:
             text += f"\n...и ещё {len(lines) - 50}"
-        await safe_send(i.followup, text[:1900], ephemeral=False)
+        await safe_send(i.followup, text[:1900], ephemeral=True)
     except Exception as e:
         await log_error(i.client, "/player_list", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
@@ -3126,9 +3208,12 @@ async def check(i):
         if guild is None:
             await safe_send(i.followup, "❌ Команда работает только на сервере.", ephemeral=True)
             return
-        role = discord.utils.get(guild.roles, name=CLAN_NAME)
+        role = guild.get_role(TALENT_ROLE_ID)
         if role is None:
-            await safe_send(i.followup, f"❌ Роль «{CLAN_NAME}» не найдена на сервере.",
+            role = discord.utils.get(guild.roles, name=CLAN_NAME)
+        if role is None:
+            await safe_send(i.followup,
+                            f"❌ Роль «{CLAN_NAME}» ({TALENT_ROLE_ID}) не найдена на сервере.",
                             ephemeral=True)
             return
         members = [m for m in guild.members if role in m.roles and not m.bot]
@@ -3205,6 +3290,416 @@ async def check(i):
             await log_error(bot, "/check.log", e)
     except Exception as e:
         await log_error(i.client, "/check", e)
+        try:
+            await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}", ephemeral=True)
+        except Exception:
+            pass
+
+
+# ============================================================
+# /check_all — муты за 2 недели у всех игроков с ролью TALENT
+# ============================================================
+def _filter_blocks_since(blocks: list, since_ts: int) -> list:
+    """Оставляет блокировки, начавшиеся не раньше since_ts.
+
+    Активные без даты начала тоже показываем: лучше показать лишнее,
+    чем пропустить действующий мут.
+    """
+    result = []
+    for b in blocks:
+        start = b.get("start_ts") or 0
+        if start >= since_ts or (not start and b.get("active")):
+            result.append(b)
+    return result
+
+
+def _talent_members(guild) -> list:
+    """Участники с ролью TALENT: сначала по id, затем по имени роли."""
+    role = guild.get_role(TALENT_ROLE_ID)
+    if role is None:
+        role = discord.utils.get(guild.roles, name=CLAN_NAME)
+    if role is None:
+        return []
+    return [m for m in guild.members if role in m.roles and not m.bot]
+
+
+@bot.tree.command(name="check_all",
+                  description="Муты за 2 недели у всех игроков с ролью TALENT")
+async def check_all(i):
+    """Проверяет всех игроков с ролью TALENT на муты за последние 2 недели.
+
+    Показывает, кто получал мут, когда, на какой срок и кто выдал.
+    Ответ ephemeral: отчёт видит только вызвавший команду.
+    """
+    await i.response.defer(ephemeral=True)
+    try:
+        guild = i.guild
+        if guild is None:
+            await safe_send(i.followup, "❌ Команда работает только на сервере.",
+                            ephemeral=True)
+            return
+        members = _talent_members(guild)
+        if not members:
+            await safe_send(i.followup,
+                            f"ℹ️ Нет участников с ролью «{CLAN_NAME}».", ephemeral=True)
+            return
+
+        since = int(time.time()) - CHECK_ALL_DAYS * 86400
+        checked = skipped = errors = 0
+        found = []
+        for idx, m in enumerate(members, 1):
+            sid = await links_repo.get_link(m.id)
+            if not sid:
+                skipped += 1
+            else:
+                try:
+                    _bans, mutes, err = await asyncio.wait_for(
+                        api.cs2red_all_blocks(sid), timeout=CMD_API_TIMEOUT)
+                    if err == "unavailable":
+                        errors += 1
+                    else:
+                        checked += 1
+                        recent = _filter_blocks_since(mutes, since)
+                        if recent:
+                            recent.sort(key=lambda b: b.get("start_ts") or 0,
+                                        reverse=True)
+                            found.append((m, sid, recent))
+                except asyncio.TimeoutError:
+                    errors += 1
+                except Exception as e:
+                    errors += 1
+                    await log_error(i.client, f"/check_all:{m.id}", e)
+
+            if idx % 5 == 0:
+                try:
+                    await i.edit_original_response(
+                        content=f"⏳ Проверено {idx}/{len(members)}…")
+                except Exception:
+                    pass
+            if idx < len(members):
+                await asyncio.sleep(BLOCK_CHECK_DELAY)
+
+        embed = discord.Embed(
+            title=f"🔇 Муты за {CHECK_ALL_DAYS} дн. — клан «{CLAN_NAME}»",
+            color=0x000000, timestamp=now_utc())
+        embed.add_field(name="👥 Игроков с ролью", value=str(len(members)), inline=True)
+        embed.add_field(name="✅ Проверено", value=str(checked), inline=True)
+        embed.add_field(name="🔇 С мутами", value=str(len(found)), inline=True)
+        embed.add_field(name="🔗 Без SteamID", value=str(skipped), inline=True)
+        embed.add_field(name="⚠️ Ошибок", value=str(errors), inline=True)
+        if found:
+            lines = []
+            for m, _sid, blocks in found[:CHECK_ALL_MAX_MEMBERS]:
+                for b in blocks[:3]:
+                    lines.append(
+                        f"• {m.mention} — {_fmt_block_ts(b.get('start_ts') or 0)} · "
+                        f"{_fmt_block_duration(b.get('start_ts') or 0, b.get('end_ts') or 0)} · "
+                        f"{(b.get('reason') or '—')[:60]} · "
+                        f"выдал: {b.get('admin') or '—'}")
+            if len(found) > CHECK_ALL_MAX_MEMBERS:
+                lines.append(f"…и ещё {len(found) - CHECK_ALL_MAX_MEMBERS}")
+            embed.add_field(name="Муты", value="\n".join(lines)[:1024], inline=False)
+        else:
+            embed.add_field(name="Муты",
+                            value=f"✅ За {CHECK_ALL_DAYS} дн. мутов не найдено",
+                            inline=False)
+        embed.set_footer(text=f"Quantum • {utc_stamp()}")
+        await safe_send(i.followup, embed=embed, ephemeral=True)
+
+        # Мини-отчёт в лог-канал: кто получал мут и когда.
+        try:
+            log_ch = bot.get_channel(CHECK_LOG_CHANNEL_ID) if CHECK_LOG_CHANNEL_ID else None
+            if log_ch is not None:
+                text = _build_check_log_text(i.user.display_name, checked,
+                                             [(m, sid, blocks) for m, sid, blocks in found],
+                                             skipped, errors)
+                await safe_send(log_ch, text,
+                                title=f"🔇 /check_all — клан «{CLAN_NAME}»")
+        except Exception as e:
+            await log_error(bot, "/check_all.log", e)
+    except Exception as e:
+        await log_error(i.client, "/check_all", e)
+        try:
+            await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}", ephemeral=True)
+        except Exception:
+            pass
+
+
+# ============================================================
+# /check_clan — проверка ролей клана у участников
+# ============================================================
+def _member_clan_roles(guild, member, known_names: set) -> list:
+    """Роли участника, которые являются ролями клана."""
+    managed_ids = set(CLAN_ROLE_MAP.values())
+    return [r for r in member.roles
+            if r.id in managed_ids or r.name in known_names]
+
+
+async def _collect_clan_role_issues(guild, members: list) -> dict:
+    """Собирает проблемы с ролями клана у участников.
+
+    Возвращает словарь со списками:
+      extra     — (member, role, лишние роли) у кого больше одной роли клана;
+      unlinked  — участники с ролью клана, но без привязки /link;
+      missing   — привязан, в клане, но роли клана нет;
+      wrong     — привязан, роль есть, но не та (имя ≠ клана на cs2red);
+      errors    — (member, текст) не удалось проверить.
+    """
+    known_names = _load_clan_role_names()
+    issues = {"extra": [], "unlinked": [], "missing": [],
+              "wrong": [], "errors": [], "checked": 0}
+    for m in members:
+        sid = await links_repo.get_link(m.id)
+        held = _member_clan_roles(guild, m, known_names)
+        if not sid:
+            if held:
+                issues["unlinked"].append((m, [r.name for r in held]))
+            continue
+        try:
+            user = await api.cs2red_user(sid)
+            if user is None:
+                issues["errors"].append((m, "cs2red не ответил"))
+                continue
+            if user.get("_not_found") or not user.get("id"):
+                issues["errors"].append((m, "игрок не найден на cs2red"))
+                continue
+            clan, clan_err = await api.player_clan_checked(sid, user=user)
+            if clan_err:
+                issues["errors"].append((m, clan_err))
+                continue
+            _remember_clan_role_name(
+                (clan or {}).get("clan_name") or "")
+        except Exception as e:
+            issues["errors"].append((m, f"ошибка: {str(e)[:80]}"))
+            continue
+
+        issues["checked"] += 1
+        clan_name = ((clan or {}).get("clan_name") or "").strip()
+        if not clan:
+            if held:
+                issues["wrong"].append((m, [r.name for r in held], None))
+        elif len(held) > 1:
+            issues["extra"].append((m, [r.name for r in held], clan_name))
+        elif not held:
+            issues["missing"].append((m, clan_name))
+        elif held[0].name != clan_name:
+            issues["wrong"].append((m, [r.name for r in held], clan_name))
+    return issues
+
+
+def _build_check_clan_embed(issues: dict, total: int) -> discord.Embed:
+    """Embed с результатами /check_clan."""
+    extra = issues["extra"]
+    unlinked = issues["unlinked"]
+    missing = issues["missing"]
+    wrong = issues["wrong"]
+    errors = issues["errors"]
+
+    embed = discord.Embed(
+        title=f"🏰 Проверка ролей клана «{CLAN_NAME}»",
+        color=0x000000, timestamp=now_utc())
+    embed.add_field(name="👥 С ролью клана", value=str(total), inline=True)
+    embed.add_field(name="✅ Проверено", value=str(issues["checked"]), inline=True)
+    embed.add_field(name="⚠️ Проблем", value=str(len(extra) + len(missing)
+                                                  + len(wrong)), inline=True)
+
+    def fmt(rows, tail="") -> str:
+        out = []
+        for row in rows[:10]:
+            m = row[0]
+            if len(row) == 3 and row[2]:
+                out.append(f"• {m.mention} — {', '.join(row[1])} → **{row[2]}**")
+            elif len(row) == 3:
+                out.append(f"• {m.mention} — {', '.join(row[1])} (нет клана)")
+            elif len(row) == 2 and isinstance(row[1], list):
+                out.append(f"• {m.mention} — {', '.join(row[1])}")
+            else:
+                out.append(f"• {m.mention} — {row[1]}")
+        if len(rows) > 10:
+            out.append(f"…и ещё {len(rows) - 10}")
+        return ("\n".join(out) if out else "✅ Нет") + tail
+
+    embed.add_field(name=f"🔀 Несколько ролей клана ({len(extra)})",
+                    value=fmt(extra)[:1024], inline=False)
+    embed.add_field(name=f"🔗 Без /link, но с ролью ({len(unlinked)})",
+                    value=fmt(unlinked)[:1024], inline=False)
+    embed.add_field(name=f"🚫 Роль есть, но не в клане ({len(wrong)})",
+                    value=fmt(wrong)[:1024], inline=False)
+    embed.add_field(name=f"➕ В клане без роли ({len(missing)})",
+                    value=fmt(missing)[:1024], inline=False)
+    if errors:
+        embed.add_field(name=f"⚠️ Ошибки проверки ({len(errors)})",
+                        value=fmt(errors)[:1024], inline=False)
+    embed.set_footer(text=f"Quantum • {utc_stamp()}")
+    return embed
+
+
+class CheckClanView(discord.ui.View):
+    """Кнопка «Очистить лишние роли» под отчётом /check_clan."""
+
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="🧹 Очистить лишние роли",
+                       style=discord.ButtonStyle.danger)
+    async def clean(self, i, b):
+        await i.response.defer(ephemeral=True)
+        if not i.user.guild_permissions.administrator:
+            await safe_send(i.followup, "❌ Нужны права администратора.", ephemeral=True)
+            return
+        guild = i.guild
+        if guild is None:
+            await safe_send(i.followup, "❌ Только на сервере.", ephemeral=True)
+            return
+        members = _talent_members(guild)
+        known_names = _load_clan_role_names()
+        removed_total = 0
+        problems = []
+        for m in members:
+            held = _member_clan_roles(guild, m, known_names)
+            if len(held) < 2:
+                continue
+            sid = await links_repo.get_link(m.id)
+            keep = None
+            if sid:
+                try:
+                    user = await api.cs2red_user(sid)
+                    clan, err = await api.player_clan_checked(sid, user=user) \
+                        if user and not user.get("_not_found") else (None, "")
+                    if not err and clan:
+                        keep = (clan.get("clan_name") or "").strip()
+                        _remember_clan_role_name(keep)
+                except Exception as e:
+                    problems.append(f"{m.display_name}: {str(e)[:60]}")
+                    continue
+            # Если клан известен — оставляем ровно его роль, иначе снимаем все.
+            to_remove = [r for r in held if not keep or r.name != keep]
+            if not to_remove:
+                continue
+            above = _clan_roles_above_bot(guild, to_remove)
+            below = [r for r in to_remove if r not in above]
+            errs = await _remove_roles_checked(m, below) if below else []
+            removed_total += len(below)
+            if above:
+                errs.append("выше роли бота: " + ", ".join(r.name for r in above))
+            if errs:
+                problems.append(f"{m.display_name}: " + "; ".join(errs))
+            if keep:
+                left = [r for r in held if r.name == keep]
+                if left:
+                    _remember_member_clan_role(m.id, left[0].id)
+        text = f"🧹 Снято лишних ролей клана: **{removed_total}**"
+        if problems:
+            text += "\n⚠️ " + "\n⚠️ ".join(problems[:10])
+        await safe_send(i.followup, text, ephemeral=True)
+
+
+@bot.tree.command(name="check_clan",
+                  description="Проверить роли клана у всех участников с ролью TALENT")
+async def check_clan(i):
+    """Ищет лишние роли клана, отсутствующие роли и участников без /link.
+
+    Отчёт ephemeral + кнопка, которая снимает лишние роли клана.
+    """
+    await i.response.defer(ephemeral=True)
+    try:
+        guild = i.guild
+        if guild is None:
+            await safe_send(i.followup, "❌ Команда работает только на сервере.",
+                            ephemeral=True)
+            return
+        members = _talent_members(guild)
+        if not members:
+            await safe_send(i.followup,
+                            f"ℹ️ Нет участников с ролью «{CLAN_NAME}».", ephemeral=True)
+            return
+
+        issues = await _collect_clan_role_issues(guild, members)
+        embed = _build_check_clan_embed(issues, len(members))
+        view = CheckClanView() if issues["extra"] else None
+        await safe_send(i.followup, embed=embed, view=view, ephemeral=True)
+    except Exception as e:
+        await log_error(i.client, "/check_clan", e)
+        try:
+            await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}", ephemeral=True)
+        except Exception:
+            pass
+
+
+# ============================================================
+# /clan_info — профиль клана одним embed
+# ============================================================
+async def _build_clan_info_embed(guild) -> discord.Embed:
+    """Собирает профиль клана: состав на cs2red, роли в Discord, проблемы."""
+    members = _talent_members(guild)
+    embed = discord.Embed(
+        title=f"🏰 Клан «{CLAN_NAME}»",
+        color=0x000000, timestamp=now_utc())
+
+    # Данные cs2red: состав клана и топ по времени на серверах.
+    clans = await api.cs2red_clans()
+    on_site = None
+    if clans:
+        for c in clans:
+            if (c.get("name") or "").strip().lower() == CLAN_NAME.lower():
+                on_site = c
+                break
+    if on_site is not None:
+        roster = on_site.get("members") or []
+        embed.add_field(name="👥 Состав на cs2red", value=str(len(roster)), inline=True)
+        tags = on_site.get("tag") or "—"
+        embed.add_field(name="🏷 Тег", value=tags, inline=True)
+    else:
+        embed.add_field(name="👥 Состав на cs2red",
+                        value="не удалось получить", inline=True)
+
+    # Discord: сколько с ролью клана и сколько без привязки.
+    linked = await links_repo.get_all_links()
+    linked_ids = {int(k) for k in linked if str(k).isdigit()}
+    no_link = [m for m in members if m.id not in linked_ids]
+    embed.add_field(name="🎭 С ролью в Discord", value=str(len(members)), inline=True)
+    embed.add_field(name="🔗 Без /link", value=str(len(no_link)), inline=True)
+
+    # Разбивка по кланам из cs2red, если данные есть.
+    if members:
+        checked = 0
+        in_clan = 0
+        for m in members[:30]:  # ограничиваем: у cs2red есть лимиты запросов
+            sid = await links_repo.get_link(m.id)
+            if not sid:
+                continue
+            try:
+                user = await api.cs2red_user(sid)
+                clan, err = await api.player_clan_checked(sid, user=user)
+            except Exception:
+                continue
+            if err:
+                continue
+            checked += 1
+            if clan:
+                in_clan += 1
+            await asyncio.sleep(REQUEST_DELAY)
+        embed.add_field(name="✅ Подтверждено в клане",
+                        value=f"{in_clan} из {checked}", inline=True)
+
+    url = CLAN_URL if CLAN_URL else "—"
+    embed.add_field(name="🔗 Ссылка", value=url, inline=False)
+    embed.set_footer(text=f"Quantum • {utc_stamp()}")
+    return embed
+
+
+@bot.tree.command(name="clan_info", description="Профиль клана: состав, роли, привязки")
+async def clan_info(i):
+    await i.response.defer(ephemeral=True)
+    try:
+        if i.guild is None:
+            await safe_send(i.followup, "❌ Команда работает только на сервере.",
+                            ephemeral=True)
+            return
+        embed = await _build_clan_info_embed(i.guild)
+        await safe_send(i.followup, embed=embed, ephemeral=True)
+    except Exception as e:
+        await log_error(i.client, "/clan_info", e)
         try:
             await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}", ephemeral=True)
         except Exception:
@@ -3339,19 +3834,21 @@ async def health(i: discord.Interaction):
         except Exception as e:
             add("🎮", "Steam API", f"❌ {e}", False)
 
-    for name, data in [
-        ("links.json", await links_repo.count_all()),
-        ("players_db.json", await players_repo.count_all()),
-        ("users_db.json", await users_repo.count_all()),
-        ("moderators.json", await moderation_repo.count_all()),
-        ("votes.json", await votes_repo.count_all()),
-        ("seen.json", await seen_repo.count_all()),
+    for name, repo in [
+        ("links.json", links_repo),
+        ("players_db.json", players_repo),
+        ("users_db.json", users_repo),
+        ("moderators.json", moderation_repo),
+        ("votes.json", votes_repo),
+        ("seen.json", seen_repo),
     ]:
         try:
-            size = len(data) if hasattr(data, "__len__") else "?"
+            # count_all() возвращает int — len() к нему неприменим, поэтому
+            # раньше в отчёте всегда было «записей: ?».
+            size = await repo.count_all()
             add("📁", f"Файл `{name}`", f"записей: `{size}`", True)
         except Exception as e:
-            add("📁", f"Файл `{name}`", f"❌ {e}", False)
+            add("📁", f"Файл `{name}`", f"❌ {str(e)[:200]}", False)
 
     mass_file = data_path("mass_links.json")
     if mass_file.exists():
@@ -3370,7 +3867,11 @@ async def health(i: discord.Interaction):
         except Exception as e:
             add("📁", "Файл `mass_links.json`", f"❌ {e}", False)
     else:
-        add("📁", "Файл `mass_links.json`", "⚠️ не найден", False)
+        # mass_links.json — это выгрузка /export_members, а не хранилище
+        # привязок (они в SQLite). Пока экспорт не делали, файла нет — это
+        # штатная ситуация, а не проблема.
+        add("📁", "Файл `mass_links.json`",
+            "ℹ️ не создан (создаётся командой `/export_members`)", True)
 
     for name, task_obj, interval in [
         ("auto_sync", auto_sync, f"{SYNC_INTERVAL_MINUTES} мин"),
@@ -3412,15 +3913,27 @@ async def health(i: discord.Interaction):
     if ai_service is None:
         add("🤖", "AI-сервис", "не инициализирован", False)
     else:
-        for prov in ai_service.providers:
+        providers = ai_service.providers
+        any_ai_ok = False
+        for prov in providers:
             ok = prov.last_error == ""
+            if ok:
+                any_ai_ok = True
             add("🤖", f"AI ({prov.name.title()})", prov.status_line(), ok)
-        # Не настроенные провайдеры (без ключа) не попадают в список,
-        # поэтому явно покажем, что их нет.
-        configured = {p.name for p in ai_service.providers}
-        for name in ("gemini", "openrouter", "llm7"):
-            if name not in configured:
-                add("🤖", f"AI ({name.title()})", "Не настроен (нет ключа)", False)
+        # Не настроенные провайдеры (без ключа) не попадают в список.
+        # Это НЕ проблема, если хотя бы один провайдер настроен и работает:
+        # каскад просто использует доступный. Красный флаг ставим только
+        # когда ИИ не настроен вообще.
+        configured = {p.name for p in providers}
+        missing = [n for n in ("gemini", "openrouter", "llm7")
+                   if n not in configured]
+        if missing:
+            names = ", ".join(n.title() for n in missing)
+            add("🤖", "AI (резерв)",
+                f"ℹ️ не настроены: {names} (нужны ключи в .env)",
+                any_ai_ok)
+        if not providers:
+            add("🤖", "AI-каскад", "❌ ни один ИИ-провайдер не настроен", False)
         try:
             cache_count = await count_cache()
             add("🗃️", "AI Cache", f"записей в БД — {cache_count}", True)
@@ -3462,11 +3975,11 @@ async def health(i: discord.Interaction):
 # ============================================================
 @bot.tree.command(name="moders", description="Список модераторов бота")
 async def moders(i):
-    await i.response.defer(ephemeral=False)
+    await i.response.defer(ephemeral=True)
     try:
         mods = await moderation_repo.get_all_moderators()
         if not mods:
-            await safe_send(i.followup, "ℹ️ Пусто", ephemeral=False)
+            await safe_send(i.followup, "ℹ️ Пусто", ephemeral=True)
             return
         lines = []
         for u in mods:
@@ -3479,7 +3992,7 @@ async def moders(i):
             else:
                 lines.append(f"• `{u}`")
         await safe_send(i.followup, f"🛠 ({len(mods)}):\n" + "\n".join(lines),
-                        title="🛠 Список модераторов", ephemeral=False)
+                        title="🛠 Список модераторов", ephemeral=True)
     except Exception as e:
         await log_error(i.client, "/moders", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
@@ -3488,14 +4001,14 @@ async def moders(i):
 @bot.tree.command(name="give", description="Выдать доступ")
 async def give(i, user: discord.Member):
     if not admin_only(i):
-        await i.response.send_message("❌", ephemeral=False)
+        await i.response.send_message("❌", ephemeral=True)
         return
-    await i.response.defer(ephemeral=False)
+    await i.response.defer(ephemeral=True)
     try:
         added = await moderation_repo.add_moderator(user.id)
         await safe_send(i.followup,
             f"✅ {user.mention} получил доступ." if added else "ℹ️ Уже есть.",
-            ephemeral=False
+            ephemeral=True
         )
     except Exception as e:
         await log_error(i.client, "/give", e)
@@ -3505,14 +4018,14 @@ async def give(i, user: discord.Member):
 @bot.tree.command(name="take", description="Забрать доступ")
 async def take(i, user: discord.Member):
     if not admin_only(i):
-        await i.response.send_message("❌", ephemeral=False)
+        await i.response.send_message("❌", ephemeral=True)
         return
-    await i.response.defer(ephemeral=False)
+    await i.response.defer(ephemeral=True)
     try:
         removed = await moderation_repo.remove_moderator(user.id)
         await safe_send(i.followup,
             f"❌ {user.mention} лишён." if removed else "ℹ️ Уже без.",
-            ephemeral=False
+            ephemeral=True
         )
     except Exception as e:
         await log_error(i.client, "/take", e)
@@ -3719,18 +4232,19 @@ def _build_admins_embed(guild, admin_members: list, mod_lines: list,
 @bot.tree.command(name="admins", description="Администраторы и модераторы клана")
 async def admins(i):
     """Кто администрирует клан: права Discord, модераторы бота, ревьюеры."""
-    await i.response.defer(ephemeral=False)
+    await i.response.defer(ephemeral=True)
     try:
         guild = i.guild
         if guild is None:
-            await safe_send(i.followup, "❌ Команда работает только на сервере.")
+            await safe_send(i.followup, "❌ Команда работает только на сервере.",
+                            ephemeral=True)
             return
 
         admin_members = await _collect_admins(guild)
         mod_lines = await _collect_bot_mods(guild)
         role_lines = await _collect_reviewer_roles(guild)
         embed = _build_admins_embed(guild, admin_members, mod_lines, role_lines)
-        await safe_send(i.followup, embed=embed)
+        await safe_send(i.followup, embed=embed, ephemeral=True)
     except Exception as e:
         await log_error(i.client, "/admins", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
@@ -3864,11 +4378,11 @@ async def _get_steam_of(m):
 
 async def _activity_guard(i, m, need_admin=True):
     if need_admin and not admin_only(i):
-        await i.response.send_message("❌", ephemeral=False)
+        await i.response.send_message("❌", ephemeral=True)
         return None
     sid = await _get_steam_of(m)
     if not sid:
-        await i.response.send_message("❌ Нет SteamID", ephemeral=False)
+        await i.response.send_message("❌ Нет SteamID", ephemeral=True)
         return None
     return sid
 
@@ -3879,9 +4393,9 @@ async def activity_set(i, member: discord.Member, server: str, hours: float):
     if not sid:
         return
     if hours < 0:
-        await i.response.send_message("❌", ephemeral=False)
+        await i.response.send_message("❌", ephemeral=True)
         return
-    await i.response.defer(ephemeral=False)
+    await i.response.defer(ephemeral=True)
     try:
         p = await players_repo.get_player(sid)
         a = p.get("activity", {})
@@ -3894,7 +4408,7 @@ async def activity_set(i, member: discord.Member, server: str, hours: float):
         total = sum(float(v) for v in a.values() if isinstance(v, (int, float)))
         await safe_send(i.followup,
             f"✅ {member.display_name} `{server.upper()}`: {hours} ч.\n"
-            f"{build_activity_bar(total, ACTIVITY_GOAL_HOURS)}", ephemeral=False
+            f"{build_activity_bar(total, ACTIVITY_GOAL_HOURS)}", ephemeral=True
         )
     except Exception as e:
         await log_error(i.client, "/activity_set", e)
@@ -3906,13 +4420,13 @@ async def activity_clear(i, member: discord.Member):
     sid = await _activity_guard(i, member)
     if not sid:
         return
-    await i.response.defer(ephemeral=False)
+    await i.response.defer(ephemeral=True)
     try:
         p = await players_repo.get_player(sid)
         p["activity"] = {}
         p["updated_at"] = now_utc().isoformat()
         await players_repo.save_player(sid, p)
-        await safe_send(i.followup, "✅ Сброшено", ephemeral=False)
+        await safe_send(i.followup, "✅ Сброшено", ephemeral=True)
     except Exception as e:
         await log_error(i.client, "/activity_clear", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
@@ -3923,11 +4437,11 @@ async def activity_show(i, member: discord.Member):
     sid = await _activity_guard(i, member, need_admin=False)
     if not sid:
         return
-    await i.response.defer(ephemeral=False)
+    await i.response.defer(ephemeral=True)
     try:
         a = (await players_repo.get_player(sid)).get("activity", {})
         if not a:
-            await safe_send(i.followup, "ℹ️ Пусто", ephemeral=False)
+            await safe_send(i.followup, "ℹ️ Пусто", ephemeral=True)
             return
         lines, t = [], 0.0
         for s, h in sorted(a.items()):
@@ -3939,7 +4453,7 @@ async def activity_show(i, member: discord.Member):
             lines.append(f"• `{s}`: {hh} ч.")
         await safe_send(i.followup,
             f"📊 **{member.display_name}**\n" + "\n".join(lines)
-            + f"\n\n{build_activity_bar(t, ACTIVITY_GOAL_HOURS)}", ephemeral=False
+            + f"\n\n{build_activity_bar(t, ACTIVITY_GOAL_HOURS)}", ephemeral=True
         )
     except Exception as e:
         await log_error(i.client, "/activity_show", e)
@@ -3948,15 +4462,15 @@ async def activity_show(i, member: discord.Member):
 
 @bot.tree.command(name="activity_all", description="Активность роли")
 async def activity_all(i):
-    await i.response.defer(ephemeral=False)
+    await i.response.defer(ephemeral=True)
     try:
         role = i.guild.get_role(ACTIVITY_ROLE_ID) if ACTIVITY_ROLE_ID else None
         if role is None:
-            await safe_send(i.followup, "❌ Роль не найдена", ephemeral=False)
+            await safe_send(i.followup, "❌ Роль не найдена", ephemeral=True)
             return
         ms = [m for m in role.members if not m.bot]
         if not ms:
-            await safe_send(i.followup, "ℹ️ Пусто", ephemeral=False)
+            await safe_send(i.followup, "ℹ️ Пусто", ephemeral=True)
             return
         db, links = await players_repo.get_all_players(), await links_repo.get_all_links()
         data = []
@@ -3979,24 +4493,24 @@ async def activity_all(i):
         head = f"📊 **Роль {role.mention}**\n\n"
         foot = f"\n\n📈 Всего: {len(data)}\n✅ Выполнили: {done}\n⚠️ Малоактивных: {len(data) - done}"
         if len(head + body + foot) <= 2000:
-            await safe_send(i.followup, head + body + foot, ephemeral=False)
+            await safe_send(i.followup, head + body + foot, ephemeral=True)
         else:
             cut = body[:2000 - len(head) - len(foot) - 100]
             cut = cut[:cut.rfind("\n")]
-            await safe_send(i.followup, head + cut + "\n_...обрезано_" + foot, ephemeral=False)
+            await safe_send(i.followup, head + cut + "\n_...обрезано_" + foot, ephemeral=True)
     except Exception as e:
         await log_error(i.client, "/activity_all", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
 
 
 # ============================================================
-# !setup и /setup_clan - официальные условия вступления
+# !setup_clan (алиас !setup) - официальные условия вступления
 # ============================================================
 def _build_clan_conditions_embed() -> discord.Embed:
     """Embed с официальными условиями вступления в клан.
 
-    Один и тот же текст для текстовой команды !setup и слэш-команды
-    /setup_clan, чтобы условия в канале и в команде не расходились.
+    Используется текстовой командой !setup_clan, чтобы текст условий
+    всегда был единым и не расходился с требованиями клана.
     """
     embed = discord.Embed(
         title="Официальные условия вступления в клан.",
@@ -4039,42 +4553,32 @@ def _build_clan_conditions_embed() -> discord.Embed:
     return embed
 
 
-@bot.command()
+@bot.command(name="setup_clan", aliases=["setup"])
 @commands.has_permissions(administrator=True)
-async def setup(ctx):
+async def setup_clan(ctx):
+    """Публикует в канале официальные условия вступления и список выбора клана.
+
+    Текстовая команда (не слэш): сообщение с условиями остаётся в канале,
+    под ним — выпадающий список кланов, который открывает модальное окно
+    заявки. Доступна только администраторам сервера.
+    """
     try:
         await ctx.message.delete()
     except Exception:
         pass
-    e = _build_clan_conditions_embed()
-    v = ClanView()
-    await safe_send(ctx.channel, embed=e, view=v)
-
-
-@bot.tree.command(name="setup_clan",
-                  description="Опубликовать официальные условия вступления в клан")
-@app_commands.default_permissions(administrator=True)
-async def setup_clan(i):
-    """Публикует условия вступления в клан и список выбора клана.
-
-    Сообщение остаётся в канале, а под ним — выпадающий список:
-    при выборе клана открывается модальное окно для заявки.
-    """
-    await i.response.defer(ephemeral=False)
+    if ctx.guild is None:
+        await safe_send(ctx.channel, "❌ Команда работает только на сервере.")
+        return
+    if not admin_only_ctx(ctx):
+        await safe_send(ctx.channel, "❌ Нет прав.")
+        return
     try:
-        if i.guild is None:
-            await safe_send(i.followup, "❌ Команда работает только на сервере.",
-                            ephemeral=True)
-            return
-        if not admin_only(i):
-            await safe_send(i.followup, "❌ Нет прав.", ephemeral=True)
-            return
         embed = _build_clan_conditions_embed()
         view = ClanView()
-        await safe_send(i.followup, embed=embed, view=view)
+        await safe_send(ctx.channel, embed=embed, view=view)
     except Exception as e:
-        await log_error(i.client, "/setup_clan", e)
-        await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
+        await log_error(ctx.bot, "!setup_clan", e)
+        await safe_send(ctx.channel, f"❌ Ошибка: {str(e)[:200]}")
 
 
 # ============================================================
@@ -4248,6 +4752,23 @@ async def build_auto_sync_embeds(guild: discord.Guild) -> list:
 
     embeds.append(e2)
     return embeds
+
+
+async def _publish_links_table(guild: discord.Guild):
+    """Публикует таблицу привязанных + список не привязанных в лог-канал.
+
+    Прежний вид логов: сначала таблица «Discord | SteamID | Клан»,
+    затем embed «🚫 Не авторизованы через /link». Discord принимает
+    максимум 10 embed'ов в одном сообщении — лишние страницы режем.
+    """
+    ch = bot.get_channel(LOG_CHANNEL_ID) if LOG_CHANNEL_ID else None
+    if ch is None:
+        return
+    try:
+        embeds = await build_auto_sync_embeds(guild)
+        await safe_send(ch, embeds=embeds[:10])
+    except Exception as e:
+        await log_error(bot, "_publish_links_table", e)
 
 
 @tasks.loop(minutes=SYNC_INTERVAL_MINUTES)
@@ -4437,6 +4958,9 @@ async def hourly_clan_sync():
             f"проблем {len([1 for _, r in results if r.startswith(('⚠️', '❌'))])}")
         await _report_clan_sync(results, checked, updated,
                                 "Часовая синхронизация кланов", note="\n".join(notes))
+        # Раз в час возвращаем прежний вид лога: таблица привязанных
+        # (Discord | SteamID | Клан), затем список не привязанных через /link.
+        await _publish_links_table(guild)
     except Exception as e:
         await log_error(bot, "hourly_clan_sync", e)
 
@@ -4479,6 +5003,172 @@ async def agent_watch():
 async def before_agent_watch():
     await bot.wait_until_ready()
     await asyncio.sleep(random.randint(60, 180))
+
+
+# ============================================================
+# HEALTH-CHECK: автопинг в лог-канал при сбое систем
+# ============================================================
+HEALTH_CHECK_MINUTES = env_int("HEALTH_CHECK_MINUTES", 15)
+# Сколько подряд неудачных проверок терпим перед сообщением в лог-канал.
+HEALTH_FAILS_BEFORE_ALERT = env_int("HEALTH_FAILS_BEFORE_ALERT", 2)
+
+# Состояние прошлой проверки: чтобы не спамить в канал одной и той же
+# проблемой, пишем только при переходе «было ок → стало плохо».
+_health_state = {"cs2red_ok": True, "ai_ok": True, "ws_ok": True,
+                 "cs2red_fails": 0, "ai_fails": 0, "ws_fails": 0}
+
+
+async def _health_probe_cs2red() -> bool:
+    """Дешёвая проверка cs2red: один запрос к публичному списку серверов."""
+    try:
+        data = await api._get_json("https://cs2red.ru/api/data/servers")
+        return data is not None
+    except Exception:
+        return False
+
+
+def _health_probe_ai() -> bool:
+    """ИИ считается живым, если задан хотя бы один провайдер."""
+    try:
+        return bool(ai_service and ai_service.providers)
+    except Exception:
+        return False
+
+
+async def _health_alert(problems: list):
+    """Пишет в лог-канал, что система деградировала."""
+    if not problems:
+        return
+    ch = bot.get_channel(LOG_CHANNEL_ID) if LOG_CHANNEL_ID else None
+    if ch is None:
+        return
+    text = "⚠️ **Health-check: проблемы с системами**\n" + "\n".join(
+        f"• {p}" for p in problems)
+    try:
+        await safe_send(ch, text, title="🩺 Health-check")
+    except Exception as e:
+        log(f"⚠️ health alert: {e}")
+
+
+@tasks.loop(minutes=HEALTH_CHECK_MINUTES)
+async def health_watch():
+    """Следит за cs2red, ИИ и WebSocket. При сбое пишет в лог-канал.
+
+    Сообщение отправляется только при переходе «работало → сломалось»,
+    чтобы канал не забивался одним и тем же текстом каждые 15 минут.
+    """
+    try:
+        problems = []
+
+        cs2red_ok = await _health_probe_cs2red()
+        if cs2red_ok:
+            _health_state["cs2red_fails"] = 0
+            if not _health_state["cs2red_ok"]:
+                problems.append("cs2red снова доступен ✅")
+        else:
+            _health_state["cs2red_fails"] += 1
+            if (_health_state["cs2red_ok"]
+                    and _health_state["cs2red_fails"] >= HEALTH_FAILS_BEFORE_ALERT):
+                problems.append("cs2red не отвечает на запросы")
+        _health_state["cs2red_ok"] = cs2red_ok
+
+        ai_ok = _health_probe_ai()
+        if ai_ok:
+            _health_state["ai_fails"] = 0
+            if not _health_state["ai_ok"]:
+                problems.append("ИИ-провайдеры снова доступны ✅")
+        else:
+            _health_state["ai_fails"] += 1
+            if (_health_state["ai_ok"]
+                    and _health_state["ai_fails"] >= HEALTH_FAILS_BEFORE_ALERT):
+                problems.append("нет доступных ИИ-провайдеров")
+        _health_state["ai_ok"] = ai_ok
+
+        ws_ok = bot.latency * 1000 < 1000 and not bot.is_closed()
+        if ws_ok:
+            _health_state["ws_fails"] = 0
+        else:
+            _health_state["ws_fails"] += 1
+            if (_health_state["ws_ok"]
+                    and _health_state["ws_fails"] >= HEALTH_FAILS_BEFORE_ALERT):
+                problems.append(f"высокая задержка Discord ({bot.latency * 1000:.0f} мс)")
+        _health_state["ws_ok"] = ws_ok
+
+        if problems:
+            await _health_alert(problems)
+    except Exception as e:
+        await log_error(bot, "health_watch", e)
+
+
+@health_watch.before_loop
+async def before_health_watch():
+    await bot.wait_until_ready()
+    await asyncio.sleep(random.randint(30, 120))
+
+
+# ============================================================
+# ЕЖЕДНЕВНАЯ СВОДКА
+# ============================================================
+DAILY_SUMMARY_HOUR = env_int("DAILY_SUMMARY_HOUR", 9)  # UTC
+
+
+async def _build_daily_summary_embed() -> discord.Embed:
+    """Один embed за сутки: заявки, роли, активности, ошибки."""
+    embed = discord.Embed(
+        title="📅 Ежедневная сводка",
+        color=0x000000, timestamp=now_utc())
+
+    # Заявки за сутки.
+    try:
+        apps = await applications_repo.list_pending_applications()
+        embed.add_field(name="📨 Заявок в работе", value=str(len(apps)), inline=True)
+    except Exception as e:
+        log(f"⚠️ daily: заявки: {e}")
+        embed.add_field(name="📨 Заявок в работе", value="?", inline=True)
+
+    # Роли клана: сколько участников и сколько без привязки.
+    guild = bot.get_guild(GUILD_ID) if GUILD_ID else None
+    if guild is not None:
+        try:
+            members = _talent_members(guild)
+            linked = await links_repo.get_all_links()
+            linked_ids = {int(k) for k in linked if str(k).isdigit()}
+            no_link = sum(1 for m in members if m.id not in linked_ids)
+            embed.add_field(name=f"🎭 Роль «{CLAN_NAME}»",
+                            value=str(len(members)), inline=True)
+            embed.add_field(name="🔗 Без /link", value=str(no_link), inline=True)
+        except Exception as e:
+            log(f"⚠️ daily: роли: {e}")
+
+    # Состояние систем.
+    cs2red = getattr(api, "last_status", None) or "нет данных"
+    embed.add_field(name="🍪 cs2red", value=str(cs2red), inline=True)
+    embed.add_field(name="🤖 ИИ", value=_ai_status()[:200], inline=False)
+    embed.add_field(name="⏱ Аптайм", value=_uptime_str(), inline=True)
+    embed.set_footer(text=f"Quantum • {utc_stamp()}")
+    return embed
+
+
+@tasks.loop(minutes=30)
+async def daily_summary():
+    """Раз в сутки (в DAILY_SUMMARY_HOUR UTC) публикует сводку в лог-канал."""
+    try:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if now.hour != DAILY_SUMMARY_HOUR or now.minute >= 30:
+            return
+        ch = bot.get_channel(LOG_CHANNEL_ID) if LOG_CHANNEL_ID else None
+        if ch is None:
+            return
+        embed = await _build_daily_summary_embed()
+        await safe_send(ch, embed=embed)
+    except Exception as e:
+        await log_error(bot, "daily_summary", e)
+
+
+@daily_summary.before_loop
+async def before_daily_summary():
+    await bot.wait_until_ready()
+    await asyncio.sleep(random.randint(30, 120))
 
 
 # ============================================================
@@ -4667,11 +5357,11 @@ async def ai_clear_cache(i):
     if not i.user.guild_permissions.administrator:
         await i.response.send_message("❌ Нужны права администратора.", ephemeral=True)
         return
-    await i.response.defer(ephemeral=False)
+    await i.response.defer(ephemeral=True)
     try:
         removed = await clear_cache()
         await safe_send(i.followup, "✅ Кэш ИИ успешно очищен.", title="🤖 Кэш ИИ",
-                        ephemeral=False)
+                        ephemeral=True)
         if removed:
             await log_to_channel(i.client,
                 f"🗑 Кэш ИИ очищен командой {i.user.mention} (удалено: {removed})")

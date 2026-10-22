@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Тесты /setup_clan: публикация официальных условий вступления в клан.
+"""Тесты !setup_clan: публикация официальных условий вступления в клан.
 
-Сообщение должно остаться в канале, а под ним — выпадающий список
-кланов, который открывает модальное окно заявки.
+Команда текстовая (не слэш). Сообщение должно остаться в канале, а под
+ним — выпадающий список кланов, который открывает модальное окно заявки.
 """
 import asyncio
 import sys
@@ -14,53 +14,65 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import script as botmod  # noqa: E402
 
 
-class _FakeFollowup:
+class _FakeMessage:
+    def __init__(self):
+        self.deleted = False
+
+    async def delete(self):
+        self.deleted = True
+
+
+class _FakeChannel:
     def __init__(self):
         self.sent = []
 
-    async def send(self, *args, **kwargs):
-        self.sent.append(kwargs)
-        return SimpleNamespace(id=1, **kwargs)
 
-
-class _FakeResponse:
-    def __init__(self):
-        self.deferred = []
-        self.done = False
-
-    async def defer(self, **kwargs):
-        self.deferred.append(kwargs)
-        self.done = True
-
-
-class _FakeUser:
+class _FakeAuthor:
     def __init__(self, administrator=True):
         self.id = 123
         self.guild_permissions = SimpleNamespace(administrator=administrator)
 
 
-class _FakeInteraction:
+class _FakeCtx:
     def __init__(self, administrator=True, in_guild=True):
-        self.user = _FakeUser(administrator)
+        self.author = _FakeAuthor(administrator)
         self.guild = SimpleNamespace(id=1, name="Клан") if in_guild else None
-        self.client = None
-        self.response = _FakeResponse()
-        self.followup = _FakeFollowup()
+        self.bot = None
+        self.channel = _FakeChannel()
+        self.message = _FakeMessage()
 
 
-def test_setup_clan_registered():
-    """Слэш-команда /setup_clan зарегистрирована."""
-    cmd = botmod.bot.tree.get_command("setup_clan")
-    assert cmd is not None, "/setup_clan не зарегистрирован"
-    print("  ok: команда /setup_clan зарегистрирована")
+def _patch_send(monkeypatch, ctx):
+    """Пишем отправленные сообщения в ctx.channel.sent вместо Discord."""
+    async def fake_safe_send(target, *args, **kwargs):
+        ctx.channel.sent.append(kwargs)
+
+    monkeypatch.setattr(botmod, "safe_send", fake_safe_send)
+
+
+def test_setup_clan_is_text_command():
+    """Команда — текстовая !setup_clan, а не слэш."""
+    names = {c.name for c in botmod.bot.commands}
+    assert "setup_clan" in names, "!setup_clan не зарегистрирована"
+    assert botmod.bot.tree.get_command("setup_clan") is None, \
+        "слэш-команда /setup_clan должна быть удалена"
+    print("  ok: !setup_clan зарегистрирована как текстовая команда")
+
+
+def test_setup_clan_alias_setup():
+    """Старое !setup остаётся алиасом."""
+    cmds = [c for c in botmod.bot.commands if c.name == "setup_clan"]
+    assert cmds and "setup" in cmds[0].aliases, cmds[0].aliases if cmds else None
+    print("  ok: !setup — алиас !setup_clan")
 
 
 def test_setup_clan_is_admin_only():
-    """Команда доступна только администраторам."""
-    cmd = botmod.bot.tree.get_command("setup_clan")
-    perms = getattr(cmd, "default_permissions", None)
-    assert perms is not None, "не заданы права по умолчанию"
-    assert perms.administrator is True, perms
+    """Команда доступна только администраторам (проверка на уровне декоратора)."""
+    cmds = [c for c in botmod.bot.commands if c.name == "setup_clan"]
+    assert cmds, "!setup_clan не зарегистрирована"
+    # checks содержит has_permissions(administrator=True)
+    assert any("has_permissions" in repr(c) or "administrator" in repr(c)
+               for c in cmds[0].checks), cmds[0].checks
     print("  ok: команда доступна только администраторам")
 
 
@@ -106,14 +118,15 @@ def test_clan_view_has_select():
     print("  ok: под embed — список выбора клана")
 
 
-def test_setup_clan_posts_message_with_view():
+def test_setup_clan_posts_message_with_view(monkeypatch):
     """Команда отправляет в канал embed + выпадающий список."""
     async def scenario():
-        i = _FakeInteraction()
-        await botmod.setup_clan.callback(i)
-        assert i.response.deferred, "команда должна сначала defer"
-        assert i.followup.sent, "сообщение не отправлено"
-        kwargs = i.followup.sent[0]
+        ctx = _FakeCtx()
+        _patch_send(monkeypatch, ctx)
+        await botmod.setup_clan.callback(ctx)
+        assert ctx.message.deleted, "команда должна удалять своё сообщение"
+        assert ctx.channel.sent, "сообщение не отправлено"
+        kwargs = ctx.channel.sent[0]
         assert kwargs.get("embed") is not None, kwargs
         view = kwargs.get("view")
         assert view is not None, "к сообщению не приложен view"
@@ -123,26 +136,27 @@ def test_setup_clan_posts_message_with_view():
     asyncio.run(scenario())
 
 
-def test_setup_clan_denied_for_non_admin():
+def test_setup_clan_denied_for_non_admin(monkeypatch):
     """Без прав администратора условия не публикуются."""
     async def scenario():
-        i = _FakeInteraction(administrator=False)
-        await botmod.setup_clan.callback(i)
-        # Ответ есть (отказ), но без embed'а с условиями и без списка.
-        for kwargs in i.followup.sent:
+        ctx = _FakeCtx(administrator=False)
+        _patch_send(monkeypatch, ctx)
+        await botmod.setup_clan.callback(ctx)
+        for kwargs in ctx.channel.sent:
             assert kwargs.get("view") is None, kwargs
-            assert kwargs.get("ephemeral") is True, kwargs
+            assert kwargs.get("embed") is None, kwargs
         print("  ok: без прав администратора условия не публикуются")
 
     asyncio.run(scenario())
 
 
-def test_setup_clan_only_in_guild():
+def test_setup_clan_only_in_guild(monkeypatch):
     """В личных сообщениях команда не работает."""
     async def scenario():
-        i = _FakeInteraction(in_guild=False)
-        await botmod.setup_clan.callback(i)
-        for kwargs in i.followup.sent:
+        ctx = _FakeCtx(in_guild=False)
+        _patch_send(monkeypatch, ctx)
+        await botmod.setup_clan.callback(ctx)
+        for kwargs in ctx.channel.sent:
             assert kwargs.get("view") is None, kwargs
         print("  ok: вне сервера команда ничего не публикует")
 

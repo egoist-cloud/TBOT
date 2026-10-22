@@ -22,9 +22,32 @@ def test_app_id_is_embedded_into_button_custom_ids():
     ids = _custom_ids(view)
     assert f"accept_btn:{app_id}" in ids
     assert f"deny_btn:{app_id}" in ids
-    assert f"voted_list_btn:{app_id}" in ids
     assert f"take_btn:{app_id}" in ids
     print("  ok: app_id зашит в custom_id кнопок")
+
+
+def test_bans_view_has_only_ban_buttons():
+    """В лог-канале у заявки только кнопки запретов, без голосования."""
+    app_id = botmod._new_app_id()
+    view = botmod.ApplicationBansView(app_id)
+    ids = _custom_ids(view)
+    assert f"tempban_btn:{app_id}" in ids
+    assert f"permban_btn:{app_id}" in ids
+    assert f"unban_btn:{app_id}" in ids
+    # Принять/Отклонить/Взять в лог-канале быть не должно.
+    assert not any(i.startswith(("accept_btn", "deny_btn", "take_btn")) for i in ids)
+    print("  ok: в лог-канале только кнопки запретов")
+
+
+def test_application_buttons_have_no_counters():
+    """Кнопки «Принять»/«Отклонить» без счётчиков 0/2, цвет: синий/красный."""
+    view = botmod.ApplicationManagement()
+    by_id = {c.custom_id: c for c in view.children}
+    assert by_id["accept_btn"].label == "Принять"
+    assert by_id["accept_btn"].style == botmod.discord.ButtonStyle.primary
+    assert by_id["deny_btn"].label == "Отклонить"
+    assert by_id["deny_btn"].style == botmod.discord.ButtonStyle.danger
+    print("  ok: кнопки решения без счётчиков, синяя/красная")
 
 
 def test_legacy_view_keeps_static_custom_ids():
@@ -76,7 +99,7 @@ def test_channel_and_thread_share_one_vote_record():
 
 
 def test_update_labels_uses_app_id():
-    """Счётчики на кнопках берутся из записи по app_id."""
+    """Счётчики убраны: update_labels больше не меняет подписи кнопок."""
     async def scenario():
         await init_db()
         app_id = botmod._new_app_id()
@@ -86,10 +109,10 @@ def test_update_labels_uses_app_id():
         await view.update_labels()
 
         labels = {c.custom_id.split(":", 1)[0]: c.label for c in view.children}
-        assert labels["accept_btn"].startswith("Принять 1/")
-        assert labels["deny_btn"].startswith("Отклонить 0/")
-        assert labels["voted_list_btn"].startswith("👥 1")
+        # Подписи статичны: никаких «1/1» на кнопках.
+        assert labels["accept_btn"] == "Принять"
+        assert labels["deny_btn"] == "Отклонить"
         await close_db()
 
     asyncio.run(scenario())
-    print("  ok: счётчики на кнопках считаются по app_id")
+    print("  ok: подписи кнопок решения статичны")

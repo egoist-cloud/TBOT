@@ -130,7 +130,30 @@ def test_build_block_embeds_max_limit():
 
 def test_check_commands_registered():
     names = {c.name for c in botmod.bot.tree.get_commands()}
-    assert {"check", "check_mutes", "check_bans"} <= names
+    assert {"check", "check_mutes", "check_bans",
+            "check_all", "check_clan"} <= names
+
+
+def test_filter_blocks_since_keeps_recent():
+    now = int(time.time())
+    old = {"start_ts": now - 20 * 86400, "active": False}
+    fresh = {"start_ts": now - 86400, "active": True}
+    undated_active = {"start_ts": 0, "active": True}
+    undated_inactive = {"start_ts": 0, "active": False}
+    since = now - 14 * 86400
+    kept = botmod._filter_blocks_since(
+        [old, fresh, undated_active, undated_inactive], since)
+    assert fresh in kept
+    assert undated_active in kept   # без даты, но активен — показываем
+    assert old not in kept
+    assert undated_inactive not in kept
+
+
+def test_check_all_days_default():
+    # Отчёт по мутам должен охватывать 2 недели.
+    assert botmod.CHECK_ALL_DAYS == 14
+    assert botmod.TALENT_ROLE_ID == 1448368118190837800
+
 
 
 def test_cs2red_blocks_from_admin_profile(monkeypatch):

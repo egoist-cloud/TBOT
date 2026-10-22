@@ -90,15 +90,28 @@ class GeminiProvider(AIProvider):
 
     name = "gemini"
     env_key = "GEMINI_API_KEY"
-    model_env = "AI_MODEL"
-    default_model = "gemini-1.5-flash"
+    # Отдельная переменная для модели Gemini: ``AI_MODEL`` общий с LLM7 и
+    # ломает его, если задать там имя Gemini-модели. ``AI_MODEL`` остаётся
+    # запасным вариантом для обратной совместимости.
+    model_env = "GEMINI_MODEL"
+    default_model = "gemini-2.5-flash"
     api_url_env = "GEMINI_API_URL"
     default_api_url = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     max_output_env = "AI_MAX_OUTPUT_TOKENS"
 
     @property
     def _model(self) -> str:
-        return os.getenv(self.model_env) or self.default_model
+        # Приоритет: GEMINI_MODEL → AI_MODEL → модель по умолчанию.
+        # ``AI_MODEL`` берём только если в нём явно Gemini-модель: в старых
+        # .env переменная была общей с LLM7 и там мог лежать селектор
+        # вроде ``default``, из-за которого Gemini получал 404.
+        explicit = (os.getenv("GEMINI_MODEL") or "").strip()
+        if explicit:
+            return explicit
+        legacy = (os.getenv("AI_MODEL") or "").strip()
+        if legacy and ("gemini" in legacy.lower()):
+            return legacy
+        return self.default_model
 
     @property
     def _max_output(self) -> int:
@@ -115,7 +128,6 @@ class GeminiProvider(AIProvider):
     async def complete(self, messages: list) -> str | None:
         if not self.enabled:
             return None
-        print(f"DEBUG: Gemini key = {self._api_key()[:5]}... (len={len(self._api_key())})")
         # Нативный формат Gemini: contents = список частей диалога.
         # Системную инструкцию выносим в system_instruction, остальное — parts.
         contents: list[dict] = []
@@ -314,8 +326,15 @@ class LLM7Provider(_OpenAICompatProvider):
     env_key = "LLM7_API_KEY"
     base_url_env = "LLM7_BASE_URL"
     default_base_url = "https://api.llm7.io/v1"
-    model_env = "AI_MODEL"
+    # У LLM7 свои селекторы моделей (default/fast/pro). Общий ``AI_MODEL``
+    # здесь намеренно НЕ используется: если в старом .env там лежит имя
+    # Gemini-модели, запросы к LLM7 падали бы с 400.
+    model_env = "LLM7_MODEL"
     default_model = "default"
+
+    @property
+    def _model(self) -> str:
+        return os.getenv("LLM7_MODEL") or self.default_model
 
 
 def make_providers(
