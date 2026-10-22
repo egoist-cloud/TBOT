@@ -657,8 +657,8 @@ class API:
                     return sid
         return None
 
-    async def cs2red_full_user(self, steam_id: str):
-        user = await self.cs2red_user(steam_id)
+    async def cs2red_full_user(self, steam_id: str, user: dict | None = None):
+        user = user if user is not None else await self.cs2red_user(steam_id)
         if not user or user.get("_not_found") or not user.get("id"):
             return None
         data = await self._get_json(
@@ -693,6 +693,174 @@ class API:
                     return {"clan_id": clan.get("id"), "clan_name": clan.get("name"),
                             "clan_tag": clan.get("tag"), "member_role": m.get("roleId")}
         return None
+
+    async def player_clan_checked(self, steam_id: str, user: dict | None = None,
+                                  clans: list | None = None) -> tuple:
+        """Как player_clan, но отличает «не в клане» от «не удалось узнать».
+
+        Возвращает ``(clan | None, error)``: ``error == ""`` — данные получены
+        (clan None значит «игрок не в клане»), иначе текст причины.
+        """
+        if user is None:
+            user = await self.cs2red_user(steam_id)
+            if user is None:
+                return None, "cs2red не ответил"
+        if user.get("_not_found") or not user.get("id"):
+            return None, ""
+        if clans is None:
+            clans = await self.cs2red_clans()
+            if clans is None:
+                return None, "/api/clans не ответил"
+        uid = int(user["id"])
+        for clan in clans:
+            for m in (clan.get("members") or []):
+                if int(m.get("userId", 0) or 0) == uid:
+                    return {"clan_id": clan.get("id"), "clan_name": clan.get("name"),
+                            "clan_tag": clan.get("tag"), "member_role": m.get("roleId")}, ""
+        return None, ""
+
+
+    # ---------- блокировки (баны/муты) ----------
+    @staticmethod
+    def _as_int(value, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
+    def normalize_block(cls, raw: dict, kind: str = "Бан",
+                        from_admin: bool = False) -> dict:
+        """Приводит запись бана/мута cs2red к единому виду.
+
+        Публичный API отдаёт заблокированного игрока в ``action``, а того,
+        кто выдал блокировку, — в ``user`` (у автоматических банов ``user``
+        пустой). Админ-API возвращает те же поля, поэтому структура общая.
+        """
+        raw = raw if isinstance(raw, dict) else {}
+        player = raw.get("action") if isinstance(raw.get("action"), dict) else {}
+        if not player and isinstance(raw.get("player"), dict):
+            player = raw["player"]
+        admin = raw.get("user") if isinstance(raw.get("user"), dict) else {}
+        if not admin and isinstance(raw.get("admin"), dict):
+            admin = raw["admin"]
+
+        start_ts = cls._as_int(raw.get("timestamp") or raw.get("time") or raw.get("date"))
+        end_ts = cls._as_int(raw.get("endTimeStamp") or raw.get("endTime")
+                             or raw.get("until") or raw.get("end"))
+        if 0 < end_ts < 1_000_000_000:
+            end_ts = 0  # мусорное значение — считаем «навсегда»
+
+        active = bool(raw.get("active", True))
+        if raw.get("unbanId") or raw.get("unmuteId"):
+            active = False
+        if active and end_ts and end_ts <= time.time():
+            active = False
+
+        reason = str(raw.get("reason") or raw.get("comment") or "—").strip() or "—"
+        admin_id = cls._as_int(raw.get("adminId") or admin.get("id"))
+        admin_nick = str(admin.get("nick") or raw.get("adminNick") or "").strip()
+        if not admin_nick:
+            if admin_id <= 0:
+                admin_nick = "Античит" if "RAC" in reason.upper() else "Система"
+            else:
+                admin_nick = f"ID {admin_id}"
+
+        steam = str(player.get("steamid64") or raw.get("steamid64")
+                    or raw.get("steam_id") or "").strip()
+        return {
+            "id": raw.get("id") or raw.get("actionId"),
+            "kind": "Мут" if kind.upper().startswith("МУТ") else "Бан",
+            "active": active,
+            "player_nick": str(player.get("nick") or raw.get("nick") or "—").strip() or "—",
+            "steam_id": steam if steam.isdigit() else "",
+            "player_id": cls._as_int(player.get("id")),
+            "reason": reason,
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "admin": admin_nick,
+            "from_admin": from_admin,
+        }
+
+    async def _public_blocks(self, steam_id: str, category: str,
+                             uid: int = 0) -> tuple[list, str]:
+        """Запасной путь: публичный список cs2red с локальной фильтрацией."""
+        is_mute = (category or "").upper().startswith("MUTE")
+        kind = "Мут" if is_mute else "Бан"
+        key = "mutes" if is_mute else "bans"
+        data = await self._get_json(
+            f"https://cs2red.ru/api/data/{key}",
+            params={"begin": 0, "count": 20, "search": steam_id},
+        )
+        if data is None:
+            return [], "unavailable"
+        blocks = []
+        for raw in (data.get("bans") or []):
+            item = self.normalize_block(raw, kind)
+            # Чужого игрока в список не пускаем (поиск может игнорироваться).
+            if item["steam_id"] and item["steam_id"] != steam_id:
+                continue
+            if not item["steam_id"] and (not uid or item["player_id"] != uid):
+                continue
+            blocks.append(item)
+        return blocks, ""
+
+    async def cs2red_all_blocks(self, steam_id: str) -> tuple[list, list, str]:
+        """Баны и муты игрока одним заходом.
+
+        Админ-профиль cs2red отдаёт оба массива сразу, поэтому хватает
+        двух запросов (поиск пользователя + его профиль).
+
+        Возвращает ``(bans, mutes, error)``; ``error`` — "" или
+        "unavailable" / "not_found".
+        """
+        user = await self.cs2red_user(steam_id)
+        if user is None:
+            return [], [], "unavailable"
+        if user.get("_not_found"):
+            return [], [], "not_found"
+        uid = self._as_int(user.get("id"))
+
+        bans: list = []
+        mutes: list = []
+        admin_ok = False
+
+        full = await self.cs2red_full_user(steam_id, user=user)
+        if isinstance(full, dict):
+            for key, kind, target in (("bans", "Бан", bans), ("mutes", "Мут", mutes)):
+                source = full.get(key)
+                if isinstance(source, list):
+                    target.extend(
+                        self.normalize_block(x, kind, from_admin=True) for x in source)
+                    admin_ok = True
+
+        # В админ-профиле может не быть массивов блокировок — тогда идём
+        # в публичный список (поиск работает при cookie сессии).
+        if not admin_ok:
+            bans, err1 = await self._public_blocks(steam_id, "BANS", uid)
+            if err1:
+                return [], [], err1
+            mutes, err2 = await self._public_blocks(steam_id, "MUTES", uid)
+            if err2:
+                return [], [], err2
+
+        for blocks in (bans, mutes):
+            blocks.sort(key=lambda b: b.get("start_ts") or 0, reverse=True)
+        return bans, mutes, ""
+
+    async def cs2red_blocks(self, steam_id: str, category: str) -> tuple[list, str]:
+        """Баны или муты игрока.
+
+        ``category`` — "BANS" или "MUTES".
+        Возвращает ``(blocks, error)``: ``error == ""`` — всё хорошо,
+        ``"unavailable"`` — cs2red недоступен (403/429/сеть), ``"not_found"`` —
+        такого игрока нет на cs2red.
+        """
+        is_mute = (category or "BANS").upper().startswith("MUTE")
+        bans, mutes, err = await self.cs2red_all_blocks(steam_id)
+        if err:
+            return [], err
+        return (mutes if is_mute else bans), ""
 
     async def server_times(self) -> dict:
         data = await self._get_json("https://cs2red.ru/api/data/servers")
@@ -1026,6 +1194,60 @@ async def sync_role_by_id(guild, member, steam_id):
 
 CLAN_ROLE_COLOR = 0x8E7CF3  # приятный фиолетовый — Discord не умеет градиенты через бота
 
+# Имена ролей, которые бот когда-либо создавал/выдавал. Нужны, чтобы снять
+# роль клана, которого уже нет в /api/clans (клан распался, игрок вышел).
+CLAN_ROLES_FILE = "clan_roles.json"
+
+
+def _load_clan_role_names() -> set:
+    try:
+        p = data_path(CLAN_ROLES_FILE)
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return {str(x).strip() for x in data if str(x).strip()}
+    except Exception as e:
+        log(f"⚠️ не прочитал {CLAN_ROLES_FILE}: {e}")
+    return set()
+
+
+def _remember_clan_role_name(name: str):
+    name = (name or "").strip()
+    if not name:
+        return
+    names = _load_clan_role_names()
+    if name in names:
+        return
+    names.add(name)
+    try:
+        data_path(CLAN_ROLES_FILE).write_text(
+            json.dumps(sorted(names), ensure_ascii=False, indent=2),
+            encoding="utf-8")
+    except Exception as e:
+        log(f"⚠️ не записал {CLAN_ROLES_FILE}: {e}")
+
+
+def _known_clan_role_names(clans: list | None) -> set:
+    names = {str(c.get("name")).strip() for c in (clans or []) if c.get("name")}
+    names |= _load_clan_role_names()
+    return names
+
+
+async def _remove_roles_checked(member, roles, reason: str = "Синхронизация клана") -> list:
+    """Снимает роли и возвращает список ошибок (пустой — всё снято)."""
+    errors = []
+    for role in roles:
+        try:
+            await member.remove_roles(role, reason=reason)
+        except discord.Forbidden:
+            errors.append(f"нет прав снять «{role.name}»: роль бота должна быть выше неё")
+        except discord.HTTPException as e:
+            errors.append(f"не удалось снять «{role.name}»: {e}")
+        except Exception as e:
+            errors.append(f"не удалось снять «{role.name}»: {e}")
+    return errors
+
+
 
 async def _find_or_create_clan_role(guild, member, clan_name: str, reason: str = "автосинхронизация"):
     """Находит роль по имени клана или создаёт её.
@@ -1035,15 +1257,22 @@ async def _find_or_create_clan_role(guild, member, clan_name: str, reason: str =
     # 1) Повторно не создаём: роль по названию клана.
     target = discord.utils.get(guild.roles, name=clan_name)
     if target is not None:
+        _remember_clan_role_name(clan_name)
         return target, None
 
     # 2) Проверяем права бота на управление ролями.
     me = guild.me
     if me is None or not me.guild_permissions.manage_roles:
         return None, "❌ нет прав Manage Roles (бот не может создать роль клана)"
+    me_top = me.top_role.position if me.top_role else 0
+    if me_top < 2:
+        return None, ("❌ роль бота слишком низко — поднимите её выше ролей клана, "
+                      "иначе бот не сможет управлять ролью")
 
-    # 3) Позиция: на 1 выше top_role участника.
-    pos = (member.top_role.position + 1) if member.top_role else 1
+    # 3) Позиция: выше роли участника, но НИЖЕ роли бота — иначе бот
+    #    не сможет потом снять эту роль (Forbidden).
+    desired = (member.top_role.position + 1) if member.top_role else 1
+    pos = max(1, min(desired, me_top - 1))
 
     try:
         target = await guild.create_role(
@@ -1058,6 +1287,7 @@ async def _find_or_create_clan_role(guild, member, clan_name: str, reason: str =
             await target.edit(position=pos, reason=reason)
         except discord.Forbidden:
             pass
+        _remember_clan_role_name(clan_name)
         return target, f"создана роль клана '{clan_name}'"
     except discord.Forbidden:
         return None, "❌ нет прав Manage Roles (не удалось создать роль клана)"
@@ -1066,10 +1296,16 @@ async def _find_or_create_clan_role(guild, member, clan_name: str, reason: str =
 
 
 async def sync_clan_role_by_id(guild, member, steam_id):
-    # Проверяем права бота заранее (Manage Roles нужен для создания роли).
+    """Синхронизирует роль клана: выдаёт актуальную и снимает прежние.
+
+    Когда игрок выходит из клана, cs2red перестаёт показывать его в составе —
+    роль клана снимается. Ошибки снятия (например, роль бота ниже) больше
+    не проглатываются: они попадают в результат.
+    """
     me = guild.me
-    if me is not None and not me.guild_permissions.manage_roles:
-        log("⚠️ sync_clan: бот не имеет права Manage Roles — роль создать не удастся")
+    if me is None or not me.guild_permissions.manage_roles:
+        return ("⚠️ у бота нет права «Управлять ролями» — роли клана не изменены "
+                "(поднимите роль бота выше ролей клана)")
 
     user = await api.cs2red_user(steam_id)
     if user is None:
@@ -1086,24 +1322,26 @@ async def sync_clan_role_by_id(guild, member, steam_id):
     if total_members == 0:
         return f"⚠️ {member.display_name}: в /api/clans нет members, роли не тронуты"
 
-    clan = await api.player_clan(steam_id)
-    # Роли кланов, которыми управляем: известные по CLAN_ROLE_MAP + создаваемые по имени.
+    clan, clan_err = await api.player_clan_checked(steam_id, user=user, clans=clans)
+    if clan_err:
+        return f"⚠️ {member.display_name}: {clan_err}, роли не тронуты"
+
+    # Роли кланов, которыми управляем: CLAN_ROLE_MAP + все известные имена
+    # (включая роли кланов, которых уже нет в /api/clans).
     managed = set(CLAN_ROLE_MAP.values())
+    known_names = _known_clan_role_names(clans)
 
     if clan is None:
         # Игрок не в клане — снимаем все управляемые роли клана.
-        held = [r for r in member.roles if r.id in managed or r.name in {
-            c.get("name") for c in clans}]
+        held = [r for r in member.roles if r.id in managed or r.name in known_names]
         if held:
-            for r in held:
-                try:
-                    await member.remove_roles(r)
-                except discord.Forbidden:
-                    pass
+            errors = await _remove_roles_checked(member, held)
+            if errors:
+                return "⚠️ клан снят не полностью: " + "; ".join(errors)
             return "🔄 клан снят"
         return "ℹ️ без клана"
 
-    clan_name = clan.get("clan_name") or ""
+    clan_name = (clan.get("clan_name") or "").strip()
     if not clan_name:
         return "ℹ️ клан без имени"
 
@@ -1120,20 +1358,21 @@ async def sync_clan_role_by_id(guild, member, steam_id):
             if target is None:
                 return f"⚠️ {created_status}" or "⚠️ не удалось создать роль клана"
 
+    _remember_clan_role_name(clan_name)
+
     # Снимаем прочие управляемые роли клана.
-    held = [r for r in member.roles if (r.id in managed or r.name in {
-        c.get("name") for c in clans}) and r != target]
-    for r in held:
-        try:
-            await member.remove_roles(r)
-        except discord.Forbidden:
-            pass
+    held = [r for r in member.roles
+            if (r.id in managed or r.name in known_names) and r != target]
+    errors = await _remove_roles_checked(member, held) if held else []
+    suffix = (" (не сняты: " + "; ".join(errors) + ")") if errors else ""
 
     if target in member.roles:
-        return f"✅ уже в '{clan_name}'" + (f" ({created_status})" if created_status else "")
+        return (f"✅ уже в '{clan_name}'"
+                + (f" ({created_status})" if created_status else "") + suffix)
     try:
         await member.add_roles(target)
-        return f"✅ выдан клан '{clan_name}'" + (f" ({created_status})" if created_status else "")
+        return (f"✅ выдан клан '{clan_name}'"
+                + (f" ({created_status})" if created_status else "") + suffix)
     except discord.Forbidden:
         return "❌ нет прав выдать роль"
 
@@ -2539,6 +2778,243 @@ async def lookup(i, member: discord.Member):
     except Exception as e:
         await log_error(i.client, "/lookup", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
+
+
+# ============================================================
+# БЛОКИРОВКИ: /check_mutes, /check_bans, /check
+# ============================================================
+BLOCK_CHECK_DELAY = 3.0   # пауза между запросами к cs2red (требование сайта)
+BLOCK_MAX_EMBEDS = 10     # Discord: не больше 10 embed'ов в одном сообщении
+
+
+def _fmt_block_ts(ts: int) -> str:
+    """Unix-время -> «ДД.ММ.ГГГГ ЧЧ:ММ» (UTC)."""
+    if not ts:
+        return "—"
+    try:
+        return datetime.datetime.fromtimestamp(ts, UTC).strftime("%d.%m.%Y %H:%M")
+    except (OverflowError, OSError, ValueError):
+        return "—"
+
+
+def _fmt_block_duration(start_ts: int, end_ts: int) -> str:
+    """Длительность блокировки: «90 дн.», «2 ч.», «навсегда» или «истёк»."""
+    if not end_ts:
+        return "навсегда"
+    now = time.time()
+    if end_ts <= now:
+        return "истёк"
+    seconds = int(end_ts - (start_ts or now))
+    days, rem = divmod(max(seconds, 0), 86400)
+    hours = rem // 3600
+    if days:
+        return f"{days} дн." + (f" {hours} ч." if hours else "")
+    if hours:
+        return f"{hours} ч."
+    return f"{max(1, rem // 60)} мин."
+
+
+def _parse_steam_id(value: str) -> str | None:
+    value = (value or "").strip()
+    if value.isdigit() and len(value) == 17 and value.startswith("7656119"):
+        return value
+    return None
+
+
+def _build_block_embeds(blocks: list, title: str, empty_text: str,
+                        show_end: bool = False) -> list:
+    """Один embed на блокировку (у Discord лимит 25 полей на embed)."""
+    if not blocks:
+        e = discord.Embed(title=title, description=empty_text,
+                          color=0x000000, timestamp=now_utc())
+        e.set_footer(text=f"Quantum • {utc_stamp()}")
+        return [e]
+
+    embeds = []
+    for b in blocks[:BLOCK_MAX_EMBEDS]:
+        e = discord.Embed(title=title, color=0x000000, timestamp=now_utc())
+        player = b.get("player_nick") or "—"
+        sid = b.get("steam_id") or ""
+        e.add_field(name="Тип", value=b.get("kind") or "Бан", inline=True)
+        e.add_field(name="Игрок", value=f"{player}\n`{sid}`" if sid else player, inline=True)
+        e.add_field(name="Причина", value=(b.get("reason") or "—")[:1024], inline=False)
+        e.add_field(name="Срок",
+                    value=_fmt_block_duration(b.get("start_ts") or 0, b.get("end_ts") or 0),
+                    inline=True)
+        e.add_field(name="Дата блокировки", value=_fmt_block_ts(b.get("start_ts") or 0),
+                    inline=True)
+        if show_end:
+            end_ts = b.get("end_ts") or 0
+            e.add_field(name="Дата разблокировки",
+                        value=_fmt_block_ts(end_ts) if end_ts else "навсегда",
+                        inline=True)
+        e.add_field(name="Забанил", value=b.get("admin") or "—", inline=True)
+        e.set_footer(text=f"Quantum • {utc_stamp()}")
+        embeds.append(e)
+    return embeds
+
+
+async def _resolve_nick(steam_id: str, blocks: list) -> str:
+    """Ник игрока: из блокировок, иначе запрос к cs2red."""
+    for b in blocks:
+        if b.get("player_nick") and b["player_nick"] != "—":
+            return b["player_nick"]
+    try:
+        user = await api.cs2red_user(steam_id)
+    except Exception:
+        user = None
+    if user and not user.get("_not_found"):
+        return user.get("nick") or steam_id
+    return steam_id
+
+
+@bot.tree.command(name="check_mutes", description="Проверить муты игрока на cs2red")
+@app_commands.describe(steam_id="SteamID64 (17 цифр)")
+async def check_mutes(i, steam_id: str):
+    await i.response.defer(ephemeral=True)
+    try:
+        sid = _parse_steam_id(steam_id)
+        if not sid:
+            await safe_send(i.followup, "❌ Неверный SteamID (нужен SteamID64 из 17 цифр).",
+                            ephemeral=True)
+            return
+        _bans, blocks, err = await asyncio.wait_for(api.cs2red_all_blocks(sid),
+                                                    timeout=CMD_API_TIMEOUT)
+        if err == "unavailable":
+            await safe_send(i.followup, "❌ Сайт cs2red временно недоступен", ephemeral=True)
+            return
+        active = [b for b in blocks if b.get("active")]
+        nick = await _resolve_nick(sid, active or blocks)
+        embeds = _build_block_embeds(active, f"🔇 Муты игрока: {nick}",
+                                     "✅ У игрока нет активных мутов")
+        await safe_send(i.followup, embeds=embeds[:BLOCK_MAX_EMBEDS], ephemeral=True)
+    except asyncio.TimeoutError:
+        await log_error(i.client, "/check_mutes", "TIMEOUT")
+        try:
+            await safe_send(i.followup, "❌ cs2red не ответил вовремя.", ephemeral=True)
+        except Exception:
+            pass
+    except Exception as e:
+        await log_error(i.client, "/check_mutes", e)
+        try:
+            await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}", ephemeral=True)
+        except Exception:
+            pass
+
+
+@bot.tree.command(name="check_bans", description="Проверить баны и муты игрока на cs2red")
+@app_commands.describe(steam_id="SteamID64 (17 цифр)")
+async def check_bans(i, steam_id: str):
+    await i.response.defer(ephemeral=True)
+    try:
+        sid = _parse_steam_id(steam_id)
+        if not sid:
+            await safe_send(i.followup, "❌ Неверный SteamID (нужен SteamID64 из 17 цифр).",
+                            ephemeral=True)
+            return
+        bans, mutes, err = await asyncio.wait_for(api.cs2red_all_blocks(sid),
+                                                  timeout=CMD_API_TIMEOUT)
+        if err == "unavailable":
+            await safe_send(i.followup, "❌ Сайт cs2red временно недоступен", ephemeral=True)
+            return
+        active = [b for b in (bans + mutes) if b.get("active")]
+        active.sort(key=lambda b: b.get("start_ts") or 0, reverse=True)
+        nick = await _resolve_nick(sid, active or (bans + mutes))
+        embeds = _build_block_embeds(active, f"🚫 Блокировки игрока: {nick}",
+                                     "✅ У игрока нет активных блокировок", show_end=True)
+        await safe_send(i.followup, embeds=embeds[:BLOCK_MAX_EMBEDS], ephemeral=True)
+    except asyncio.TimeoutError:
+        await log_error(i.client, "/check_bans", "TIMEOUT")
+        try:
+            await safe_send(i.followup, "❌ cs2red не ответил вовремя.", ephemeral=True)
+        except Exception:
+            pass
+    except Exception as e:
+        await log_error(i.client, "/check_bans", e)
+        try:
+            await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}", ephemeral=True)
+        except Exception:
+            pass
+
+
+@bot.tree.command(name="check", description="Проверить всех игроков с ролью клана на баны и муты")
+async def check(i):
+    """Прогоняет всех участников с ролью CLAN_NAME (TALENT) по cs2red."""
+    await i.response.defer(ephemeral=True)
+    try:
+        guild = i.guild
+        if guild is None:
+            await safe_send(i.followup, "❌ Команда работает только на сервере.", ephemeral=True)
+            return
+        role = discord.utils.get(guild.roles, name=CLAN_NAME)
+        if role is None:
+            await safe_send(i.followup, f"❌ Роль «{CLAN_NAME}» не найдена на сервере.",
+                            ephemeral=True)
+            return
+        members = [m for m in guild.members if role in m.roles and not m.bot]
+        if not members:
+            await safe_send(i.followup, f"ℹ️ Нет участников с ролью «{CLAN_NAME}».",
+                            ephemeral=True)
+            return
+
+        checked = skipped = errors = 0
+        offenders = []
+        for idx, m in enumerate(members, 1):
+            sid = await links_repo.get_link(m.id)
+            if not sid:
+                skipped += 1
+            else:
+                try:
+                    bans, mutes, err = await asyncio.wait_for(api.cs2red_all_blocks(sid),
+                                                              timeout=CMD_API_TIMEOUT)
+                    if err == "unavailable":
+                        errors += 1
+                    else:
+                        active = [b for b in (bans + mutes) if b.get("active")]
+                        checked += 1
+                        if active:
+                            offenders.append((m, sid, active))
+                except asyncio.TimeoutError:
+                    errors += 1
+                except Exception as e:
+                    errors += 1
+                    await log_error(i.client, f"/check:{m.id}", e)
+
+            if idx % 5 == 0:
+                try:
+                    await i.edit_original_response(
+                        content=f"⏳ Проверено {idx}/{len(members)}…")
+                except Exception:
+                    pass
+            if idx < len(members):
+                await asyncio.sleep(BLOCK_CHECK_DELAY)
+
+        embed = discord.Embed(title=f"🛡 Проверка клана «{CLAN_NAME}»",
+                              color=0x000000, timestamp=now_utc())
+        embed.add_field(name="👥 Игроков с ролью", value=str(len(members)), inline=True)
+        embed.add_field(name="✅ Проверено", value=str(checked), inline=True)
+        embed.add_field(name="🚫 С блокировками", value=str(len(offenders)), inline=True)
+        embed.add_field(name="🔗 Без SteamID", value=str(skipped), inline=True)
+        embed.add_field(name="⚠️ Ошибок", value=str(errors), inline=True)
+        if offenders:
+            lines = []
+            for m, _sid, active in offenders[:10]:
+                kinds = ", ".join(sorted({b.get("kind") or "Бан" for b in active}))
+                reason = (active[0].get("reason") or "—")[:80]
+                lines.append(f"• {m.mention} — {kinds}: {reason}")
+            if len(offenders) > 10:
+                lines.append(f"…и ещё {len(offenders) - 10}")
+            embed.add_field(name="Нарушители", value="\n".join(lines)[:1024], inline=False)
+        else:
+            embed.add_field(name="Нарушители", value="✅ Не найдено", inline=False)
+        embed.set_footer(text=f"Quantum • {utc_stamp()}")
+        await safe_send(i.followup, embed=embed, ephemeral=True)
+    except Exception as e:
+        await log_error(i.client, "/check", e)
+        try:
+            await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}", ephemeral=True)
+        except Exception:
+            pass
 
 
 # ============================================================

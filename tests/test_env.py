@@ -46,7 +46,11 @@ def test_import_with_empty_env_vars():
     assert "GUILD_ID= 0" in out, out
     assert "CLAN_NAME= TALENT" in out, out
     assert "VOTES_REQUIRED= 2" in out, out
-    assert "COMMANDS= 28" in out, out
+    commands_line = [ln for ln in out.splitlines() if ln.startswith("COMMANDS=")]
+    assert commands_line, out
+    # Точное число меняется с каждой новой командой — важен сам факт,
+    # что дерево команд собралось (и не уменьшилось).
+    assert int(commands_line[0].split("=", 1)[1]) >= 28, out
     print("  ok: бот стартует при пустых переменных окружения")
 
 
