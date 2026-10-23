@@ -56,13 +56,13 @@ async def upsert_application(user_id, *, clan_name="", status="pending",
     await db.execute(
         "INSERT INTO applications (user_id, status, clan_name, message_id, "
         "channel_id, app_id, moderator_id, taken_by, taken_at, "
-        "created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?) "
+        "decision_reason, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?) "
         "ON CONFLICT(user_id) DO UPDATE SET "
         "status = excluded.status, clan_name = excluded.clan_name, "
         "message_id = excluded.message_id, channel_id = excluded.channel_id, "
         "app_id = excluded.app_id, moderator_id = NULL, "
-        "taken_by = NULL, taken_at = NULL, "
+        "taken_by = NULL, taken_at = NULL, decision_reason = NULL, "
         "updated_at = excluded.updated_at",
         (uid, status, clan_name, message_id, channel_id, app_id, now, now),
     )
@@ -83,12 +83,13 @@ async def add_history(user_id, *, clan_name="", status="pending", message_id="",
     await db.execute(
         "INSERT OR IGNORE INTO application_history "
         "(user_id, clan_name, status, message_id, channel_id, app_id, "
-        "moderator_id, taken_by, taken_at, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "moderator_id, taken_by, taken_at, decision_reason, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (str(user_id), clan_name, status, message_id, channel_id, app_id,
          str(moderator_id) if moderator_id else None,
          str(taken_by) if taken_by else None,
-         taken_at or (now if taken_by else None), now, now),
+         taken_at or (now if taken_by else None),
+         None, now, now),
     )
     await db.commit()
 
@@ -98,7 +99,8 @@ async def get_user_history(user_id, limit: int = 25) -> list:
     db = await get_db()
     cursor = await db.execute(
         "SELECT user_id, clan_name, status, message_id, app_id, moderator_id, "
-        "taken_by, taken_at, created_at, updated_at FROM application_history "
+        "taken_by, taken_at, decision_reason, created_at, updated_at "
+        "FROM application_history "
         "WHERE user_id = ? ORDER BY id DESC LIMIT ?",
         (str(user_id), int(limit)),
     )
@@ -161,28 +163,34 @@ async def list_pending_applications() -> list:
     return [dict(r) for r in rows]
 
 
-async def finalize_application(user_id, status: str, moderator_id=None) -> None:
+async def finalize_application(user_id, status: str, moderator_id=None,
+                               reason: str = "") -> None:
     """Закрывает активную заявку пользователя (статус принят/отклонён/отозвана).
 
     moderator_id — кто вынес решение (его голос достиг порога). Нужен
     для личной статистики модератора в /status.
+
+    reason — обязательная причина отказа. Для принятых заявок остаётся
+    пустой; повторная подача заявки обнуляет её.
     """
+    reason = (reason or "").strip()[:900]
     db = await get_db()
     await db.execute(
-        "UPDATE applications SET status = ?, moderator_id = ?, updated_at = ? "
-        "WHERE user_id = ?",
-        (status, str(moderator_id) if moderator_id else None, _now(),
-         str(user_id)),
+        "UPDATE applications SET status = ?, moderator_id = ?, "
+        "decision_reason = ?, updated_at = ? WHERE user_id = ?",
+        (status, str(moderator_id) if moderator_id else None,
+         reason or None, _now(), str(user_id)),
     )
     await db.commit()
     # Дублируем финальный статус в историю заявок (последняя запись игрока).
     try:
         await db.execute(
             "UPDATE application_history SET status = ?, moderator_id = ?, "
-            "updated_at = ? WHERE id = (SELECT id FROM application_history "
+            "decision_reason = ?, updated_at = ? "
+            "WHERE id = (SELECT id FROM application_history "
             "WHERE user_id = ? ORDER BY id DESC LIMIT 1)",
-            (status, str(moderator_id) if moderator_id else None, _now(),
-             str(user_id)),
+            (status, str(moderator_id) if moderator_id else None,
+             reason or None, _now(), str(user_id)),
         )
         await db.commit()
     except Exception as e:
@@ -238,7 +246,8 @@ async def get_taken_applications(moderator_id, limit: int | None = 50) -> list:
     db = await get_db()
     sql = (
         "SELECT user_id, clan_name, status, message_id, channel_id, app_id, "
-        "moderator_id, taken_by, taken_at, created_at, updated_at "
+        "moderator_id, taken_by, taken_at, decision_reason, "
+        "created_at, updated_at "
         "FROM application_history WHERE taken_by = ? "
         "ORDER BY COALESCE(taken_at, updated_at) DESC, id DESC"
     )

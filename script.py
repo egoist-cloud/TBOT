@@ -8,6 +8,7 @@ import time
 import random
 import asyncio
 import datetime
+import functools
 import platform
 import sys
 import threading
@@ -35,6 +36,7 @@ from quantum.repositories import players as players_repo
 from quantum.repositories import users as users_repo
 from quantum.repositories import moderation as moderation_repo
 from quantum.repositories import applications as applications_repo
+from quantum.repositories import audit as audit_repo
 from quantum.ai import AIService
 from github_sync import GitHubSync
 from quantum.ai.cache import count_cache, clear_cache
@@ -89,6 +91,8 @@ APPLICATIONS_CHANNEL_ID = 1511463623703265361
 THREADS_CHANNEL_ID = 1236678127778795660
 DB_CHANNEL_ID = 1554883485834149888
 ERROR_LOG_CHANNEL_ID = 1511463623703265361
+# Канал аудита админских и модераторских действий.
+AUDIT_LOG_CHANNEL_ID = env_int("AUDIT_LOG_CHANNEL_ID", 1555204495682568202)
 # Куда /check присылает мини-отчёт о найденных мутах/банах.
 CHECK_LOG_CHANNEL_ID = env_int("CHECK_LOG_CHANNEL_ID", LOG_CHANNEL_ID)
 
@@ -302,6 +306,17 @@ REQUEST_DELAY = 0.3
 ACTIVITY_TRACK_SECONDS = 300
 ACTIVITY_TRACK_DELTA = 300
 CLANS_CACHE_TTL = 300
+
+# --- защита cs2red и скорость -------------------------------------------
+# Пауза между запросами к cs2red. Меньше 1.5 сек ставить не стоит: сайт
+# отвечает 429 и сам начинает резать запросы.
+CS2RED_RATE_LIMIT_SECONDS = env_float("CS2RED_RATE_LIMIT_SECONDS", 2.5)
+# «Предохранитель»: после 429/403/5xx бот не долбит сайт, а сразу отвечает
+# ошибкой и ждёт. Пауза растёт экспоненциально, но не больше MAX.
+CS2RED_BLOCK_BASE_SECONDS = env_int("CS2RED_BLOCK_BASE_SECONDS", 60)
+CS2RED_BLOCK_MAX_SECONDS = env_int("CS2RED_BLOCK_MAX_SECONDS", 1800)
+# Короткий кэш профиля игрока: повторные команды не дёргают cs2red зря.
+CS2RED_USER_CACHE_TTL = env_int("CS2RED_USER_CACHE_TTL", 60)
 
 
 # ============================================================
@@ -597,6 +612,45 @@ async def run_with_timeout(coro, timeout: float, fallback_msg: str,
         await log_error(bot, context or "run_with_timeout", e)
         await close_interaction(interaction, f"❌ Ошибка: {str(e)[:200]}", ephemeral=False)
         return None
+
+
+# Тяжёлые операции (обход всех игроков через cs2red) не должны выполняться
+# параллельно: два модератора одновременно запускали /check_all и удваивали
+# нагрузку на сайт. Lock на имя операции решает это без блокировки event loop.
+_heavy_locks: dict[str, asyncio.Lock] = {}
+
+
+def _heavy_lock(name: str) -> asyncio.Lock:
+    lock = _heavy_locks.get(name)
+    if lock is None:
+        lock = asyncio.Lock()
+        _heavy_locks[name] = lock
+    return lock
+
+
+def single_flight(name: str, busy_text: str):
+    """Не даёт запустить одну и ту же тяжёлую команду дважды.
+
+    Второй вызов получает ephemeral-сообщение «уже выполняется» и не
+    создаёт лишних запросов к cs2red.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(interaction, *args, **kwargs):
+            lock = _heavy_lock(name)
+            if lock.locked():
+                try:
+                    if not interaction.response.is_done():
+                        await interaction.response.defer(ephemeral=True)
+                    await safe_send(interaction.followup, busy_text,
+                                    ephemeral=True)
+                except Exception:
+                    pass
+                return None
+            async with lock:
+                return await func(interaction, *args, **kwargs)
+        return wrapper
+    return decorator
 
 
 # ============================================================
@@ -995,13 +1049,13 @@ def parse_activity_json(user: dict, now: float | None = None) -> dict | None:
 # ============================================================
 class API:
     # Интервал между запросами к cs2red (анти-DDoS Cloudflare).
-    RATE_LIMIT_SECONDS = 2.5
+    RATE_LIMIT_SECONDS = CS2RED_RATE_LIMIT_SECONDS
     # При 5xx: максимальное число повторов подряд.
     RETRY_MAX = 3
-    # При 429 ждём столько же.
-    RATE_LIMIT_429_WAIT = 300
     # При 5xx ждём между повторами.
     RETRY_5xx_WAIT = 10
+    # Сколько максимум держать профили в кэше (защита от роста памяти).
+    USER_CACHE_MAX = 512
 
     def __init__(self):
         # Публичная сессия: Steam / GitHub / LLM — БЕЗ cookies и заголовков cs2red.
@@ -1018,6 +1072,62 @@ class API:
         self._last_cs2red_ts = 0.0
         # Причина блокировки, если сработала защита (429/403/5xx исчерпаны).
         self.blocked_reason = ""
+        # Предохранитель: до какого времени cs2red не трогаем. Раньше при
+        # 429 команда «висела» 5 минут; теперь отвечает сразу, а сайт
+        # получает паузу в фоне.
+        self._blocked_until = 0.0
+        self._block_strikes = 0
+        # Кэш профилей: steam_id -> (ts, user).
+        self._user_cache: dict[str, tuple[float, dict]] = {}
+
+    # ---------- предохранитель и кэш ----------
+    def is_blocked(self) -> bool:
+        return time.time() < self._blocked_until
+
+    def block_reason_text(self) -> str:
+        """Человекочитаемая причина паузы и сколько ждать."""
+        if not self.is_blocked():
+            return ""
+        left = max(0, int(self._blocked_until - time.time()))
+        reason = self.blocked_reason or "временная блокировка"
+        return f"{reason} (пауза ещё {left} сек)"
+
+    def _block(self, reason: str) -> None:
+        """Ставит cs2red на паузу с экспоненциальным ростом."""
+        self._block_strikes = min(self._block_strikes + 1, 8)
+        delay = min(CS2RED_BLOCK_BASE_SECONDS * (2 ** (self._block_strikes - 1)),
+                    CS2RED_BLOCK_MAX_SECONDS)
+        self._blocked_until = time.time() + delay
+        self.blocked_reason = reason
+        log(f"⛔ cs2red на паузе {delay} сек (причина: {reason}, "
+            f"подряд: {self._block_strikes})")
+
+    def reset_block(self) -> None:
+        """Снимает паузу после успешного ответа или ручного сброса."""
+        self._blocked_until = 0.0
+        self._block_strikes = 0
+        self.blocked_reason = ""
+
+    def _cache_get(self, steam_id):
+        key = str(steam_id)
+        item = self._user_cache.get(key)
+        if not item:
+            return None
+        ts, user = item
+        if time.time() - ts > CS2RED_USER_CACHE_TTL:
+            self._user_cache.pop(key, None)
+            return None
+        return user
+
+    def _cache_put(self, steam_id, user) -> None:
+        if not isinstance(user, dict):
+            return
+        if len(self._user_cache) >= self.USER_CACHE_MAX:
+            # Простое вытеснение: удаляем самый старый по времени записи.
+            oldest = min(self._user_cache.items(),
+                         key=lambda kv: kv[1][0])[0]
+            self._user_cache.pop(oldest, None)
+        self._user_cache[str(steam_id)] = (time.time(), user)
 
     async def start(self):
         timeout = aiohttp.ClientTimeout(total=20, connect=10)
@@ -1068,7 +1178,8 @@ class API:
             now = time.time()
             wait = self.RATE_LIMIT_SECONDS - (now - self._last_cs2red_ts)
             if wait > 0:
-                await asyncio.sleep(wait)
+                # Небольшой джиттер: несколько воркеров не бьют залпом.
+                await asyncio.sleep(wait + random.uniform(0, 0.25))
             self._last_cs2red_ts = time.time()
             return
 
@@ -1077,6 +1188,11 @@ class API:
         if not session:
             return None
         is_cs2red = _is_cs2red_host(url)
+        # Предохранитель: после 429/403 не ждём 5 минут внутри команды,
+        # а сразу говорим «сайт на паузе». Это и быстрее для Discord, и
+        # безопаснее для cs2red.
+        if is_cs2red and self.is_blocked():
+            return None
 
         # 5xx-ретраи: если подряд падаем, останавливаем cs2red-поток.
         consecutive_5xx = 0
@@ -1092,17 +1208,17 @@ class API:
 
                         # 403 — авторизация сломана: останавливаемся окончательно.
                         if r.status == 403:
-                            self.blocked_reason = "403"
+                            if is_cs2red:
+                                self._block("403")
                             log(f"🔴 403 на {url} — авторизация на cs2red. Проверьте куки.")
                             return None
 
-                        # 429 — Cloudflare/Discord прижал: пауза 5 минут, потом стоп.
+                        # 429 — Cloudflare/Discord прижал: пауза, без зависания.
                         if r.status == 429:
-                            self.blocked_reason = "429"
-                            log(f"🐢 429 на {url} — cs2red временно блокирует запросы "
-                                f"(429). Пауза {self.RATE_LIMIT_429_WAIT} сек.")
-                            await asyncio.sleep(self.RATE_LIMIT_429_WAIT)
-                            # После паузы 429 всё равно стоп (не рискуем уронить сайт).
+                            if is_cs2red:
+                                self._block("429")
+                            log(f"🐢 429 на {url} — cs2red временно блокирует "
+                                f"запросы. Пауза без ожидания в команде.")
                             return None
 
                         # 5xx — временный сбой сервера: ретраи с паузой, до RETRY_MAX.
@@ -1111,7 +1227,8 @@ class API:
                             log(f"⚠️ {r.status} на {url} ({attempt + 1}-я попытка из "
                                 f"{self.RETRY_MAX + 1})")
                             if consecutive_5xx > self.RETRY_MAX:
-                                self.blocked_reason = f"{r.status}"
+                                if is_cs2red:
+                                    self._block(str(r.status))
                                 return None
                             await asyncio.sleep(self.RETRY_5xx_WAIT)
                             continue
@@ -1122,14 +1239,15 @@ class API:
                         # иначе после одного 403/429 фоновые задачи навсегда
                         # считали сайт недоступным и прерывались.
                         if is_cs2red:
-                            self.blocked_reason = ""
+                            self.reset_block()
                         return await r.json(content_type=None)
             except NET_ERRORS as e:
                 log(f"⚠️ GET {url}: сетевой сбой: {e}")
                 if attempt < self.RETRY_MAX:
                     await asyncio.sleep(self.RETRY_5xx_WAIT)
                     continue
-                self.blocked_reason = "network"
+                if is_cs2red:
+                    self._block("network")
                 return None
             except Exception as e:
                 log(f"⚠️ GET {url}: {e}")
@@ -1148,6 +1266,8 @@ class API:
         if not session:
             return None, "нет сессии"
         is_cs2red = _is_cs2red_host(url)
+        if is_cs2red and self.is_blocked():
+            return None, self.block_reason_text()
         consecutive_5xx = 0
         for attempt in range(self.RETRY_MAX + 1):
             try:
@@ -1157,29 +1277,28 @@ class API:
                     async with session.get(url, params=params) as r:
                         self.last_status = r.status
                         if r.status == 403:
-                            self.blocked_reason = "403"
+                            self._block("403")
                             log(f"🔴 403 на {url} — авторизация на cs2red. "
                                 f"Проверьте куки.")
                             return None, "403 (нужны актуальные cookie cs2red)"
                         if r.status == 429:
-                            self.blocked_reason = "429"
+                            self._block("429")
                             log(f"🐢 429 на {url} — cs2red временно блокирует "
-                                f"запросы. Пауза {self.RATE_LIMIT_429_WAIT} сек.")
-                            await asyncio.sleep(self.RATE_LIMIT_429_WAIT)
+                                f"запросы. Пауза без ожидания в команде.")
                             return None, "429 (cs2red временно блокирует запросы)"
                         if r.status >= 500:
                             consecutive_5xx += 1
                             log(f"⚠️ {r.status} на {url} "
                                 f"({attempt + 1}-я попытка из {self.RETRY_MAX + 1})")
                             if consecutive_5xx > self.RETRY_MAX:
-                                self.blocked_reason = f"{r.status}"
+                                self._block(str(r.status))
                                 return None, f"{r.status} (сервер cs2red не отвечает)"
                             await asyncio.sleep(self.RETRY_5xx_WAIT)
                             continue
                         consecutive_5xx = 0
                         r.raise_for_status()
                         if is_cs2red:
-                            self.blocked_reason = ""
+                            self.reset_block()
                         # Кодировку не форсируем: aiohttp берёт её из
                         # Content-Type/мета-тега, а у cs2red это UTF-8.
                         html = await r.text()
@@ -1189,7 +1308,8 @@ class API:
                 if attempt < self.RETRY_MAX:
                     await asyncio.sleep(self.RETRY_5xx_WAIT)
                     continue
-                self.blocked_reason = "network"
+                if is_cs2red:
+                    self._block("network")
                 return None, "сеть"
             except Exception as e:
                 log(f"⚠️ GET {url}: {e}")
@@ -1238,6 +1358,11 @@ class API:
         return None
 
     async def cs2red_user(self, steam_id: str):
+        # Кэш на минуту: /check_all, /check_onlineall и /clan_info часто
+        # запрашивают одних и тех же игроков подряд.
+        cached = self._cache_get(steam_id)
+        if cached is not None:
+            return cached
         data = await self._get_json(
             "https://cs2red.ru/api/admin/users",
             params={"begin": 0, "count": 1, "search": steam_id})
@@ -1252,7 +1377,9 @@ class API:
         # Когда steamid64 в ответе нет, остаётся прежнее поведение (первый).
         for u in users:
             if self.extract_steam64(u) == str(steam_id):
+                self._cache_put(steam_id, u)
                 return u
+        self._cache_put(steam_id, users[0])
         return users[0]
 
     async def cs2red_search_by_nick(self, nickname: str, limit: int = 10):
@@ -1284,6 +1411,10 @@ class API:
         return None
 
     async def cs2red_full_user(self, steam_id: str, user: dict | None = None):
+        cache_key = f"full:{steam_id}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
         user = user if user is not None else await self.cs2red_user(steam_id)
         if not user or user.get("_not_found") or not user.get("id"):
             return None
@@ -1291,7 +1422,9 @@ class API:
             "https://cs2red.ru/api/admin/user",
             params={"userId": user["id"]})
         if data and data.get("success"):
-            return data.get("user")
+            full = data.get("user")
+            self._cache_put(cache_key, full)
+            return full
         return None
 
     async def cs2red_clans(self):
@@ -1885,6 +2018,83 @@ async def log_to_applications(bot, text):
         await _send(bot, APPLICATION_LOGS_CHANNEL_ID, text)
 
 
+def _audit_identity(obj):
+    """Возвращает (id, имя) для Discord-объекта, id-строки или None."""
+    if obj is None:
+        return None, ""
+    if isinstance(obj, (int, str)):
+        return (str(obj) or None), ""
+    uid = getattr(obj, "id", None)
+    name = (getattr(obj, "display_name", None)
+            or getattr(obj, "name", None)
+            or (str(uid) if uid else ""))
+    return (str(uid) if uid else None), str(name or "")
+
+
+def _build_audit_embed(action, actor_id, target_id, target_name, details):
+    """Собирает чёрный embed аудита (без отправки)."""
+    embed = discord.Embed(title=f"🛡 {action}", color=0x000000,
+                          timestamp=now_utc())
+    if actor_id:
+        embed.add_field(name="Кто", value=f"<@{actor_id}>\n`{actor_id}`",
+                        inline=True)
+    else:
+        embed.add_field(name="Кто", value="система", inline=True)
+    if target_id or target_name:
+        value = (f"<@{target_id}>\n`{target_id}`" if target_id
+                 else (target_name or "—"))
+        embed.add_field(name="Объект", value=value[:1024], inline=True)
+    if details:
+        embed.add_field(name="Детали", value=details[:1024], inline=False)
+    embed.set_footer(text=f"Quantum • {utc_stamp()} (UTC)")
+    return embed
+
+
+async def _send_audit_embed(bot, embed) -> None:
+    """Отправляет embed аудита. Ограничен по времени, ошибки не летят наружу."""
+    try:
+        channel = bot.get_channel(AUDIT_LOG_CHANNEL_ID)
+        if channel is None:
+            channel = await bot.fetch_channel(AUDIT_LOG_CHANNEL_ID)
+        if channel is None:
+            return
+        await asyncio.wait_for(safe_send(channel, embed=embed), timeout=10)
+    except Exception as e:
+        log(f"⚠️ audit channel: {type(e).__name__}: {e}")
+
+
+async def audit_action(bot, action: str, *, actor=None, target=None,
+                       details: str = "", notify: bool = True):
+    """Пишет действие в ``audit_log`` и дублирует его в канал аудита.
+
+    Возвращает Task отправки embed'а (или None). Запись в БД ждём (это
+    быстро и важно), а отправку в Discord делаем в фоне: аудит не должен
+    задерживать ответ на команду, даже если канал временно недоступен.
+    Никогда не бросает исключение.
+    """
+    actor_id, actor_name = _audit_identity(actor)
+    target_id, target_name = _audit_identity(target)
+    try:
+        await audit_repo.add_entry(
+            actor_id=actor_id, actor_name=actor_name, action=action,
+            target_id=target_id, target_name=target_name, details=details,
+        )
+    except Exception as e:
+        log(f"⚠️ audit db: {type(e).__name__}: {e}")
+
+    if not notify or not AUDIT_LOG_CHANNEL_ID:
+        return None
+    embed = _build_audit_embed(action, actor_id, target_id, target_name,
+                               details)
+    try:
+        return asyncio.create_task(_send_audit_embed(bot, embed))
+    except RuntimeError:
+        # Нет работающего event loop (например, синхронный вызов) —
+        # отправляем сразу, если это вообще возможно.
+        await _send_audit_embed(bot, embed)
+        return None
+
+
 def utc_stamp() -> str:
     return now_utc().strftime("%d.%m.%Y %H:%M")
 
@@ -2289,21 +2499,14 @@ async def _save_votes(app_id, st):
     await votes_repo.save_votes(app_id, st)
 
 
-async def _vote(interaction, kind, button=None):
-    await interaction.response.defer()
-    if not user_can_review(interaction.user):
-        await safe_send(interaction.followup, "❌ Нет прав.", ephemeral=True)
-        return
-    # Заявитель не должен сам решать свою судьбу — голосовать по своей
-    # заявке ему нельзя (иначе «Принять»/«Отклонить» жмётся в один клик).
-    embed = interaction.message.embeds[0] if interaction.message.embeds else None
-    tid = extract_discord_id_from_embed(embed) if embed else None
-    if tid and str(interaction.user.id) == str(tid):
-        await safe_send(interaction.followup,
-                        "❌ Вы не можете голосовать по своей заявке.", ephemeral=True)
-        return
+async def _apply_vote(interaction, kind, app_id, tid, show_take,
+                      reason: str = ""):
+    """Применяет голос и, если порог достигнут, закрывает заявку.
 
-    app_id = _app_id_for(interaction, button)
+    Вынесено из ``_vote``, потому что отклонение приходит из модального
+    окна: там уже нет кнопки, но app_id и заявитель сохранены в модалке.
+    ``reason`` — обязательная причина отказа; попадает в embed, БД и аудит.
+    """
     st, applied = await votes_repo.apply_vote(
         app_id, kind, interaction.user.id,
         allow_repeat=user_can_spam_vote(interaction.user),
@@ -2315,11 +2518,16 @@ async def _vote(interaction, kind, button=None):
     # В канале-логе «Взять» быть не должно. После голоса мы перерисовываем
     # исходное сообщение, поэтому сохраняем его контекст: ветка — с кнопкой,
     # канал — без неё.
-    show_take = isinstance(interaction.channel, discord.Thread)
     view = ApplicationManagement(app_id, show_take=show_take)
     if st[kind] >= VOTES_REQUIRED:
         status = "Принят" if kind == "accept" else "Отклонен"
-        embed.set_footer(text=f"Quantum • Статус: {status}")
+        embed = (interaction.message.embeds[0]
+                 if interaction.message and interaction.message.embeds else None)
+        if embed is not None:
+            embed.set_footer(text=f"Quantum • Статус: {status}")
+            if kind == "deny" and reason:
+                embed.add_field(name="Причина отказа", value=reason[:1024],
+                                inline=False)
         for c in view.children:
             c.disabled = True
         try:
@@ -2347,9 +2555,21 @@ async def _vote(interaction, kind, button=None):
             try:
                 await applications_repo.finalize_application(
                     tid, "accepted" if kind == "accept" else "rejected",
-                    moderator_id=interaction.user.id)
+                    moderator_id=interaction.user.id, reason=reason)
             except Exception as e:
                 log(f"⚠️ Не финализировал заявку: {e}")
+        # Аудит: решение по заявке с причиной отказа.
+        try:
+            await audit_action(
+                interaction.client,
+                "Заявка принята" if kind == "accept" else "Заявка отклонена",
+                actor=interaction.user,
+                target=member or tid,
+                details=(f"Заявка `{app_id or tid or '—'}`\n"
+                         + (f"Причина: {reason}" if reason else "Без причины")),
+            )
+        except Exception as e:
+            log(f"⚠️ audit заявки: {e}")
         if isinstance(interaction.channel, discord.Thread):
             await close_application_thread(interaction.channel, interaction.user, status)
     else:
@@ -2357,6 +2577,73 @@ async def _vote(interaction, kind, button=None):
             await interaction.message.edit(view=view)
         except Exception:
             pass
+
+
+async def _vote(interaction, kind, button=None):
+    await interaction.response.defer()
+    if not user_can_review(interaction.user):
+        await safe_send(interaction.followup, "❌ Нет прав.", ephemeral=True)
+        return
+    # Заявитель не должен сам решать свою судьбу — голосовать по своей
+    # заявке ему нельзя (иначе «Принять»/«Отклонить» жмётся в один клик).
+    embed = (interaction.message.embeds[0]
+             if interaction.message and interaction.message.embeds else None)
+    tid = extract_discord_id_from_embed(embed) if embed else None
+    if tid and str(interaction.user.id) == str(tid):
+        await safe_send(interaction.followup,
+                        "❌ Вы не можете голосовать по своей заявке.", ephemeral=True)
+        return
+
+    app_id = _app_id_for(interaction, button)
+    await _apply_vote(interaction, kind, app_id, tid,
+                      isinstance(interaction.channel, discord.Thread))
+
+
+class RejectModal(discord.ui.Modal, title="Отклонить заявку"):
+    """Модальное окно отказа: причина обязательна.
+
+    Discord сам не даст отправить пустое поле (``required=True``), но
+    проверка на сервере всё равно нужна: значение может прийти из
+    старого клиента или состоять из пробелов.
+    """
+
+    def __init__(self, app_id: str, tid: str, show_take: bool = True):
+        super().__init__()
+        self.app_id = str(app_id or "")
+        self.tid = str(tid or "")
+        self.show_take = bool(show_take)
+        self.reason = discord.ui.TextInput(
+            label="Причина отказа (обязательно)",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            min_length=3,
+            max_length=900,
+            placeholder="Коротко объясните игроку причину отказа",
+        )
+        self.add_item(self.reason)
+
+    async def on_submit(self, i):
+        # Повторная проверка прав: модалку открывает кнопка, но проверять
+        # на всякий случай нужно и здесь — компонент живёт до отправки.
+        if not user_can_review(i.user):
+            await i.response.send_message("❌ Нет прав.", ephemeral=True)
+            return
+        if self.tid and str(i.user.id) == str(self.tid):
+            await i.response.send_message(
+                "❌ Вы не можете голосовать по своей заявке.", ephemeral=True)
+            return
+        reason = (self.reason.value or "").strip()
+        if len(reason) < 3:
+            await i.response.send_message(
+                "❌ Причина отказа обязательна (минимум 3 символа).",
+                ephemeral=True)
+            return
+        try:
+            await i.response.defer()
+        except discord.InteractionResponded:
+            pass
+        await _apply_vote(i, "deny", self.app_id, self.tid, self.show_take,
+                          reason=reason)
 
 
 # ============================================================
@@ -2408,6 +2695,12 @@ class ApplicationManagement(discord.ui.View):
         except Exception as e:
             await log_error(i.client, "take_btn.db", e)
         await safe_send(i.followup, f"🙋 Взял {i.user.mention}.")
+        try:
+            await audit_action(
+                i.client, "Заявка взята", actor=i.user,
+                details=f"Заявка `{app_id}`")
+        except Exception as e:
+            await log_error(i.client, "take_btn.audit", e)
         # В ветке заявку берёт один модератор: оставляем только заявителя
         # и того, кто взял — остальных убираем из ветки.
         try:
@@ -2423,7 +2716,19 @@ class ApplicationManagement(discord.ui.View):
     @discord.ui.button(label="Отклонить", style=discord.ButtonStyle.danger,
                        custom_id="deny_btn", row=0)
     async def deny(self, i, b):
-        await _vote(i, "deny", b)
+        # Причина отказа обязательна: сначала модальное окно, голос — после.
+        if not user_can_review(i.user):
+            await i.response.send_message("❌ Нет прав.", ephemeral=True)
+            return
+        embed = (i.message.embeds[0] if i.message and i.message.embeds else None)
+        tid = extract_discord_id_from_embed(embed) if embed else None
+        if tid and str(i.user.id) == str(tid):
+            await i.response.send_message(
+                "❌ Вы не можете голосовать по своей заявке.", ephemeral=True)
+            return
+        app_id = _app_id_for(i, b)
+        await i.response.send_modal(RejectModal(
+            app_id, tid or "", isinstance(i.channel, discord.Thread)))
 
 
 class ApplicationBansView(discord.ui.View):
@@ -2468,6 +2773,8 @@ class ApplicationBansView(discord.ui.View):
             "type": "perm", "until": None, "reason": f"Выдал {i.user}"})
         await safe_send(i.followup, f"⛔ <@{tid}> перм. запрет")
         await log_to_channel(i.client, f"⛔ perm <@{tid}> от {i.user.mention}")
+        await audit_action(i.client, "Перманентный запрет", actor=i.user,
+                           target=tid, details=f"Discord ID: `{tid}`")
 
     @discord.ui.button(label="✅ Снять запрет", style=discord.ButtonStyle.success,
                        custom_id="unban_btn", row=0)
@@ -2485,6 +2792,8 @@ class ApplicationBansView(discord.ui.View):
         await safe_send(i.followup, f"✅ снят с <@{tid}>" if had else "ℹ️ нет")
         if had:
             await log_to_channel(i.client, f"✅ unban <@{tid}> от {i.user.mention}")
+            await audit_action(i.client, "Запрет снят", actor=i.user,
+                               target=tid, details=f"Discord ID: `{tid}`")
 
 
 class TempBanModal(discord.ui.Modal, title="Запрет"):
@@ -2509,6 +2818,10 @@ class TempBanModal(discord.ui.Modal, title="Запрет"):
             "type": "temp", "until": until, "reason": self.reason.value.strip() or "-"})
         await i.response.send_message(f"🚫 <@{self.tid}> запрет на {hours} ч.")
         await log_to_channel(i.client, f"🚫 temp <@{self.tid}> {hours}ч от {i.user.mention}")
+        await audit_action(i.client, "Временный запрет", actor=i.user,
+                           target=self.tid,
+                           details=(f"Срок: {hours} ч.\n"
+                                    f"Причина: {self.reason.value.strip() or '—'}"))
 
 # ============================================================
 # МОДАЛЬНОЕ ОКНО ЗАЯВКИ
@@ -2818,6 +3131,12 @@ class MyBot(commands.Bot):
             await init_db()
             await import_json_to_sqlite(DATA_DIR)
             log("✅ SQLite готов (init_db + миграция)")
+            try:
+                removed = await audit_repo.prune(180)
+                if removed:
+                    log(f"🧹 Аудит: удалено старых записей — {removed}")
+            except Exception as e:
+                log(f"⚠️ audit prune: {type(e).__name__}: {e}")
             await api.start()
             log("✅ API session ready")
 
@@ -3079,6 +3398,10 @@ async def link(i, steam_id: str):
             f"✅ Привязано: `{steam_id}` (ник **{u.get('nick', '-')}**)",
             ephemeral=False
         )
+        await audit_action(i.client, "Привязка SteamID", actor=i.user,
+                           target=i.user,
+                           details=(f"SteamID: `{steam_id}`\n"
+                                    f"Ник на cs2red: {u.get('nick') or '—'}"))
         try:
             s1 = await sync_role_by_id(i.guild, i.user, steam_id, user=u)
             s2 = await sync_clan_role_by_id(i.guild, i.user, steam_id, user=u)
@@ -3105,6 +3428,9 @@ async def unlink(i):
             await safe_send(i.followup,
                             "✅ Отвязано. Роли на сервере не изменены (команда в ЛС).",
                             ephemeral=False)
+            await audit_action(i.client, "Отвязка SteamID", actor=i.user,
+                               target=i.user,
+                               details=f"SteamID: `{rid}` (ЛС)")
             return
         managed_n = {n for n in ROLE_MAP.values() if n}
         managed_i = set(CLAN_ROLE_MAP.values())
@@ -3130,6 +3456,8 @@ async def unlink(i):
             text += ("\n⚠️ Не удалось снять: " + ", ".join(failed)
                      + " — роль бота должна быть выше этих ролей.")
         await safe_send(i.followup, text, ephemeral=False)
+        await audit_action(i.client, "Отвязка SteamID", actor=i.user,
+                           target=i.user, details=f"SteamID: `{rid}`")
     except Exception as e:
         await log_error(i.client, "/unlink", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
@@ -3225,12 +3553,17 @@ async def admlink(i, user: discord.Member, steam_id: str):
             f"🔗 /admlink: {user.mention} ({user.id}) → `{steam_id}` "
             f"({action}) от {i.user.mention}\n"
             + "\n".join(sync_lines))
+        await audit_action(
+            i.client, "Админ-привязка", actor=i.user, target=user,
+            details=(f"SteamID: `{steam_id}`\n{action}\n"
+                     + "\n".join(sync_lines))[:1024])
     except Exception as e:
         await log_error(i.client, "/admlink", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
 
 
 @bot.tree.command(name="sync_all", description="Синхронизировать всех")
+@single_flight("sync_all", "⏳ Синхронизация уже выполняется. Подождите.")
 async def sync_all(i):
     await i.response.defer(ephemeral=True)
     if not await _admin_guard(i):
@@ -3251,7 +3584,7 @@ async def run_sync_all(i, ephemeral: bool = False):
         processed = 0
         res = []
         stopped = False
-        api.blocked_reason = ""
+        api.reset_block()
 
         def _progress(processed_: int, total_: int) -> discord.Embed:
             pct = int((processed_ / total_) * 100) if total_ else 0
@@ -3341,6 +3674,12 @@ async def run_sync_all(i, ephemeral: bool = False):
             await safe_send(i.followup, text[:1900], title="🔗 Синхронизация",
                             ephemeral=ephemeral)
         await log_to_channel(i.client, text)
+        await audit_action(
+            i.client, "Синхронизация ролей", actor=i.user,
+            details=(f"Обработано: {processed} из {total}\n"
+                     f"Строк результата: {len(res)}"
+                     + (f"\nОстановлено: {api.blocked_reason}"
+                        if api.blocked_reason else "")))
     except Exception as e:
         await log_error(i.client, "/sync_all", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
@@ -3368,6 +3707,7 @@ async def linked_member_autocomplete(i, current):
 # /link_all
 # ============================================================
 @bot.tree.command(name="link_all", description="Массовая привязка/синхронизация из базы SQLite")
+@single_flight("link_all", "⏳ Массовая привязка уже выполняется. Подождите.")
 async def link_all(i):
     await i.response.defer(ephemeral=True)
     if not await _admin_guard(i):
@@ -3478,6 +3818,7 @@ async def link_all(i):
 
 @bot.tree.command(name="auto_link", description="Авто-привязка по никам через админ-панель cs2red (админ)")
 @app_commands.default_permissions(administrator=True)
+@single_flight("auto_link", "⏳ Авто-привязка уже выполняется. Подождите.")
 async def auto_link(i):
     await i.response.defer(ephemeral=True)
     if not await _admin_guard(i):
@@ -3496,7 +3837,7 @@ async def run_auto_link(i, ephemeral: bool = False):
         return
 
     # Проверочный запрос: убеждаемся, что авторизация работает.
-    api.blocked_reason = ""
+    api.reset_block()
     probe = await api.cs2red_search_by_nick("__probe__", limit=1)
     if probe is None:
         if api.blocked_reason == "403" or getattr(api, "last_status", None) == 403:
@@ -4017,6 +4358,9 @@ def _taken_application_line(row: dict) -> str:
     if clan:
         line += f" · **{clan}**"
     line += f" · {_fmt_dt(row.get('taken_at'))}"
+    reason = (row.get("decision_reason") or "").strip()
+    if reason and status == "rejected":
+        line += f"\n   📝 {reason[:160]}"
     return line
 
 
@@ -4188,6 +4532,7 @@ async def _clan_sync_members(guild) -> list:
 
 @bot.tree.command(name="check_all",
                   description="Баны и муты за 2 недели у всех игроков с ролью TALENT")
+@single_flight("check_all", "⏳ /check_all уже выполняется. Подождите.")
 async def check_all(i):
     """Проверяет всех игроков с ролью TALENT на баны и муты за 2 недели.
 
@@ -4407,6 +4752,8 @@ async def collect_online_stats(members: list, progress=None):
 
 @bot.tree.command(name="check_onlineall",
                   description="Недельный онлайн игроков клана TALENT (кто < 9 ч.)")
+@single_flight("check_onlineall",
+               "⏳ /check_onlineall уже выполняется. Подождите.")
 async def check_onlineall(i):
     """Проверяет недельный онлайн всех игроков с ролью TALENT.
 
@@ -4727,6 +5074,11 @@ class CheckClanView(discord.ui.View):
             text += "\n⚠️ " + "\n⚠️ ".join(
                 f"{m.display_name}: {r}" for m, r in problems[:10])
         await safe_send(i.followup, text, ephemeral=True)
+        await audit_action(
+            i.client, "Синхронизация ролей клана", actor=i.user,
+            details=(f"Участников: {len(results)}\n"
+                     f"Изменений: {len(changed)}\n"
+                     f"Проблем: {len(problems)}"))
 
     @discord.ui.button(label="🧹 Очистить лишние роли",
                        style=discord.ButtonStyle.danger)
@@ -4776,10 +5128,15 @@ class CheckClanView(discord.ui.View):
         if problems:
             text += "\n⚠️ " + "\n⚠️ ".join(problems[:10])
         await safe_send(i.followup, text, ephemeral=True)
+        await audit_action(
+            i.client, "Очистка лишних ролей клана", actor=i.user,
+            details=(f"Снято ролей: {removed_total}\n"
+                     f"Проблем: {len(problems)}"))
 
 
 @bot.tree.command(name="check_clan",
                   description="Проверить роли клана у всех привязанных через /link")
+@single_flight("check_clan", "⏳ /check_clan уже выполняется. Подождите.")
 async def check_clan(i):
     """Ищет лишние и устаревшие роли клана, а также отсутствующие.
 
@@ -5509,6 +5866,10 @@ class GivePanelView(discord.ui.View):
                 i.client,
                 f"🛠 /give: {i.user.mention} → {self.target.mention} — "
                 f"{_moderator_permissions_text(perms)}")
+            await audit_action(
+                i.client, "Изменение прав модератора", actor=i.user,
+                target=self.target,
+                details=_moderator_permissions_text(perms))
         except Exception as e:
             await self._fail(i, e)
 
@@ -5527,6 +5888,9 @@ class GivePanelView(discord.ui.View):
                     i.client,
                     f"🛠 /give: {i.user.mention} выдал {self.target.mention} "
                     f"все права")
+                await audit_action(i.client, "Выданы все права", actor=i.user,
+                                   target=self.target,
+                                   details="Все команды модератора")
         except Exception as e:
             await self._fail(i, e)
 
@@ -5545,6 +5909,9 @@ class GivePanelView(discord.ui.View):
                     i.client,
                     f"🧹 /give: {i.user.mention} снял все права с "
                     f"{self.target.mention}")
+                await audit_action(i.client, "Сняты все права", actor=i.user,
+                                   target=self.target,
+                                   details="Модератор удалён из /moders")
         except Exception as e:
             await self._fail(i, e)
 
@@ -5601,9 +5968,77 @@ async def take(i, user: discord.Member):
             f"❌ {user.mention} лишён." if removed else "ℹ️ Уже без.",
             ephemeral=True
         )
+        if removed:
+            await audit_action(i.client, "Снят доступ модератора",
+                               actor=i.user, target=user,
+                               details="Удалён из /moders")
     except Exception as e:
         await log_error(i.client, "/take", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
+
+
+# ============================================================
+# ЖУРНАЛ АУДИТА (/audit)
+# ============================================================
+def _audit_line(row: dict) -> str:
+    """Одна строка журнала аудита."""
+    actor = row.get("actor_id")
+    target = row.get("target_id")
+    who = f"<@{actor}>" if actor else (row.get("actor_name") or "система")
+    line = (f"• `{_fmt_dt(row.get('ts'))}` · **{row.get('action') or '—'}**\n"
+            f"  кто: {who}")
+    if target:
+        line += f" · объект: <@{target}>"
+    elif row.get("target_name"):
+        line += f" · объект: {row['target_name']}"
+    details = (row.get("details") or "").strip()
+    if details:
+        line += "\n  " + details.replace("\n", " ")[:300]
+    return line
+
+
+@bot.tree.command(name="audit", description="Журнал админских действий")
+@app_commands.describe(user="Показать действия участника (кто или над кем)",
+                       limit="Сколько записей показать (1–50)")
+@app_commands.default_permissions(administrator=True)
+async def audit(i, user: discord.Member | None = None, limit: int = 15):
+    """Ephemeral-журнал: кто, когда и что сделал.
+
+    Записи пишутся в таблицу ``audit_log`` и дублируются в канал аудита.
+    Команда доступна только администраторам: в журнале бывают причины
+    отказов и служебные подробности.
+    """
+    await i.response.defer(ephemeral=True)
+    if not await _admin_guard(i):
+        return
+    try:
+        limit = max(1, min(int(limit or 15), 50))
+        rows = await audit_repo.list_entries(limit=limit)
+        if user is not None:
+            by_actor = await audit_repo.list_entries(
+                actor_id=user.id, limit=limit)
+            by_target = await audit_repo.list_entries(
+                target_id=user.id, limit=limit)
+            merged = {r["id"]: r for r in (by_actor + by_target)}
+            rows = sorted(merged.values(), key=lambda r: r["id"],
+                          reverse=True)[:limit]
+        if not rows:
+            await safe_send(i.followup, "ℹ️ Записей аудита нет.",
+                            ephemeral=True)
+            return
+        title = "🛡 Аудит действий"
+        if user is not None:
+            title += f" · {user.display_name}"
+        text = "\n".join(_audit_line(r) for r in rows)
+        embeds = _split_text_embeds(title, text)
+        await safe_send(i.followup, embeds=embeds, ephemeral=True)
+    except Exception as e:
+        await log_error(i.client, "/audit", e)
+        try:
+            await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}",
+                            ephemeral=True)
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -5909,6 +6344,9 @@ def _build_search_embed(target, summary: dict, history: list) -> discord.Embed:
         mod_id = item.get("moderator_id")
         if mod_id:
             line += f" · решил <@{mod_id}>"
+        reason = (item.get("decision_reason") or "").strip()
+        if reason and status == "rejected":
+            line += f"\n📝 {reason[:120]}"
         if used + len(line) + 1 > 1000:
             break
         lines.append(line)
@@ -5996,6 +6434,10 @@ async def activity_set(i, member: discord.Member, server: str, hours: float):
             f"✅ {member.display_name} `{server.upper()}`: {hours} ч.\n"
             f"{build_activity_bar(total, ACTIVITY_GOAL_HOURS)}", ephemeral=True
         )
+        await audit_action(i.client, "Изменение активности", actor=i.user,
+                           target=member,
+                           details=(f"Сервер: {server.upper()}\n"
+                                    f"Часы: {hours}\nSteamID: `{sid}`"))
     except Exception as e:
         await log_error(i.client, "/activity_set", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
@@ -6013,6 +6455,8 @@ async def activity_clear(i, member: discord.Member):
         p["updated_at"] = now_utc().isoformat()
         await players_repo.save_player(sid, p)
         await safe_send(i.followup, "✅ Сброшено", ephemeral=True)
+        await audit_action(i.client, "Сброс активности", actor=i.user,
+                           target=member, details=f"SteamID: `{sid}`")
     except Exception as e:
         await log_error(i.client, "/activity_clear", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
@@ -6363,7 +6807,7 @@ async def auto_sync():
     try:
         log(f"⏰ auto_sync {now_utc().isoformat()}")
         # Статус блокировки cs2red относится только к текущему запуску.
-        api.blocked_reason = ""
+        api.reset_block()
         links = await links_repo.get_all_links()
         guild = bot.get_guild(GUILD_ID)
         if not links or guild is None:
@@ -6479,7 +6923,7 @@ async def hourly_clan_sync():
     try:
         # Сбрасываем статус прошлого запуска, иначе после одного 403/429
         # каждый следующий час прерывался бы на первом игроке.
-        api.blocked_reason = ""
+        api.reset_block()
         links = await links_repo.get_all_links()
         guild = bot.get_guild(GUILD_ID)
         if not links or guild is None:
@@ -6952,6 +7396,8 @@ async def ai_clear_cache(i):
         if removed:
             await log_to_channel(i.client,
                 f"🗑 Кэш ИИ очищен командой {i.user.mention} (удалено: {removed})")
+            await audit_action(i.client, "Очистка кэша ИИ", actor=i.user,
+                               details=f"Удалено записей: {removed}")
     except Exception as e:
         await log_error(i.client, "/ai_clear_cache", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")

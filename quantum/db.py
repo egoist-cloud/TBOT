@@ -116,6 +116,7 @@ async def init_db() -> None:
             moderator_id TEXT,
             taken_by    TEXT,
             taken_at    TEXT,
+            decision_reason TEXT,
             created_at  TEXT,
             updated_at  TEXT
         );
@@ -133,9 +134,23 @@ async def init_db() -> None:
             moderator_id TEXT,
             taken_by     TEXT,
             taken_at     TEXT,
+            decision_reason TEXT,
             created_at   TEXT,
             updated_at   TEXT,
             UNIQUE(user_id, app_id)
+        );
+
+        -- Аудит админских и модераторских действий. Пишется всегда, а
+        -- копия уходит в отдельный канал (AUDIT_LOG_CHANNEL_ID).
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts          TEXT NOT NULL,
+            actor_id    TEXT,
+            actor_name  TEXT,
+            action      TEXT NOT NULL,
+            target_id   TEXT,
+            target_name TEXT,
+            details     TEXT
         );
         """
     )
@@ -150,6 +165,10 @@ async def init_db() -> None:
     await _ensure_column(db, "applications", "taken_at", "TEXT")
     await _ensure_column(db, "application_history", "taken_by", "TEXT")
     await _ensure_column(db, "application_history", "taken_at", "TEXT")
+    # Причина отказа обязательна начиная с этой версии. Колонка нужна и
+    # в текущей заявке (её показывает /check), и в истории (/search).
+    await _ensure_column(db, "applications", "decision_reason", "TEXT")
+    await _ensure_column(db, "application_history", "decision_reason", "TEXT")
     # Права модераторов по командам. Старые записи получают полный доступ,
     # чтобы обновление бота не отобрало права у уже назначенных людей.
     await _ensure_column(db, "moderators", "commands",
@@ -161,6 +180,9 @@ async def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_applications_app ON applications (app_id);
         CREATE INDEX IF NOT EXISTS idx_app_history_user ON application_history (user_id);
         CREATE INDEX IF NOT EXISTS idx_app_history_taken ON application_history (taken_by);
+        CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log (ts);
+        CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log (actor_id);
+        CREATE INDEX IF NOT EXISTS idx_audit_target ON audit_log (target_id);
         """
     )
     # Переносим текущие заявки в историю (идемпотентно: UNIQUE(user_id, app_id)).
