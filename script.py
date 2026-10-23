@@ -400,6 +400,62 @@ def _split_text_embeds(title: str, text: str, limit: int = 4000) -> list:
     return chunks or [_embed_black(title, "")]
 
 
+# Discord считает сумму текста ВСЕХ embed'ов в одном сообщении и режет
+# сообщение с ошибкой 50035 «Embed size exceeds maximum size of 6000».
+# Один embed с описанием на 3200 символов ещё проходит, а два — уже нет,
+# поэтому пачку embed'ов всегда разбиваем по фактическому размеру.
+EMBED_MSG_LIMIT = 5800       # запас до жёсткого лимита Discord (6000)
+EMBED_MSG_MAX_COUNT = 10     # максимум embed'ов в одном сообщении
+
+
+def _embed_chars(embed) -> int:
+    """Длина текста embed'а — именно её Discord суммирует для лимита 6000."""
+    if not isinstance(embed, discord.Embed):
+        return 0
+    total = len(embed.title or "") + len(embed.description or "")
+    if embed.footer and embed.footer.text:
+        total += len(embed.footer.text)
+    if embed.author and embed.author.name:
+        total += len(embed.author.name)
+    for f in embed.fields:
+        total += len(f.name or "") + len(f.value or "")
+    return total
+
+
+def _trim_embed(embed, limit: int = EMBED_MSG_LIMIT):
+    """Обрезает description, чтобы даже одиночный embed влез в лимит."""
+    if not isinstance(embed, discord.Embed):
+        return embed
+    over = _embed_chars(embed) - limit
+    if over > 0 and embed.description:
+        desc = embed.description
+        keep = max(0, len(desc) - over - 1)
+        embed.description = desc[:keep] + "…"
+    return embed
+
+
+def _batch_embeds(embeds, limit: int = EMBED_MSG_LIMIT,
+                  max_count: int = EMBED_MSG_MAX_COUNT):
+    """Группирует embed'ы в пачки по суммарному размеру и количеству.
+
+    Гарантирует, что каждая пачка пройдёт проверку Discord (сумма текста
+    всех embed'ов ≤ ``limit``, количество ≤ ``max_count``).
+    """
+    batches, current, current_len = [], [], 0
+    for e in embeds:
+        _trim_embed(e)
+        size = _embed_chars(e)
+        if current and (current_len + size > limit
+                        or len(current) >= max_count):
+            batches.append(current)
+            current, current_len = [], 0
+        current.append(e)
+        current_len += size
+    if current:
+        batches.append(current)
+    return batches
+
+
 async def safe_send(target, *args, title: str = "", retries: int = 5, **kwargs):
     """
     Отправка с retry. Уважает:
@@ -452,12 +508,39 @@ async def _safe_send_inner(target, retries, *args, **kwargs):
         for e in embs:
             if isinstance(e, discord.Embed):
                 e.color = 0x000000
+        embs = list(embs)
+        # Discord лимит: сумма текста всех embed'ов ≤ 6000 на сообщение.
+        # Если не влезает — отправляем несколькими сообщениями.
+        total = sum(_embed_chars(e) for e in embs)
+        if total > EMBED_MSG_LIMIT or len(embs) > EMBED_MSG_MAX_COUNT:
+            batches = _batch_embeds(embs)
+            for idx, batch in enumerate(batches):
+                k = dict(kwargs)
+                k["embeds"] = batch
+                # Текст и кнопки — только в первом сообщении.
+                if idx > 0:
+                    k.pop("content", None)
+                    k.pop("view", None)
+                await _safe_send_inner(target, retries, *args, **k)
+            return None
     last_exc = None
     for attempt in range(retries):
         try:
             return await target.send(*args, **kwargs)
         except discord.HTTPException as e:
             last_exc = e
+            # 50035 «Embed size exceeds maximum size of 6000»: подстраховка —
+            # отправляем embed'ы по одному, чтобы сообщение точно прошло.
+            if (e.status == 400 and getattr(e, "code", None) == 50035
+                    and kwargs.get("embeds") and len(kwargs["embeds"]) > 1):
+                for idx, one in enumerate(list(kwargs["embeds"])):
+                    k = dict(kwargs)
+                    k["embeds"] = [one]
+                    if idx > 0:
+                        k.pop("content", None)
+                        k.pop("view", None)
+                    await _safe_send_inner(target, retries, *args, **k)
+                return None
             if e.status == 429:
                 is_cloudflare = False
                 try:
@@ -5436,14 +5519,15 @@ async def _publish_links_table(guild: discord.Guild):
 
     Прежний вид логов: сначала таблица «Discord | SteamID | Клан»,
     затем embed «🚫 Не авторизованы через /link». Discord принимает
-    максимум 10 embed'ов в одном сообщении — лишние страницы режем.
+    максимум 10 embed'ов и 6000 символов суммарно на сообщение —
+    ``safe_send`` сам разбивает пачки по фактическому размеру.
     """
     ch = bot.get_channel(LOG_CHANNEL_ID) if LOG_CHANNEL_ID else None
     if ch is None:
         return
     try:
         embeds = await build_auto_sync_embeds(guild)
-        await safe_send(ch, embeds=embeds[:10])
+        await safe_send(ch, embeds=embeds)
     except Exception as e:
         await log_error(bot, "_publish_links_table", e)
 
