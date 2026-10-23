@@ -861,6 +861,136 @@ def parse_activity_html(html: str):
 
 
 # ============================================================
+# АКТИВНОСТЬ: расчёт из JSON админ-профиля cs2red
+# ============================================================
+# Раньше активность парсилась из HTML /admin/user/<id>, но это SPA:
+# в HTML лежит только пустой каркас, а данные приходят отдельным
+# запросом GET /api/admin/user?userId=<id>. Там же, в user.Activity,
+# лежит готовая статистика по режимам, а в user.admin_reports — репорты.
+ACTIVITY_DAYS = ("monday", "tuesday", "wednesday", "thursday",
+                 "friday", "saturday", "sunday")
+MSK_OFFSET = 3 * 3600          # Москва = UTC+3 (без перехода на летнее время)
+DAY_SECONDS = 86400
+WEEK_SECONDS = 7 * DAY_SECONDS
+
+
+def _safe_int(value, default: int = 0) -> int:
+    """int() с поддержкой строк/float из JSON (``"123.0"``, ``123.0``)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError, OverflowError):
+            return default
+
+
+def msk_week_start(ts, weeks_ago: int = 0) -> int:
+    """Начало недели по МСК (понедельник 00:00) — как считает cs2red.
+
+    ``weeks_ago=0`` — текущая неделя, ``1`` — прошлая. Формула повторяет
+    JS-код сайта: ``(day - (day + 3) % 7) * 86400 - weeks * 604800 - 10800``.
+    """
+    moment = _safe_int(ts, int(time.time()))
+    shifted = moment + MSK_OFFSET
+    day = shifted // DAY_SECONDS
+    monday = (day - (day + 3) % 7) * DAY_SECONDS
+    return int(monday - weeks_ago * WEEK_SECONDS - MSK_OFFSET)
+
+
+def _seconds(value) -> int:
+    """Неотрицательные секунды из поля JSON (битые/None -> 0)."""
+    try:
+        return max(0, int(float(value or 0)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def parse_activity_json(user: dict, now: float | None = None) -> dict | None:
+    """Считает недельную активность из JSON ``/api/admin/user``.
+
+    Структура ответа (проверено по JS-бандлу админки):
+
+    * ``user.Activity`` — массив по режимам; в каждом ``gamemodeId``,
+      ``monday..sunday`` и ``last_monday..last_sunday`` — секунды;
+      ``spectator``/``last_spectator`` — тоже секунды;
+    * ``user.admin_reports`` — рассмотренные репорты, время записи —
+      ``timestamp_result`` или ``timestamp``.
+
+    Возвращает словарь с часами в ``week``/``prev``, количеством репортов
+    и разбивкой по режимам, либо ``None``, если данных активности нет.
+    """
+    if not isinstance(user, dict):
+        return None
+    raw_activity = user.get("Activity")
+    if raw_activity is None:
+        raw_activity = user.get("activity")
+    if not isinstance(raw_activity, list):
+        return None
+
+    now = time.time() if now is None else float(now)
+    week_start = msk_week_start(now, 0)
+    prev_start = msk_week_start(now, 1)
+
+    week_seconds = prev_seconds = 0
+    observer_seconds = prev_observer_seconds = 0
+    modes = []
+
+    for item in raw_activity:
+        if not isinstance(item, dict):
+            continue
+        cur = sum(_seconds(item.get(day)) for day in ACTIVITY_DAYS)
+        prev = sum(_seconds(item.get("last_" + day)) for day in ACTIVITY_DAYS)
+        cur_obs = _seconds(item.get("spectator"))
+        prev_obs = _seconds(item.get("last_spectator"))
+        week_seconds += cur
+        prev_seconds += prev
+        observer_seconds += cur_obs
+        prev_observer_seconds += prev_obs
+
+        # Нулевые режимы в разбивку не тащим — иначе поле забьётся пустотой.
+        if any((cur, prev, cur_obs, prev_obs)):
+            modes.append({
+                "gamemode_id": _safe_int(item.get("gamemodeId")),
+                "week": cur / 3600,
+                "prev": prev / 3600,
+                "observer": cur_obs / 3600,
+                "prev_observer": prev_obs / 3600,
+                "seconds": cur,
+            })
+    modes.sort(key=lambda m: m["week"], reverse=True)
+
+    raw_reports = user.get("admin_reports")
+    if not isinstance(raw_reports, list):
+        raw_reports = []
+    rep_week = rep_prev = 0
+    for rec in raw_reports:
+        if not isinstance(rec, dict):
+            continue
+        ts = _safe_int(rec.get("timestamp_result") or rec.get("timestamp"))
+        if not ts:
+            continue
+        if ts >= week_start:
+            rep_week += 1
+        elif ts >= prev_start:
+            rep_prev += 1
+
+    return {
+        "week": {"total": week_seconds / 3600,
+                 "observer": observer_seconds / 3600,
+                 "seconds": week_seconds},
+        "prev": {"total": prev_seconds / 3600,
+                 "observer": prev_observer_seconds / 3600,
+                 "seconds": prev_seconds},
+        "reports": {"week": rep_week, "prev": rep_prev,
+                    "total": len(raw_reports)},
+        "modes": modes,
+        "week_start": week_start,
+        "prev_start": prev_start,
+    }
+
+
+# ============================================================
 # API: cs2red / Steam
 # ============================================================
 class API:
@@ -880,6 +1010,8 @@ class API:
         self.cs2red: aiohttp.ClientSession | None = None
         self.sem = asyncio.Semaphore(4)
         self._clans_cache = {"ts": 0.0, "data": None}
+        # Названия режимов (gamemodeId) для разбивки активности.
+        self._categories_cache = {"ts": 0.0, "data": None}
         self.last_status: int | None = None
         # Анти-DDoS: последовательный крановой протокол к cs2red.
         self._rate_lock = asyncio.Lock()
@@ -1173,6 +1305,32 @@ class API:
         self._clans_cache = {"ts": ts, "data": clans}
         return clans
 
+    async def cs2red_categories(self) -> dict:
+        """Названия режимов ``gamemodeId -> имя`` для разбивки активности.
+
+        Справочник меняется редко, поэтому кэшируем на час. Если запрос
+        не удался, возвращаем то, что уже было (или пустой словарь).
+        """
+        ts = asyncio.get_event_loop().time()
+        cached = self._categories_cache
+        if (cached["data"] is not None
+                and ts - cached["ts"] < 3600):
+            return cached["data"]
+        data = await self._get_json("https://cs2red.ru/api/data/servers")
+        if not isinstance(data, dict):
+            return cached["data"] or {}
+        names = {}
+        for cat in (data.get("categories") or []):
+            if not isinstance(cat, dict):
+                continue
+            cid = self._as_int(cat.get("id"))
+            name = (cat.get("categoryName") or cat.get("categoryShort")
+                    or cat.get("slug") or "")
+            if cid and name:
+                names[cid] = str(name).strip()
+        self._categories_cache = {"ts": ts, "data": names}
+        return names
+
     async def player_clan(self, steam_id: str):
         user = await self.cs2red_user(steam_id)
         if not user or user.get("_not_found") or not user.get("id"):
@@ -1217,27 +1375,42 @@ class API:
     # ---------- блокировки (баны/муты) ----------
     @staticmethod
     def _as_int(value, default: int = 0) -> int:
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return default
+        return _safe_int(value, default)
 
     @classmethod
     def normalize_block(cls, raw: dict, kind: str = "Бан",
-                        from_admin: bool = False) -> dict:
+                        from_admin: bool = False,
+                        player: dict | None = None) -> dict:
         """Приводит запись бана/мута cs2red к единому виду.
 
         Публичный API отдаёт заблокированного игрока в ``action``, а того,
         кто выдал блокировку, — в ``user`` (у автоматических банов ``user``
-        пустой). Админ-API возвращает те же поля, поэтому структура общая.
+        пустой).
+
+        В админ-профиле (``/api/admin/user``) забаненный игрок может не
+        дублироваться в записи — он известен из самого профиля. Такой
+        объект передаётся в ``player``. Если же ``action`` есть, он
+        приоритетнее.
+
+        ``player`` — подсказка ``{"id", "nick", "steamid64"}`` профиля.
         """
         raw = raw if isinstance(raw, dict) else {}
-        player = raw.get("action") if isinstance(raw.get("action"), dict) else {}
-        if not player and isinstance(raw.get("player"), dict):
-            player = raw["player"]
+        raw_player = raw.get("action") if isinstance(raw.get("action"), dict) else {}
+        if not raw_player and isinstance(raw.get("player"), dict):
+            raw_player = raw["player"]
+        known_player = player if isinstance(player, dict) else {}
+        player_info = raw_player or known_player
+
         admin = raw.get("user") if isinstance(raw.get("user"), dict) else {}
         if not admin and isinstance(raw.get("admin"), dict):
             admin = raw["admin"]
+
+        # Защита от перепутанных полей: если «user» — это сам забаненный,
+        # значит выдавшего в записи нет и показывать игрока как админа нельзя.
+        if (admin and player_info
+                and cls._as_int(admin.get("id")) > 0
+                and cls._as_int(admin.get("id")) == cls._as_int(player_info.get("id"))):
+            admin = {}
 
         start_ts = cls._as_int(raw.get("timestamp") or raw.get("time") or raw.get("date"))
         end_ts = cls._as_int(raw.get("endTimeStamp") or raw.get("endTime")
@@ -1263,15 +1436,18 @@ class API:
             else:
                 admin_nick = f"ID {admin_id}"
 
-        steam = str(player.get("steamid64") or raw.get("steamid64")
-                    or raw.get("steam_id") or "").strip()
+        steam = str(player_info.get("steamid64") or raw.get("steamid64")
+                    or raw.get("steam_id") or known_player.get("steamid64")
+                    or "").strip()
+        nick = str(player_info.get("nick") or raw.get("nick")
+                   or known_player.get("nick") or "—").strip() or "—"
         return {
             "id": raw.get("id") or raw.get("actionId"),
             "kind": "Мут" if kind.upper().startswith("МУТ") else "Бан",
             "active": active,
-            "player_nick": str(player.get("nick") or raw.get("nick") or "—").strip() or "—",
+            "player_nick": nick,
             "steam_id": steam if steam.isdigit() else "",
-            "player_id": cls._as_int(player.get("id")),
+            "player_id": cls._as_int(player_info.get("id")),
             "reason": reason,
             "start_ts": start_ts,
             "end_ts": end_ts,
@@ -1317,22 +1493,28 @@ class API:
         if user.get("_not_found"):
             return [], [], "not_found"
         uid = self._as_int(user.get("id"))
+        player_hint = {"id": uid, "steamid64": steam_id,
+                       "nick": user.get("nick")}
 
         bans: list = []
         mutes: list = []
         got = {"bans": False, "mutes": False}
 
         full = await self.cs2red_full_user(steam_id, user=user)
-        if isinstance(full, dict):
+        admin_profile = isinstance(full, dict)
+        if admin_profile:
             for key, kind, target in (("bans", "Бан", bans), ("mutes", "Мут", mutes)):
                 source = full.get(key)
                 if isinstance(source, list):
                     target.extend(
-                        self.normalize_block(x, kind, from_admin=True) for x in source)
+                        self.normalize_block(x, kind, from_admin=True,
+                                             player=player_hint) for x in source)
                     got[key] = True
 
         # В админ-профиле может не быть одного из массивов — тогда идём
-        # в публичный список (поиск работает при cookie сессии).
+        # в публичный список. Важно: пустой ответ публичного поиска НЕ
+        # доказывает отсутствие блокировок (без сессии фильтр может
+        # игнорироваться), поэтому в этом случае честно сообщаем об ошибке.
         if not got["bans"]:
             bans, err1 = await self._public_blocks(steam_id, "BANS", uid)
             if err1:
@@ -1341,6 +1523,9 @@ class API:
             mutes, err2 = await self._public_blocks(steam_id, "MUTES", uid)
             if err2:
                 return [], [], err2
+
+        if not admin_profile and not bans and not mutes:
+            return [], [], "unavailable"
 
         for blocks in (bans, mutes):
             blocks.sort(key=lambda b: b.get("start_ts") or 0, reverse=True)
@@ -1378,41 +1563,52 @@ class API:
         return result
 
     async def cs2red_activity(self, steam_id: str):
-        """Активность игрока со страницы ``/admin/user/<id>`` (вкладка «Активность»).
+        """Активность игрока из JSON админ-профиля cs2red.
+
+        Страница ``/admin/user/<id>`` — SPA: в HTML данных нет, всё лежит
+        в ``GET /api/admin/user?userId=<id>``. Берём оттуда ``user.Activity``
+        и ``user.admin_reports`` (см. :func:`parse_activity_json`).
 
         Возвращает ``(data | None, error)``. ``data`` — словарь вида::
 
             {
               "nick": "Nick",
               "internal_id": 8081,
-              "week": {"total": 26.0, "observer": 0.33},   # часы/доли часа
+              "week": {"total": 26.0, "observer": 0.33},   # часы
               "prev": {"total": 12.0, "observer": 0.0},
               "reports": {"week": 3, "prev": 1, "total": 9},
-              "raw": "…"   # отладочный текст блока (для диагностики)
+              "modes": [{"gamemode_id": 1, "name": "PUBLIC", ...}],
             }
 
-        ``error``: ``""`` при успехе, иначе «не найден», «403 …», «429 …»,
-        «нет bs4», «нет данных активности» и т.п.
+        ``error``: ``""`` при успехе, иначе «не найден», «недоступен
+        профиль» и т.п.
         """
-        if not _HAS_BS4:
-            return None, "нет bs4 (beautifulsoup4 не установлен)"
-        internal_id, user, err = await self.cs2red_internal_id(steam_id)
-        if err and not internal_id:
-            return None, err
-        if not internal_id:
+        user = await self.cs2red_user(steam_id)
+        if user is None:
+            return None, "cs2red не ответил"
+        if user.get("_not_found") or not user.get("id"):
             return None, "не найден"
-        # Задержка между запросами к cs2red (анти-DDoS) — как и везде.
-        await asyncio.sleep(REQUEST_DELAY)
-        html, herr = await self._get_html(
-            f"https://cs2red.ru/admin/user/{internal_id}")
-        if not html:
-            return None, herr or "нет доступа к странице игрока"
-        data = parse_activity_html(html)
+
+        full = await self.cs2red_full_user(steam_id, user=user)
+        if not isinstance(full, dict):
+            return None, "нет доступа к профилю (проверьте cookie cs2red)"
+
+        data = parse_activity_json(full)
         if data is None:
-            return None, "нет данных активности (нет вкладки «Активность»?)"
-        data["internal_id"] = internal_id
-        if user:
-            data.setdefault("nick", user.get("nick"))
+            return None, "нет данных активности"
+
+        data["internal_id"] = self._as_int(user.get("id"))
+        data["nick"] = user.get("nick")
+
+        # Названия режимов — необязательное украшение: без них отчёт
+        # всё равно корректен, поэтому ошибку справочника игнорируем.
+        try:
+            names = await self.cs2red_categories()
+        except Exception:
+            names = {}
+        for mode in data.get("modes") or []:
+            gid = mode.get("gamemode_id") or 0
+            mode["name"] = names.get(gid) or (f"Режим {gid}" if gid else "Режим")
         return data, ""
 
     async def _steam_get(self, iface: str, params: dict):
@@ -3641,6 +3837,9 @@ async def check_mutes(i, steam_id: str):
         if err == "unavailable":
             await safe_send(i.followup, "❌ Сайт cs2red временно недоступен", ephemeral=True)
             return
+        if err == "not_found":
+            await safe_send(i.followup, "❌ Игрок не найден на cs2red.", ephemeral=True)
+            return
         active = [b for b in blocks if b.get("active")]
         nick = await _resolve_nick(sid, active or blocks)
         embeds = _build_block_embeds(active, f"🔇 Муты игрока: {nick}",
@@ -3674,6 +3873,9 @@ async def check_bans(i, steam_id: str):
                                                   timeout=CMD_API_TIMEOUT)
         if err == "unavailable":
             await safe_send(i.followup, "❌ Сайт cs2red временно недоступен", ephemeral=True)
+            return
+        if err == "not_found":
+            await safe_send(i.followup, "❌ Игрок не найден на cs2red.", ephemeral=True)
             return
         active = [b for b in (bans + mutes) if b.get("active")]
         active.sort(key=lambda b: b.get("start_ts") or 0, reverse=True)
@@ -3728,7 +3930,7 @@ async def check(i):
                 try:
                     bans, mutes, err = await asyncio.wait_for(api.cs2red_all_blocks(sid),
                                                               timeout=CMD_API_TIMEOUT)
-                    if err == "unavailable":
+                    if err:
                         errors += 1
                     else:
                         active = [b for b in (bans + mutes) if b.get("active")]
@@ -3851,7 +4053,7 @@ async def check_all(i):
                 try:
                     _bans, mutes, err = await asyncio.wait_for(
                         api.cs2red_all_blocks(sid), timeout=CMD_API_TIMEOUT)
-                    if err == "unavailable":
+                    if err:
                         errors += 1
                     else:
                         checked += 1
@@ -3953,8 +4155,10 @@ def _build_onlineall_embed(rows: list, low: list, no_link: list,
         for m, data in low[:CHECK_ALL_MAX_MEMBERS]:
             w = (data.get("week") or {}).get("total")
             p = (data.get("prev") or {}).get("total")
+            o = (data.get("week") or {}).get("observer")
+            obs = f", наблюд. {_fmt_hours(o)}" if o else ""
             lines.append(f"• {m.mention} — сейчас {_fmt_hours(w)}, "
-                         f"прошлая {_fmt_hours(p)}")
+                         f"прошлая {_fmt_hours(p)}{obs}")
         if len(low) > CHECK_ALL_MAX_MEMBERS:
             lines.append(f"…и ещё {len(low) - CHECK_ALL_MAX_MEMBERS}")
         embed.add_field(name="⚠️ Малоактивные", value="\n".join(lines)[:1024],
@@ -4041,10 +4245,10 @@ async def collect_online_stats(members: list, progress=None):
 async def check_onlineall(i):
     """Проверяет недельный онлайн всех игроков с ролью TALENT.
 
-    Для каждого берётся страница активности на cs2red: онлайн за текущую
-    и прошлую неделю и время наблюдателя. Кто наиграл меньше
-    ``ONLINE_MIN_HOURS`` (по умолчанию 9 ч.) — выводится отдельным полем.
-    Ответ ephemeral.
+    Для каждого берётся JSON админ-профиля cs2red (``user.Activity``):
+    онлайн за текущую и прошлую неделю и время наблюдателя. Кто наиграл
+    меньше ``ONLINE_MIN_HOURS`` (по умолчанию 9 ч.) — выводится отдельным
+    полем. Ответ ephemeral.
     """
     await i.response.defer(ephemeral=True)
     try:
@@ -4056,7 +4260,7 @@ async def check_onlineall(i):
         if not CS2RED_COOKIES:
             await safe_send(i.followup,
                             "❌ Нет cookie cs2red (CS2RED_COOKIE_STRING) — "
-                            "страница активности недоступна.", ephemeral=True)
+                            "профиль активности недоступен.", ephemeral=True)
             return
         members = _talent_members(guild)
         if not members:
@@ -4132,6 +4336,20 @@ def _build_activity_embed(steam_id: str, data: dict) -> discord.Embed:
               f"Всего: `{rep.get('total') if rep.get('total') is not None else '—'}`",
         inline=True)
 
+    modes = data.get("modes") or []
+    if modes:
+        lines = []
+        for mode in modes[:8]:
+            name = str(mode.get("name") or "Режим")[:40]
+            obs = mode.get("observer")
+            extra = f", наблюд. {_fmt_hours(obs)}" if obs else ""
+            lines.append(f"• {name}: `{_fmt_hours(mode.get('week'))}` "
+                         f"(прошлая `{_fmt_hours(mode.get('prev'))}`{extra})")
+        if len(modes) > 8:
+            lines.append(f"…и ещё {len(modes) - 8}")
+        embed.add_field(name="По режимам", value="\n".join(lines)[:1024],
+                        inline=False)
+
     wk = week.get("total")
     if wk is not None:
         note = ("⚠️ Ниже нормы" if wk < ONLINE_MIN_HOURS else "✅ В норме")
@@ -4147,8 +4365,8 @@ def _build_activity_embed(steam_id: str, data: dict) -> discord.Embed:
 async def activity(i, steam_id: str):
     """Показывает недельную активность игрока (эта и прошлая неделя).
 
-    ``steam_id`` — SteamID64 (17 цифр). Данные берутся со страницы
-    активности в админке cs2red. Ответ ephemeral.
+    ``steam_id`` — SteamID64 (17 цифр). Данные берутся из JSON
+    админ-профиля cs2red (``user.Activity``). Ответ ephemeral.
     """
     await i.response.defer(ephemeral=True)
     try:

@@ -218,3 +218,43 @@ def test_cs2red_blocks_not_found(monkeypatch):
     blocks, err = asyncio.run(botmod.api.cs2red_blocks(STEAM, "BANS"))
     assert blocks == []
     assert err == "not_found"
+
+
+def test_normalize_block_admin_player_hint():
+    """В админ-профиле игрок может не дублироваться — берём его из профиля."""
+    now = int(time.time())
+    raw = {
+        "id": 1, "adminId": 42, "reason": "test",
+        "timestamp": now - 60, "endTimeStamp": 0,
+        "user": {"id": 42, "nick": "lilcom"},
+    }
+    hint = {"id": 7, "nick": "sllletron", "steamid64": STEAM}
+    block = botmod.API.normalize_block(raw, "Бан", from_admin=True,
+                                       player=hint)
+    assert block["player_nick"] == "sllletron"
+    assert block["steam_id"] == STEAM
+    assert block["player_id"] == 7
+    assert block["admin"] == "lilcom"
+    assert block["active"] is True
+    assert block["end_ts"] == 0  # навсегда
+
+
+def test_normalize_block_user_equal_player_is_not_admin():
+    """Если API положил самого игрока в user — не выдаём его за админа."""
+    raw = {
+        "id": 1, "reason": "test", "timestamp": int(time.time()),
+        "endTimeStamp": 0,
+        "user": {"id": 7, "nick": "sllletron"},
+        "action": {"id": 7, "nick": "sllletron", "steamid64": STEAM},
+    }
+    block = botmod.API.normalize_block(raw, "Мут")
+    assert block["player_nick"] == "sllletron"
+    assert block["admin"] == "Система"
+
+
+def test_normalize_block_expired_is_inactive():
+    now = int(time.time())
+    raw = {"id": 1, "timestamp": now - 1000, "endTimeStamp": now - 10,
+           "action": {"id": 7, "nick": "x", "steamid64": STEAM}}
+    block = botmod.API.normalize_block(raw, "Бан")
+    assert block["active"] is False
