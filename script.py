@@ -2745,6 +2745,22 @@ class ClanView(discord.ui.View):
 # ============================================================
 PUBLIC_COMMANDS = {"link", "unlink", "ping", "health", "lookup", "ask", "rules"}
 
+# Команды, которые нельзя делегировать через /give: они управляют доступом
+# или меняют данные опаснее, чем обычная модерация. Проверка прав внутри
+# самих команд остаётся, но панель их не показывает.
+ADMIN_ONLY_COMMANDS = {
+    "give", "take", "admlink", "auto_link", "sync_all", "export_members",
+    "link_all", "player_list", "player_note", "ai_clear_cache", "panel",
+    "activity_set", "activity_clear",
+}
+
+# Команды, которые админ может выдать модератору. Порядок = порядок в меню.
+MODERATOR_COMMANDS = [
+    "check", "check_all", "check_bans", "check_mutes", "check_clan",
+    "check_onlineall", "activity", "activity_all", "activity_show",
+    "search", "player_info", "clan_info", "status", "admins", "moders",
+]
+
 
 class MyBot(commands.Bot):
     def __init__(self):
@@ -2757,8 +2773,25 @@ class MyBot(commands.Bot):
         cmd = getattr(i, "command", None)
         if cmd is None or cmd.name in PUBLIC_COMMANDS:
             return True
-        if not await is_moderator(i.user.id, i.guild) and not i.response.is_done():
-            await i.response.send_message("❌ Нет доступа.", ephemeral=True)
+        if not await is_moderator(i.user.id, i.guild):
+            if not i.response.is_done():
+                await i.response.send_message("❌ Нет доступа.", ephemeral=True)
+            return False
+        # Администраторы сервера не ограничены списком команд модератора.
+        if admin_only(i):
+            return True
+        # Даже при полном доступе ("*") служебные команды остаются админскими.
+        if cmd.name in ADMIN_ONLY_COMMANDS:
+            if not i.response.is_done():
+                await i.response.send_message(
+                    "❌ Эта команда только для администраторов.", ephemeral=True)
+            return False
+        if not await moderation_repo.has_command_access(i.user.id, cmd.name):
+            if not i.response.is_done():
+                await i.response.send_message(
+                    "❌ Нет доступа к этой команде. "
+                    "Попросите администратора выдать её в /give.",
+                    ephemeral=True)
             return False
         return True
 
@@ -2935,6 +2968,13 @@ async def on_member_join(member):
         if len(users) == 1:
             steam_id = api.extract_steam64(users[0])
             if steam_id:
+                # Не перехватываем SteamID, уже привязанный к другому Discord:
+                # иначе смена ника на сервере позволяла бы увести чужую привязку.
+                owner = await links_repo.get_owner_of(steam_id)
+                if owner and str(owner) != str(member.id):
+                    log(f"🐣 on_member_join {member.display_name}: SteamID `{steam_id}` "
+                        f"уже привязан к {owner} — автопривязка пропущена")
+                    return
                 await links_repo.add_link(member.id, steam_id)
                 c_nick = users[0].get("nick") or nick
                 log(f"✅ Автопривязка при входе: {member.display_name} → `{steam_id}` "
@@ -3082,10 +3122,16 @@ async def unlink(i):
 @app_commands.describe(user="Участник Discord", steam_id="SteamID64 (17 цифр)")
 @app_commands.default_permissions(administrator=True)
 async def admlink(i, user: discord.Member, steam_id: str):
+    """Админская привязка: переносит SteamID у старого владельца и синхронизирует роли.
+
+    Обычный ``add_link`` падал с UNIQUE constraint, если SteamID уже был
+    привязан к другому Discord (например, игрок перешёл на новый аккаунт).
+    Здесь привязка переносится, а роли обновляются сразу.
+    """
     await i.response.defer(ephemeral=True)
     if not await _admin_guard(i):
         return
-    steam_id = steam_id.strip()
+    steam_id = (steam_id or "").strip()
     if not (steam_id.isdigit() and len(steam_id) == 17 and steam_id.startswith("7656119")):
         await safe_send(i.followup, "❌ Неверный SteamID (ожидается SteamID64 из 17 цифр, "
                                     "начинающийся с 7656119).", ephemeral=True)
@@ -3094,9 +3140,53 @@ async def admlink(i, user: discord.Member, steam_id: str):
         if user.bot:
             await safe_send(i.followup, "❌ Нельзя привязать бота.", ephemeral=True)
             return
-        # Проверяем, есть ли уже привязка (для информативного лога).
+
+        # Данные cs2red нужны для ника и синхронизации ролей. Если сайт
+        # недоступен, привязку всё равно сохраняем — команда админская.
+        user_info, user_err = None, ""
+        try:
+            user_info = await asyncio.wait_for(
+                api.cs2red_user(steam_id), timeout=CMD_API_TIMEOUT)
+        except asyncio.TimeoutError:
+            user_err = "cs2red не ответил вовремя"
+        if user_info is None:
+            user_err = user_err or "cs2red не ответил"
+        elif user_info.get("_not_found"):
+            user_err = "игрок не найден на cs2red"
+            user_info = None
+        elif not user_info.get("id"):
+            user_err = "некорректный ответ cs2red"
+            user_info = None
+
         was_linked = await links_repo.get_link(user.id)
-        await links_repo.add_link(user.id, steam_id)
+        # steam_id уникален: если он за другим Discord, переносим привязку.
+        previous = await links_repo.transfer_link(user.id, steam_id)
+
+        sync_lines = []
+        if i.guild is None:
+            sync_lines.append("⚠️ команда вне сервера: роли не изменены")
+        elif user_info is None:
+            sync_lines.append(f"⚠️ {user_err}: роли не изменены")
+        else:
+            try:
+                sync_lines.append(await sync_role_by_id(
+                    i.guild, user, steam_id, user=user_info))
+            except Exception as e:
+                sync_lines.append("⚠️ роль по cs2red не синхронизирована")
+                await log_error(i.client, "/admlink.role", e)
+            try:
+                sync_lines.append(await sync_clan_role_by_id(
+                    i.guild, user, steam_id, user=user_info))
+            except Exception as e:
+                sync_lines.append("⚠️ роль клана не синхронизирована")
+                await log_error(i.client, "/admlink.clan", e)
+
+        if previous:
+            action = f"перенесена от <@{previous}>"
+        elif was_linked:
+            action = "обновлена"
+        else:
+            action = "создана"
 
         embed = discord.Embed(
             title="✅ Админ-привязка",
@@ -3105,20 +3195,19 @@ async def admlink(i, user: discord.Member, steam_id: str):
         )
         embed.add_field(name="Пользователь", value=user.mention, inline=True)
         embed.add_field(name="Steam ID", value=f"`{steam_id}`", inline=True)
-        embed.add_field(name="Действие",
-                        value="Привязка обновлена" if was_linked else "Привязка создана",
+        embed.add_field(name="Ник на cs2red",
+                        value=((user_info or {}).get("nick") or "—")[:1024],
+                        inline=True)
+        embed.add_field(name="Действие", value=action, inline=False)
+        embed.add_field(name="Роли", value=("\n".join(sync_lines) or "—")[:1024],
                         inline=False)
         embed.set_footer(text=f"Выполнил: {i.user.display_name}")
 
-        await safe_send(i.followup,
-            f"✅ Пользователь {user.mention} успешно привязан к Steam ID: `{steam_id}`.",
-            ephemeral=True
-        )
         await safe_send(i.followup, embed=embed, ephemeral=True)
         await log_to_channel(i.client,
-            f"🔗 /admlink: {user.mention} ({user.id}) "
-            f"{'обновлён' if was_linked else 'привязан'} → `{steam_id}` "
-            f"от {i.user.mention}")
+            f"🔗 /admlink: {user.mention} ({user.id}) → `{steam_id}` "
+            f"({action}) от {i.user.mention}\n"
+            + "\n".join(sync_lines))
     except Exception as e:
         await log_error(i.client, "/admlink", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
@@ -4951,7 +5040,18 @@ async def health(i: discord.Interaction):
 # ============================================================
 # МОДЕРАТОРЫ
 # ============================================================
-@bot.tree.command(name="moders", description="Список модераторов бота")
+def _moderator_permissions_text(commands) -> str:
+    """Короткое описание прав модератора для /moders и панели."""
+    if commands is None:
+        return "—"
+    if "*" in commands:
+        return "все команды"
+    if not commands:
+        return "нет команд"
+    return ", ".join(f"`/{c}`" for c in commands)
+
+
+@bot.tree.command(name="moders", description="Список модераторов и их команд")
 async def moders(i):
     await i.response.defer(ephemeral=True)
     try:
@@ -4963,12 +5063,14 @@ async def moders(i):
         for u in mods:
             member = i.guild.get_member(int(u)) if str(u).isdigit() else None
             target = member or bot.get_user(int(u)) if str(u).isdigit() else None
+            perms = _moderator_permissions_text(
+                await moderation_repo.get_moderator_commands(u))
             if member:
-                lines.append(f"• {member.mention}")
+                lines.append(f"• {member.mention} — {perms}")
             elif target:
-                lines.append(f"• @{target.display_name} (ник хоста: {target.display_name})")
+                lines.append(f"• @{target.display_name} — {perms}")
             else:
-                lines.append(f"• `{u}`")
+                lines.append(f"• `{u}` — {perms}")
         await safe_send(i.followup, f"🛠 ({len(mods)}):\n" + "\n".join(lines),
                         title="🛠 Список модераторов", ephemeral=True)
     except Exception as e:
@@ -4976,18 +5078,279 @@ async def moders(i):
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
 
 
-@bot.tree.command(name="give", description="Выдать доступ")
-async def give(i, user: discord.Member):
-    if not admin_only(i):
-        await i.response.send_message("❌", ephemeral=True)
-        return
-    await i.response.defer(ephemeral=True)
-    try:
-        added = await moderation_repo.add_moderator(user.id)
-        await safe_send(i.followup,
-            f"✅ {user.mention} получил доступ." if added else "ℹ️ Уже есть.",
-            ephemeral=True
+class GiveUserSelect(discord.ui.UserSelect):
+    """Выбор участника, которому выдаём доступ."""
+
+    def __init__(self, panel):
+        super().__init__(
+            placeholder="Выберите участника",
+            min_values=1,
+            max_values=1,
+            row=0,
         )
+        self.panel = panel
+
+    async def callback(self, i):
+        await self.panel.pick_user(i, self.values[0])
+
+
+class GiveCommandsSelect(discord.ui.Select):
+    """Мульти-выбор команд, доступных выбранному модератору."""
+
+    def __init__(self, panel):
+        options = []
+        for name in MODERATOR_COMMANDS:
+            cmd = bot.tree.get_command(name)
+            desc = (getattr(cmd, "description", "") or "").strip()
+            options.append(discord.SelectOption(
+                label=f"/{name}"[:100],
+                value=name,
+                description=desc[:100] or None,
+                default=name in panel.selected,
+            ))
+        super().__init__(
+            placeholder="Команды, которые можно использовать",
+            min_values=0,
+            max_values=len(options),
+            options=options,
+            row=1,
+        )
+        self.panel = panel
+
+    async def callback(self, i):
+        await self.panel.pick_commands(i, self.values)
+
+
+class GivePanelView(discord.ui.View):
+    """Панель /give: участник + команды + «все»/«очистить».
+
+    Панель эфемерная и управляется только тем админом, который её открыл.
+    Кнопки «Все права» и «Очистить» применяются сразу, ручной выбор команд
+    сохраняется кнопкой «Сохранить».
+    """
+
+    def __init__(self, owner_id: int, target=None, permissions=None):
+        super().__init__(timeout=900)
+        self.owner_id = int(owner_id)
+        self.target = target
+        self.is_moderator = permissions is not None
+        self.selected = self._selection_from(permissions)
+        self.user_select = GiveUserSelect(self)
+        self.command_select = GiveCommandsSelect(self)
+        self.add_item(self.user_select)
+        self.add_item(self.command_select)
+        self._refresh()
+
+    @staticmethod
+    def _selection_from(permissions) -> set:
+        if permissions is None or "*" in permissions:
+            return set(MODERATOR_COMMANDS)
+        return {c for c in permissions if c in MODERATOR_COMMANDS}
+
+    @property
+    def all_selected(self) -> bool:
+        return self.selected >= set(MODERATOR_COMMANDS)
+
+    async def _guard(self, i) -> bool:
+        if i.user.id != self.owner_id:
+            await i.response.send_message(
+                "❌ Это меню открыл другой администратор.", ephemeral=True)
+            return False
+        perms = getattr(i.user, "guild_permissions", None)
+        if not (perms and perms.administrator):
+            await i.response.send_message("❌ Нужны права администратора.",
+                                          ephemeral=True)
+            return False
+        return True
+
+    async def _fail(self, i, exc):
+        """Ошибка панели: пишем в лог и отвечаем админу, не роняя interaction."""
+        await log_error(i.client, "/give", exc)
+        try:
+            if i.response.is_done():
+                await i.followup.send(f"❌ Ошибка: {str(exc)[:200]}",
+                                      ephemeral=True)
+            else:
+                await i.response.send_message(f"❌ Ошибка: {str(exc)[:200]}",
+                                              ephemeral=True)
+        except Exception:
+            pass
+
+    def _refresh(self):
+        self.user_select.placeholder = (
+            f"Выбран: {self.target.display_name}" if self.target
+            else "Выберите участника")[:150]
+        for option in self.command_select.options:
+            option.default = option.value in self.selected
+
+    def build_embed(self) -> discord.Embed:
+        e = discord.Embed(title="🛠 Доступ модератора", color=0x000000,
+                          timestamp=now_utc())
+        if self.target:
+            e.add_field(name="Пользователь",
+                        value=f"{self.target.mention}\n`{self.target.id}`",
+                        inline=False)
+            status = "✅ есть в /moders" if self.is_moderator else "❌ не модератор"
+        else:
+            e.add_field(name="Пользователь",
+                        value="не выбран — выберите в меню ниже",
+                        inline=False)
+            status = "—"
+        e.add_field(name="Статус", value=status, inline=True)
+        if self.all_selected:
+            commands = "все команды"
+        elif not self.selected:
+            commands = "нет команд"
+        else:
+            commands = "\n".join(
+                f"• `/{c}`" for c in MODERATOR_COMMANDS if c in self.selected)
+        e.add_field(name="Команды", value=commands[:1024], inline=False)
+        e.add_field(
+            name="Как пользоваться",
+            value=("1. Выберите участника.\n"
+                   "2. Отметьте команды в меню.\n"
+                   "3. Нажмите «💾 Сохранить».\n"
+                   "«➕ Все права» и «🧹 Очистить» применяются сразу."),
+            inline=False)
+        e.set_footer(text=f"Quantum • {utc_stamp()} (UTC)")
+        return e
+
+    async def _persist(self) -> bool:
+        if self.target is None:
+            return False
+        if not self.selected:
+            await moderation_repo.remove_moderator(self.target.id)
+            self.is_moderator = False
+        else:
+            payload = ["*"] if self.all_selected else sorted(self.selected)
+            await moderation_repo.set_moderator_commands(self.target.id, payload)
+            self.is_moderator = True
+        return True
+
+    async def _edit(self, i):
+        self._refresh()
+        await i.edit_original_response(embed=self.build_embed(), view=self)
+
+    async def pick_user(self, i, user):
+        try:
+            if not await self._guard(i):
+                return
+            if getattr(user, "bot", False):
+                await i.response.send_message("❌ Нельзя выдать доступ боту.",
+                                              ephemeral=True)
+                return
+            await i.response.defer()
+            self.target = user
+            permissions = await moderation_repo.get_moderator_commands(user.id)
+            self.is_moderator = permissions is not None
+            self.selected = self._selection_from(permissions)
+            await self._edit(i)
+        except Exception as e:
+            await self._fail(i, e)
+
+    async def pick_commands(self, i, values):
+        try:
+            if not await self._guard(i):
+                return
+            await i.response.defer()
+            self.selected = {v for v in values if v in MODERATOR_COMMANDS}
+            await self._edit(i)
+        except Exception as e:
+            await self._fail(i, e)
+
+    @discord.ui.button(label="💾 Сохранить", style=discord.ButtonStyle.success,
+                       row=2)
+    async def save(self, i, _button):
+        try:
+            if not await self._guard(i):
+                return
+            if self.target is None:
+                await i.response.send_message("❌ Сначала выберите участника.",
+                                              ephemeral=True)
+                return
+            await i.response.defer()
+            await self._persist()
+            await self._edit(i)
+            perms = (["*"] if self.all_selected else sorted(self.selected))
+            await log_to_channel(
+                i.client,
+                f"🛠 /give: {i.user.mention} → {self.target.mention} — "
+                f"{_moderator_permissions_text(perms)}")
+        except Exception as e:
+            await self._fail(i, e)
+
+    @discord.ui.button(label="➕ Все права", style=discord.ButtonStyle.primary,
+                       row=2)
+    async def all_rights(self, i, _button):
+        try:
+            if not await self._guard(i):
+                return
+            await i.response.defer()
+            self.selected = set(MODERATOR_COMMANDS)
+            saved = await self._persist()
+            await self._edit(i)
+            if saved:
+                await log_to_channel(
+                    i.client,
+                    f"🛠 /give: {i.user.mention} выдал {self.target.mention} "
+                    f"все права")
+        except Exception as e:
+            await self._fail(i, e)
+
+    @discord.ui.button(label="🧹 Очистить", style=discord.ButtonStyle.danger,
+                       row=2)
+    async def clear(self, i, _button):
+        try:
+            if not await self._guard(i):
+                return
+            await i.response.defer()
+            self.selected = set()
+            saved = await self._persist()
+            await self._edit(i)
+            if saved:
+                await log_to_channel(
+                    i.client,
+                    f"🧹 /give: {i.user.mention} снял все права с "
+                    f"{self.target.mention}")
+        except Exception as e:
+            await self._fail(i, e)
+
+    @discord.ui.button(label="✖ Закрыть", style=discord.ButtonStyle.secondary,
+                       row=2)
+    async def close(self, i, _button):
+        try:
+            if not await self._guard(i):
+                return
+            await i.response.defer()
+            self.stop()
+            await i.edit_original_response(content="Панель закрыта.", embed=None,
+                                           view=None)
+        except Exception as e:
+            await self._fail(i, e)
+
+
+@bot.tree.command(name="give", description="Панель доступа модератора")
+@app_commands.describe(user="Участник (необязательно — можно выбрать в панели)")
+@app_commands.default_permissions(administrator=True)
+async def give(i, user: discord.Member | None = None):
+    await i.response.defer(ephemeral=True)
+    if not await _admin_guard(i):
+        return
+    try:
+        if user is not None and user.bot:
+            await safe_send(i.followup, "❌ Нельзя выдать доступ боту.",
+                            ephemeral=True)
+            return
+        permissions = None
+        if user is not None:
+            permissions = await moderation_repo.get_moderator_commands(user.id)
+        view = GivePanelView(i.user.id, target=user, permissions=permissions)
+        await safe_send(i.followup, embed=view.build_embed(), view=view,
+                        ephemeral=True)
+        await log_to_channel(
+            i.client,
+            f"🛠 /give: панель открыл {i.user.mention}"
+            + (f" для {user.mention}" if user else ""))
     except Exception as e:
         await log_error(i.client, "/give", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")

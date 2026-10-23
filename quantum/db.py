@@ -77,7 +77,8 @@ async def init_db() -> None:
         );
 
         CREATE TABLE IF NOT EXISTS moderators (
-            discord_id TEXT PRIMARY KEY
+            discord_id TEXT PRIMARY KEY,
+            commands   TEXT NOT NULL DEFAULT '["*"]'
         );
 
         CREATE TABLE IF NOT EXISTS votes (
@@ -141,6 +142,10 @@ async def init_db() -> None:
     await _ensure_column(db, "votes", "deny_voters", "TEXT NOT NULL DEFAULT '[]'")
     await _ensure_column(db, "applications", "app_id", "TEXT")
     await _ensure_column(db, "applications", "moderator_id", "TEXT")
+    # Права модераторов по командам. Старые записи получают полный доступ,
+    # чтобы обновление бота не отобрало права у уже назначенных людей.
+    await _ensure_column(db, "moderators", "commands",
+                         """TEXT NOT NULL DEFAULT '["*"]'""")
     # Индексы — только после миграций, когда колонки точно есть.
     await db.executescript(
         """
