@@ -26,6 +26,17 @@ def test_app_id_is_embedded_into_button_custom_ids():
     print("  ok: app_id зашит в custom_id кнопок")
 
 
+def test_channel_view_has_no_take_button():
+    """В канале заявок нет «Взять» — она остаётся только в ветке."""
+    app_id = botmod._new_app_id()
+    view = botmod.ApplicationManagement(app_id, show_take=False)
+    ids = _custom_ids(view)
+    assert f"accept_btn:{app_id}" in ids
+    assert f"deny_btn:{app_id}" in ids
+    assert not any(i.startswith("take_btn") for i in ids)
+    print("  ok: в канале заявок нет кнопки «Взять»")
+
+
 def test_bans_view_has_only_ban_buttons():
     """В лог-канале у заявки только кнопки запретов, без голосования."""
     app_id = botmod._new_app_id()

@@ -21,7 +21,7 @@ async def get_active_application(user_id) -> dict | None:
     db = await get_db()
     cursor = await db.execute(
         "SELECT user_id, status, clan_name, message_id, channel_id, app_id, "
-        "created_at, updated_at FROM applications "
+        "taken_by, taken_at, created_at, updated_at FROM applications "
         "WHERE user_id = ? AND status IN ('pending', 'voting')",
         (str(user_id),),
     )
@@ -38,7 +38,8 @@ async def upsert_application(user_id, *, clan_name="", status="pending",
 
     moderator_id при новой заявке сбрасывается: пользователь мог подать
     заявку повторно, и старый решитель не должен засчитываться в его
-    статистику за новую заявку.
+    статистику за новую заявку. Вместе с ним сбрасывается ``taken_by``:
+    «Взять» относится только к конкретной заявке.
 
     Каждая новая заявка (app_id отличается от предыдущей) попадает в
     application_history — в applications хранится только последняя.
@@ -54,12 +55,14 @@ async def upsert_application(user_id, *, clan_name="", status="pending",
 
     await db.execute(
         "INSERT INTO applications (user_id, status, clan_name, message_id, "
-        "channel_id, app_id, moderator_id, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?) "
+        "channel_id, app_id, moderator_id, taken_by, taken_at, "
+        "created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?) "
         "ON CONFLICT(user_id) DO UPDATE SET "
         "status = excluded.status, clan_name = excluded.clan_name, "
         "message_id = excluded.message_id, channel_id = excluded.channel_id, "
         "app_id = excluded.app_id, moderator_id = NULL, "
+        "taken_by = NULL, taken_at = NULL, "
         "updated_at = excluded.updated_at",
         (uid, status, clan_name, message_id, channel_id, app_id, now, now),
     )
@@ -72,17 +75,20 @@ async def upsert_application(user_id, *, clan_name="", status="pending",
 
 
 async def add_history(user_id, *, clan_name="", status="pending", message_id="",
-                      channel_id="", app_id="", moderator_id=None) -> None:
+                      channel_id="", app_id="", moderator_id=None,
+                      taken_by=None, taken_at=None) -> None:
     """Добавляет запись в историю заявок (append-only)."""
     db = await get_db()
     now = _now()
     await db.execute(
         "INSERT OR IGNORE INTO application_history "
         "(user_id, clan_name, status, message_id, channel_id, app_id, "
-        "moderator_id, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "moderator_id, taken_by, taken_at, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (str(user_id), clan_name, status, message_id, channel_id, app_id,
-         str(moderator_id) if moderator_id else None, now, now),
+         str(moderator_id) if moderator_id else None,
+         str(taken_by) if taken_by else None,
+         taken_at or (now if taken_by else None), now, now),
     )
     await db.commit()
 
@@ -92,7 +98,7 @@ async def get_user_history(user_id, limit: int = 25) -> list:
     db = await get_db()
     cursor = await db.execute(
         "SELECT user_id, clan_name, status, message_id, app_id, moderator_id, "
-        "created_at, updated_at FROM application_history "
+        "taken_by, taken_at, created_at, updated_at FROM application_history "
         "WHERE user_id = ? ORDER BY id DESC LIMIT ?",
         (str(user_id), int(limit)),
     )
@@ -147,7 +153,8 @@ async def list_pending_applications() -> list:
     db = await get_db()
     cursor = await db.execute(
         "SELECT user_id, status, clan_name, message_id, channel_id, app_id, "
-        "created_at, updated_at FROM applications WHERE status = 'pending'"
+        "taken_by, taken_at, created_at, updated_at FROM applications "
+        "WHERE status = 'pending'"
     )
     rows = await cursor.fetchall()
     await cursor.close()
@@ -180,6 +187,69 @@ async def finalize_application(user_id, status: str, moderator_id=None) -> None:
         await db.commit()
     except Exception as e:
         print(f"[applications] обновить историю: {e}")
+
+
+async def mark_application_taken(app_id, moderator_id) -> bool:
+    """Запоминает, что модератор «взял» заявку.
+
+    app_id — идентификатор из кнопки; для старых заявок без app_id
+    допускается id сообщения. Возвращает True, если удалось обновить
+    хотя бы одну запись.
+    """
+    app_key = str(app_id or "").strip()
+    if not app_key:
+        return False
+    db = await get_db()
+    now = _now()
+    uid = str(moderator_id)
+    updated = False
+
+    # Новые заявки ищем по app_id; старые — по id сообщения. Условие
+    # по message_id нужно только как fallback, чтобы не задеть чужие
+    # заявки с пустым app_id.
+    for table in ("applications", "application_history"):
+        sql = (
+            f"UPDATE {table} SET taken_by = ?, taken_at = ?, updated_at = ? "
+            f"WHERE app_id = ?"
+        )
+        params = (uid, now, now, app_key)
+        cursor = await db.execute(sql, params)
+        if cursor.rowcount:
+            updated = True
+        else:
+            cursor = await db.execute(
+                f"UPDATE {table} SET taken_by = ?, taken_at = ?, updated_at = ? "
+                f"WHERE message_id = ?",
+                (uid, now, now, app_key),
+            )
+            if cursor.rowcount:
+                updated = True
+    await db.commit()
+    return updated
+
+
+async def get_taken_applications(moderator_id, limit: int | None = 50) -> list:
+    """Все заявки, которые модератор когда-либо «взял».
+
+    История хранит и активные, и завершённые заявки, поэтому /check
+    показывает полный список, а не только текущие. При ``limit=None``
+    возвращаются все записи.
+    """
+    db = await get_db()
+    sql = (
+        "SELECT user_id, clan_name, status, message_id, channel_id, app_id, "
+        "moderator_id, taken_by, taken_at, created_at, updated_at "
+        "FROM application_history WHERE taken_by = ? "
+        "ORDER BY COALESCE(taken_at, updated_at) DESC, id DESC"
+    )
+    params: tuple = (str(moderator_id),)
+    if limit is not None:
+        sql += " LIMIT ?"
+        params += (int(limit),)
+    cursor = await db.execute(sql, params)
+    rows = await cursor.fetchall()
+    await cursor.close()
+    return [dict(r) for r in rows]
 
 
 async def count_applications() -> int:
@@ -217,8 +287,8 @@ async def get_user_stats(user_id) -> dict:
       total         — принято + отклонено (всего обработано);
       clan_main     — из решённых: заявки в основной клан (CLAN_NAME);
       clan_other    — из решённых: заявки в другие кланы;
-      pending       — личные заявки «в работе»: модератор уже голосовал
-                      либо заявка закреплена за ним;
+      pending       — личные заявки «в работе»: модератор уже голосовал,
+                      взял заявку кнопкой «Взять» либо она закреплена за ним;
       pending_total — все заявки «в работе» в клане;
       in_work       — список заявок «в работе» (личные): app_id, user_id,
                       message_id, clan_name.
@@ -263,14 +333,16 @@ async def get_user_stats(user_id) -> dict:
     # 3. Все заявки «в работе».
     placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)
     cursor = await db.execute(
-        f"SELECT user_id, message_id, app_id, clan_name, moderator_id "
-        f"FROM applications WHERE status IN ({placeholders})", ACTIVE_STATUSES)
+        f"SELECT user_id, message_id, app_id, clan_name, moderator_id, "
+        f"taken_by, taken_at FROM applications "
+        f"WHERE status IN ({placeholders})", ACTIVE_STATUSES)
     active = await cursor.fetchall()
     await cursor.close()
     stats["pending_total"] = len(active)
     active_ids = {r["app_id"] for r in active if r["app_id"]}
 
-    # 4. Личные заявки в работе: модератор уже голосовал или решил заявку.
+    # 4. Личные заявки в работе: модератор уже голосовал, «взял» заявку
+    # или она закреплена за ним как за решителем (легаси).
     voted: set = set()
     if active_ids:
         cursor = await db.execute(
@@ -283,13 +355,17 @@ async def get_user_stats(user_id) -> dict:
             if uid in parse_voters(row["accept_voters"], row["deny_voters"]):
                 voted.add(row["message_id"])
     for row in active:
-        if row["app_id"] not in voted and row["moderator_id"] != uid:
+        taken_by = row["taken_by"]
+        if (row["app_id"] not in voted and row["moderator_id"] != uid
+                and taken_by != uid):
             continue
         stats["in_work"].append({
             "app_id": row["app_id"] or "",
             "user_id": row["user_id"] or "",
             "message_id": row["message_id"] or "",
             "clan_name": row["clan_name"] or "",
+            "taken_by": taken_by or "",
+            "taken_at": row["taken_at"] or "",
         })
     stats["pending"] = len(stats["in_work"])
     return stats

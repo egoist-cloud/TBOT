@@ -114,6 +114,8 @@ async def init_db() -> None:
             channel_id  TEXT,
             app_id      TEXT,
             moderator_id TEXT,
+            taken_by    TEXT,
+            taken_at    TEXT,
             created_at  TEXT,
             updated_at  TEXT
         );
@@ -129,6 +131,8 @@ async def init_db() -> None:
             channel_id   TEXT,
             app_id       TEXT,
             moderator_id TEXT,
+            taken_by     TEXT,
+            taken_at     TEXT,
             created_at   TEXT,
             updated_at   TEXT,
             UNIQUE(user_id, app_id)
@@ -142,6 +146,10 @@ async def init_db() -> None:
     await _ensure_column(db, "votes", "deny_voters", "TEXT NOT NULL DEFAULT '[]'")
     await _ensure_column(db, "applications", "app_id", "TEXT")
     await _ensure_column(db, "applications", "moderator_id", "TEXT")
+    await _ensure_column(db, "applications", "taken_by", "TEXT")
+    await _ensure_column(db, "applications", "taken_at", "TEXT")
+    await _ensure_column(db, "application_history", "taken_by", "TEXT")
+    await _ensure_column(db, "application_history", "taken_at", "TEXT")
     # Права модераторов по командам. Старые записи получают полный доступ,
     # чтобы обновление бота не отобрало права у уже назначенных людей.
     await _ensure_column(db, "moderators", "commands",
@@ -152,6 +160,7 @@ async def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_ai_cache_expires ON ai_cache (expires_at);
         CREATE INDEX IF NOT EXISTS idx_applications_app ON applications (app_id);
         CREATE INDEX IF NOT EXISTS idx_app_history_user ON application_history (user_id);
+        CREATE INDEX IF NOT EXISTS idx_app_history_taken ON application_history (taken_by);
         """
     )
     # Переносим текущие заявки в историю (идемпотентно: UNIQUE(user_id, app_id)).
@@ -162,11 +171,12 @@ async def init_db() -> None:
         await db.execute(
             "INSERT OR IGNORE INTO application_history "
             "(user_id, clan_name, status, message_id, channel_id, app_id, "
-            "moderator_id, created_at, updated_at) "
+            "moderator_id, taken_by, taken_at, created_at, updated_at) "
             "SELECT user_id, clan_name, status, message_id, channel_id, "
             "COALESCE(NULLIF(app_id, ''), "
             "'legacy-' || COALESCE(NULLIF(message_id, ''), user_id)), "
-            "moderator_id, created_at, updated_at FROM applications"
+            "moderator_id, taken_by, taken_at, created_at, updated_at "
+            "FROM applications"
         )
         await db.commit()
     except Exception as e:

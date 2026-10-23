@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Тесты проверок блокировок: /check, /check_mutes, /check_bans.
+"""Тесты проверок блокировок: /check_all, /check_mutes, /check_bans.
 
 Сеть не используется: методы API подменяются фейками.
 """
@@ -149,8 +149,24 @@ def test_filter_blocks_since_keeps_recent():
     assert undated_inactive not in kept
 
 
+def test_recent_blocks_includes_bans_and_mutes():
+    """ /check_all берёт и баны, и муты, отбрасывая старое. """
+    now = int(time.time())
+    since = now - 14 * 86400
+    bans = [
+        {"kind": "Бан", "start_ts": now - 60, "active": True},
+        {"kind": "Бан", "start_ts": now - 30 * 86400, "active": False},
+    ]
+    mutes = [
+        {"kind": "Мут", "start_ts": now - 120, "active": True},
+    ]
+    result = botmod._recent_blocks(bans, mutes, since)
+    assert [b["kind"] for b in result] == ["Бан", "Мут"]
+    assert all(b["start_ts"] >= since for b in result)
+
+
 def test_check_all_days_default():
-    # Отчёт по мутам должен охватывать 2 недели.
+    # Отчёт по обоим типам блокировок должен охватывать 2 недели.
     assert botmod.CHECK_ALL_DAYS == 14
     assert botmod.TALENT_ROLE_ID == 1448368118190837800
 

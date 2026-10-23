@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Тесты ролей клана и отчёта /check в лог-канал."""
+"""Тесты ролей клана и отчёта /check_all в лог-канал."""
 import asyncio
 import sys
 import time
@@ -83,7 +83,7 @@ def test_check_log_text_with_blocks():
 
 def test_check_log_text_empty():
     text = botmod._build_check_log_text("admin", 5, [], 1, 0)
-    assert "Активных блокировок нет" in text
+    assert "Блокировок не найдено" in text
     assert "без SteamID: 1" in text
 
 
@@ -109,6 +109,7 @@ class _FakeMember:
         self.roles = list(roles)
         self.removed = []
         self.added = []
+        self.bot = False
 
     async def remove_roles(self, *roles, reason=None):
         for role in roles:
@@ -143,6 +144,25 @@ def _fake_api(monkeypatch, clans):
 
     monkeypatch.setattr(botmod.api, "cs2red_user", fake_user)
     monkeypatch.setattr(botmod.api, "cs2red_clans", fake_clans)
+
+
+def test_clan_sync_members_includes_all_linked(monkeypatch):
+    """В /check_clan попадают все /link, даже без роли TALENT."""
+    talent = _FakeRole(botmod.TALENT_ROLE_ID, "TALENT")
+    guild = _FakeGuild([talent])
+    talent_member = _FakeMember(111, [talent])
+    linked_member = _FakeMember(222, [])
+    bot_member = _FakeMember(333, [talent])
+    bot_member.bot = True
+    guild.members = [talent_member, linked_member, bot_member]
+
+    async def fake_links():
+        return {"111": STEAM, "222": "76561198000000001"}
+
+    monkeypatch.setattr(botmod.links_repo, "get_all_links", fake_links)
+
+    members = asyncio.run(botmod._clan_sync_members(guild))
+    assert {m.id for m in members} == {111, 222}
 
 
 def test_auto_remove_role_when_left_clan(monkeypatch):

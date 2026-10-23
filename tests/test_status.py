@@ -16,6 +16,7 @@ from quantum.repositories import votes as votes_repo  # noqa: E402
 class _FakeTarget:
     """Заглушка участника Discord для сборки Embed."""
 
+    id = 777
     display_name = "Модератор"
     display_avatar = SimpleNamespace(url="https://cdn.discordapp.com/embed/avatars/1.png")
 
@@ -115,7 +116,10 @@ def test_status_embed_layout():
         "accepted": 7, "rejected": 2, "total": 9,
         "clan_main": 5, "clan_other": 2,
         "pending": 1, "pending_total": 3,
-        "in_work": [{"app_id": "abc", "user_id": "42", "message_id": "111"}],
+        "in_work": [{
+            "app_id": "abc", "user_id": "42", "message_id": "111",
+            "clan_name": "TALENT", "taken_by": "42",
+        }],
     }
     embed = botmod._build_status_embed(_FakeTarget(), stats)
 
@@ -137,7 +141,8 @@ def test_status_embed_layout():
     assert "**В работе:** 1" in status
     assert "**В работе в клане:** 3" in status
 
-    assert fields["🛠 Заявки в работе"] == "`ticket-111`"
+    assert fields["🛠 Заявки в работе"] == (
+        "`ticket-111` · <@42> · 🙋 взял · **TALENT**")
     print("  ok: embed профиля собран по формату")
 
 
@@ -150,6 +155,49 @@ def test_status_embed_empty_work_placeholder():
     fields = {f.name: f.value for f in embed.fields}
     assert fields["🛠 Заявки в работе"] == "Нет активных заявок"
     print("  ok: заглушка для пустого списка заявок")
+
+
+def test_check_embed_lists_all_taken_applications():
+    """Embed /check: активные и завершённые заявки, счётчики и футер."""
+    rows = [
+        {"app_id": "a1", "user_id": "41", "message_id": "m1",
+         "clan_name": "TALENT", "status": "pending",
+         "taken_at": "2026-10-23T10:00:00+00:00"},
+        {"app_id": "a2", "user_id": "42", "message_id": "m2",
+         "clan_name": "OTHER", "status": "accepted",
+         "taken_at": "2026-10-22T10:00:00+00:00"},
+    ]
+    embed = botmod._build_taken_applications_embed(_FakeTarget(), rows)
+
+    assert embed.color.value == 0
+    assert embed.title == "📋 Заявки, которые взял Модератор"
+    assert "Всего взято: **2**" in embed.description
+    assert "активных сейчас: **1**" in embed.description
+    fields = {f.name: f.value for f in embed.fields}
+    assert "`ticket-m1` · <@41>" in fields["📜 Список"]
+    assert "`ticket-m2` · <@42>" in fields["📜 Список"]
+    assert "Quantum" in embed.footer.text
+    print("  ok: /check показывает все взятые заявки")
+
+
+def test_check_embeds_split_many_applications():
+    """Длинный список /check делится на несколько embed'ов, а не режется."""
+    rows = [{
+        "app_id": f"a{i}", "user_id": str(1000 + i),
+        "message_id": f"m{i}", "clan_name": "TALENT",
+        "status": "pending",
+        "taken_at": "2026-10-23T10:00:00+00:00",
+    } for i in range(45)]
+    embeds = botmod._build_taken_applications_embeds(_FakeTarget(), rows)
+
+    assert len(embeds) == 3, len(embeds)
+    assert "Всего взято: **45**" in embeds[0].description
+    assert "Продолжение" in embeds[1].description
+    for embed in embeds:
+        assert embed.color.value == 0
+        list_field = next(f for f in embed.fields if f.name == "📜 Список")
+        assert len(list_field.value) <= 1024
+    print("  ok: /check делит длинный список на несколько embed'ов")
 
 
 def test_stats_split_by_clan():
@@ -186,6 +234,77 @@ def test_stats_split_by_clan():
 
     asyncio.run(scenario())
     print("  ok: заявки разбиты по кланам")
+
+
+def test_taken_application_counts_in_work():
+    """Заявка, которую модератор взял, видна в /status без голоса."""
+    async def scenario():
+        await init_db()
+        try:
+            await _seed("take001", 9501, "pending", None)
+            ok = await applications_repo.mark_application_taken("take001", 808)
+            assert ok is True
+
+            stats = await applications_repo.get_user_stats(808)
+            assert stats["pending"] == 1, stats
+            item = stats["in_work"][0]
+            assert item["taken_by"] == "808", item
+            assert item["taken_at"], item
+
+            # Другой модератор эту заявку в работе не видит.
+            other = await applications_repo.get_user_stats(809)
+            assert other["pending"] == 0, other
+        finally:
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: взятая заявка попадает в /status")
+
+
+def test_get_taken_applications_keeps_active_and_finished():
+    """История /check хранит и активные, и завершённые взятые заявки."""
+    async def scenario():
+        await init_db()
+        try:
+            await _seed("take101", 9601, "pending", None)
+            await applications_repo.mark_application_taken("take101", 909)
+            await applications_repo.finalize_application(
+                9601, "accepted", moderator_id=909)
+
+            await _seed("take102", 9602, "pending", None)
+            await applications_repo.mark_application_taken("take102", 909)
+
+            rows = await applications_repo.get_taken_applications(909)
+            by_app = {r["app_id"]: r for r in rows}
+            assert by_app["take101"]["status"] == "accepted"
+            assert by_app["take102"]["status"] == "pending"
+            assert by_app["take101"]["taken_by"] == "909"
+        finally:
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: /check видит активные и завершённые заявки")
+
+
+def test_mark_taken_falls_back_to_message_id():
+    """Для старой заявки без app_id «Взять» ищет по id сообщения."""
+    async def scenario():
+        await init_db()
+        try:
+            await applications_repo.upsert_application(
+                9701, clan_name="TALENT", status="pending",
+                message_id="777", channel_id="888",
+                app_id="legacy-777")
+            ok = await applications_repo.mark_application_taken("777", 1001)
+            assert ok is True
+
+            rows = await applications_repo.get_taken_applications(1001)
+            assert any(r["message_id"] == "777" for r in rows), rows
+        finally:
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: старая заявка берётся по message_id")
 
 
 def test_stats_in_work_list_contains_ids():

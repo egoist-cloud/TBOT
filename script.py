@@ -2312,7 +2312,11 @@ async def _vote(interaction, kind, button=None):
         await safe_send(interaction.followup, "Вы уже голосовали.", ephemeral=True)
         return
 
-    view = ApplicationManagement(app_id)
+    # В канале-логе «Взять» быть не должно. После голоса мы перерисовываем
+    # исходное сообщение, поэтому сохраняем его контекст: ветка — с кнопкой,
+    # канал — без неё.
+    show_take = isinstance(interaction.channel, discord.Thread)
+    view = ApplicationManagement(app_id, show_take=show_take)
     if st[kind] >= VOTES_REQUIRED:
         status = "Принят" if kind == "accept" else "Отклонен"
         embed.set_footer(text=f"Quantum • Статус: {status}")
@@ -2364,14 +2368,21 @@ class ApplicationManagement(discord.ui.View):
     app_id зашит в custom_id кнопок: заявка публикуется в канале, в ветке
     и в лог-канале, и все копии должны делить одни и те же голоса.
 
-    Кнопки: «Взять», «Принять» (синяя), «Отклонить» (красная).
-    Достаточно одного голоса (``VOTES_REQUIRED``). Кнопок запретов здесь
-    нет — они живут в отдельном view ``ApplicationBansView`` в лог-канале.
+    В канале-логе кнопки «Взять» нет: заявку берут только в ветке,
+    созданной под конкретную заявку игрока (``show_take=False`` для
+    сообщения в канале). Кнопки: «Взять», «Принять» (синяя),
+    «Отклонить» (красная). Достаточно одного голоса
+    (``VOTES_REQUIRED``). Кнопок запретов здесь нет — они живут в
+    отдельном view ``ApplicationBansView``.
     """
 
-    def __init__(self, app_id: str = ""):
+    def __init__(self, app_id: str = "", show_take: bool = True):
         super().__init__(timeout=None)
         self.app_id = str(app_id or "")
+        if not show_take:
+            for child in self.children:
+                if (child.custom_id or "").startswith("take_btn"):
+                    self.remove_item(child)
         if self.app_id:
             # discord.py копирует кнопки в экземпляр: правка не влияет
             # на сам класс и на другие экземпляры.
@@ -2391,6 +2402,11 @@ class ApplicationManagement(discord.ui.View):
         if not user_can_review(i.user):
             await safe_send(i.followup, "❌ Нет прав.", ephemeral=True)
             return
+        app_id = _app_id_for(i, b)
+        try:
+            await applications_repo.mark_application_taken(app_id, i.user.id)
+        except Exception as e:
+            await log_error(i.client, "take_btn.db", e)
         await safe_send(i.followup, f"🙋 Взял {i.user.mention}.")
         # В ветке заявку берёт один модератор: оставляем только заявителя
         # и того, кто взял — остальных убираем из ветки.
@@ -2566,8 +2582,9 @@ class QuestionnaireModal(discord.ui.Modal, title="Заявка в клан"):
         msg = None
         if ch:
             try:
-                # В канале заявок — только «Взять / Принять / Отклонить».
-                view = ApplicationManagement(app_id)
+                # В канале-логе — «Принять / Отклонить» без «Взять»:
+                # заявку берут только в ветке, созданной под игрока.
+                view = ApplicationManagement(app_id, show_take=False)
                 msg = await safe_send(ch, content=f"🔔 Новая заявка от {i.user.mention}",
                                       embed=e, view=view)
             except Exception as ex:
@@ -3907,7 +3924,7 @@ def _build_check_log_text(initiator: str, checked: int, offenders: list,
                     f"{(b.get('reason') or '—')[:120]} · "
                     f"выдал: {b.get('admin') or '—'}")
     else:
-        lines.append("\n✅ Активных блокировок нет.")
+        lines.append("\n✅ Блокировок не найдено.")
     return "\n".join(lines)
 
 
@@ -3986,95 +4003,117 @@ async def check_bans(i, steam_id: str):
             pass
 
 
-@bot.tree.command(name="check", description="Проверить всех игроков с ролью клана на баны и муты")
-async def check(i):
-    """Прогоняет всех участников с ролью CLAN_NAME (TALENT) по cs2red."""
+def _taken_application_line(row: dict) -> str:
+    """Одна строка списка /check: статус, ticket, заявитель, клан, дата."""
+    status = (row.get("status") or "").strip().lower()
+    emoji = _STATUS_EMOJI.get(status, "▫️")
+    ident = (row.get("message_id") or row.get("app_id")
+             or row.get("user_id") or "")
+    line = f"{emoji} `ticket-{ident}`" if ident else f"{emoji} —"
+    applicant = row.get("user_id") or ""
+    if applicant:
+        line += f" · <@{applicant}>"
+    clan = (row.get("clan_name") or "").strip()
+    if clan:
+        line += f" · **{clan}**"
+    line += f" · {_fmt_dt(row.get('taken_at'))}"
+    return line
+
+
+def _build_taken_applications_embeds(target, rows: list) -> list:
+    """Embeds со всеми заявками, которые «взял» модератор.
+
+    Список разбивается на части по 20 строк и ~1000 символов, чтобы
+    каждая часть влезала в лимит поля Discord. safe_send сам уложит
+    embeds в сообщения по лимитам 6000 символов / 10 embeds.
+    """
+    active_statuses = {"pending", "voting"}
+    active = sum(1 for row in rows
+                 if (row.get("status") or "").lower() in active_statuses)
+
+    pages: list[list[str]] = []
+    current: list[str] = []
+    used = 0
+    for row in rows:
+        line = _taken_application_line(row)
+        if current and (len(current) >= 20 or used + len(line) + 1 > 1000):
+            pages.append(current)
+            current = []
+            used = 0
+        current.append(line)
+        used += len(line) + 1
+    if current:
+        pages.append(current)
+    if not pages:
+        pages = [[]]
+
+    embeds = []
+    for idx, lines in enumerate(pages):
+        if idx == 0:
+            title = f"📋 Заявки, которые взял {target.display_name}"
+        else:
+            title = f"📋 Заявки, которые взял {target.display_name} · стр. {idx + 1}"
+        embed = discord.Embed(title=title, color=0x000000,
+                              timestamp=now_utc())
+        if idx == 0:
+            try:
+                embed.set_thumbnail(url=target.display_avatar.url)
+            except Exception:
+                pass
+            embed.description = (f"Всего взято: **{len(rows)}** · "
+                                 f"активных сейчас: **{active}**")
+            embed.add_field(
+                name="👤 Модератор",
+                value=getattr(target, "mention", f"<@{target.id}>"),
+                inline=True,
+            )
+            embed.add_field(name="📨 Взято заявок", value=str(len(rows)),
+                            inline=True)
+            embed.add_field(name="⏳ Активных", value=str(active), inline=True)
+        else:
+            embed.description = (f"Продолжение списка · всего взято: "
+                                 f"**{len(rows)}**")
+        embed.add_field(
+            name="📜 Список",
+            value=("\n".join(lines) if lines
+                   else "Модератор ещё не брал заявки.")[:1024],
+            inline=False,
+        )
+        embed.set_footer(text=f"Quantum • {utc_stamp()}")
+        embeds.append(embed)
+    return embeds
+
+
+def _build_taken_applications_embed(target, rows: list) -> discord.Embed:
+    """Первый embed списка /check (совместимость с тестами)."""
+    return _build_taken_applications_embeds(target, rows)[0]
+
+
+@bot.tree.command(name="check",
+                  description="Все заявки, которые взял модератор")
+@app_commands.describe(user="Чей список показать (по умолчанию — ваш)")
+async def check(i, user: discord.Member | None = None):
+    """Показывает историю заявок, взятых модератором кнопкой «Взять».
+
+    В отличие от /status (только активные заявки), здесь виден весь
+    список: и заявки в работе, и уже принятые/отклонённые.
+    """
     await i.response.defer(ephemeral=True)
     try:
-        guild = i.guild
-        if guild is None:
-            await safe_send(i.followup, "❌ Команда работает только на сервере.", ephemeral=True)
-            return
-        role = guild.get_role(TALENT_ROLE_ID)
-        if role is None:
-            role = discord.utils.get(guild.roles, name=CLAN_NAME)
-        if role is None:
-            await safe_send(i.followup,
-                            f"❌ Роль «{CLAN_NAME}» ({TALENT_ROLE_ID}) не найдена на сервере.",
-                            ephemeral=True)
-            return
-        members = [m for m in guild.members if role in m.roles and not m.bot]
-        if not members:
-            await safe_send(i.followup, f"ℹ️ Нет участников с ролью «{CLAN_NAME}».",
-                            ephemeral=True)
+        member = i.user if isinstance(i.user, discord.Member) else None
+        is_reviewer = bool(member and user_can_review(member))
+        if not is_reviewer and i.guild is not None:
+            is_reviewer = await is_moderator(i.user.id, i.guild)
+
+        target = user or i.user
+        if target.id != i.user.id and not is_reviewer:
+            await safe_send(i.followup, "❌ У вас нет прав.", ephemeral=True)
             return
 
-        checked = skipped = errors = 0
-        offenders = []
-        for idx, m in enumerate(members, 1):
-            sid = await links_repo.get_link(m.id)
-            if not sid:
-                skipped += 1
-            else:
-                try:
-                    bans, mutes, err = await asyncio.wait_for(api.cs2red_all_blocks(sid),
-                                                              timeout=CMD_API_TIMEOUT)
-                    if err:
-                        errors += 1
-                    else:
-                        active = [b for b in (bans + mutes) if b.get("active")]
-                        checked += 1
-                        if active:
-                            offenders.append((m, sid, active))
-                except asyncio.TimeoutError:
-                    errors += 1
-                except Exception as e:
-                    errors += 1
-                    await log_error(i.client, f"/check:{m.id}", e)
-
-            if idx % 5 == 0:
-                try:
-                    await i.edit_original_response(
-                        content=f"⏳ Проверено {idx}/{len(members)}…")
-                except Exception:
-                    pass
-            if idx < len(members):
-                await asyncio.sleep(BLOCK_CHECK_DELAY)
-
-        embed = discord.Embed(title=f"🛡 Проверка клана «{CLAN_NAME}»",
-                              color=0x000000, timestamp=now_utc())
-        embed.add_field(name="👥 Игроков с ролью", value=str(len(members)), inline=True)
-        embed.add_field(name="✅ Проверено", value=str(checked), inline=True)
-        embed.add_field(name="🚫 С блокировками", value=str(len(offenders)), inline=True)
-        embed.add_field(name="🔗 Без SteamID", value=str(skipped), inline=True)
-        embed.add_field(name="⚠️ Ошибок", value=str(errors), inline=True)
-        if offenders:
-            lines = []
-            for m, _sid, active in offenders[:10]:
-                kinds = ", ".join(sorted({b.get("kind") or "Бан" for b in active}))
-                reason = (active[0].get("reason") or "—")[:80]
-                lines.append(f"• {m.mention} — {kinds}: {reason}")
-            if len(offenders) > 10:
-                lines.append(f"…и ещё {len(offenders) - 10}")
-            embed.add_field(name="Нарушители", value="\n".join(lines)[:1024], inline=False)
-        else:
-            embed.add_field(name="Нарушители", value="✅ Не найдено", inline=False)
-        embed.set_footer(text=f"Quantum • {utc_stamp()}")
-        await safe_send(i.followup, embed=embed, ephemeral=True)
-
-        # Мини-отчёт в лог-канал: кто получал мут/бан, когда и на какой срок.
-        try:
-            log_ch = bot.get_channel(CHECK_LOG_CHANNEL_ID) if CHECK_LOG_CHANNEL_ID else None
-            if log_ch is None:
-                await log_error(bot, "/check.log",
-                                f"канал {CHECK_LOG_CHANNEL_ID} не найден")
-            else:
-                text = _build_check_log_text(i.user.display_name, checked, offenders,
-                                             skipped, errors)
-                await safe_send(log_ch, text,
-                                title=f"🛡 /check — клан «{CLAN_NAME}»")
-        except Exception as e:
-            await log_error(bot, "/check.log", e)
+        rows = await applications_repo.get_taken_applications(
+            target.id, limit=None)
+        embeds = _build_taken_applications_embeds(target, rows)
+        await safe_send(i.followup, embeds=embeds, ephemeral=True)
     except Exception as e:
         await log_error(i.client, "/check", e)
         try:
@@ -4084,13 +4123,13 @@ async def check(i):
 
 
 # ============================================================
-# /check_all — муты за 2 недели у всех игроков с ролью TALENT
+# /check_all — баны и муты за 2 недели у всех игроков с ролью TALENT
 # ============================================================
 def _filter_blocks_since(blocks: list, since_ts: int) -> list:
     """Оставляет блокировки, начавшиеся не раньше since_ts.
 
     Активные без даты начала тоже показываем: лучше показать лишнее,
-    чем пропустить действующий мут.
+    чем пропустить действующий бан/мут.
     """
     result = []
     for b in blocks:
@@ -4098,6 +4137,18 @@ def _filter_blocks_since(blocks: list, since_ts: int) -> list:
         if start >= since_ts or (not start and b.get("active")):
             result.append(b)
     return result
+
+
+def _recent_blocks(bans: list, mutes: list, since_ts: int) -> list:
+    """Баны и муты за период, новые сверху.
+
+    Раньше /check_all смотрел только муты и терял баны. Здесь обе
+    категории объединяются до фильтрации по времени.
+    """
+    blocks = (bans or []) + (mutes or [])
+    recent = _filter_blocks_since(blocks, since_ts)
+    recent.sort(key=lambda b: b.get("start_ts") or 0, reverse=True)
+    return recent
 
 
 def _talent_members(guild) -> list:
@@ -4110,13 +4161,38 @@ def _talent_members(guild) -> list:
     return [m for m in guild.members if role in m.roles and not m.bot]
 
 
-@bot.tree.command(name="check_all",
-                  description="Муты за 2 недели у всех игроков с ролью TALENT")
-async def check_all(i):
-    """Проверяет всех игроков с ролью TALENT на муты за последние 2 недели.
+async def _clan_sync_members(guild) -> list:
+    """Кого проверять при синхронизации ролей клана.
 
-    Показывает, кто получал мут, когда, на какой срок и кто выдал.
-    Ответ ephemeral: отчёт видит только вызвавший команду.
+    Это не только участники с ролью TALENT: если игрок через /link
+    ушёл в другой клан, старой роли TALENT у него может уже не быть,
+    но новую роль всё равно нужно выдать. Поэтому в список попадают
+    все привязанные через /link, все с ролью TALENT и все, у кого
+    есть любая известная роль клана.
+    """
+    talent_ids = {m.id for m in _talent_members(guild)}
+    linked = await links_repo.get_all_links()
+    linked_ids = {int(k) for k in linked if str(k).isdigit()}
+    managed_ids = set(CLAN_ROLE_MAP.values())
+    known_names = _load_clan_role_names()
+    result = []
+    for m in guild.members:
+        if m.bot:
+            continue
+        has_clan_role = any(
+            r.id in managed_ids or r.name in known_names for r in m.roles)
+        if m.id in talent_ids or m.id in linked_ids or has_clan_role:
+            result.append(m)
+    return result
+
+
+@bot.tree.command(name="check_all",
+                  description="Баны и муты за 2 недели у всех игроков с ролью TALENT")
+async def check_all(i):
+    """Проверяет всех игроков с ролью TALENT на баны и муты за 2 недели.
+
+    Показывает, кто получал блокировку, какого типа, когда, на какой
+    срок и кто выдал. Ответ ephemeral: отчёт видит только вызвавший.
     """
     await i.response.defer(ephemeral=True)
     try:
@@ -4140,16 +4216,14 @@ async def check_all(i):
                 skipped += 1
             else:
                 try:
-                    _bans, mutes, err = await asyncio.wait_for(
+                    bans, mutes, err = await asyncio.wait_for(
                         api.cs2red_all_blocks(sid), timeout=CMD_API_TIMEOUT)
                     if err:
                         errors += 1
                     else:
                         checked += 1
-                        recent = _filter_blocks_since(mutes, since)
+                        recent = _recent_blocks(bans, mutes, since)
                         if recent:
-                            recent.sort(key=lambda b: b.get("start_ts") or 0,
-                                        reverse=True)
                             found.append((m, sid, recent))
                 except asyncio.TimeoutError:
                     errors += 1
@@ -4167,11 +4241,11 @@ async def check_all(i):
                 await asyncio.sleep(BLOCK_CHECK_DELAY)
 
         embed = discord.Embed(
-            title=f"🔇 Муты за {CHECK_ALL_DAYS} дн. — клан «{CLAN_NAME}»",
+            title=f"🚫 Баны и муты за {CHECK_ALL_DAYS} дн. — клан «{CLAN_NAME}»",
             color=0x000000, timestamp=now_utc())
         embed.add_field(name="👥 Игроков с ролью", value=str(len(members)), inline=True)
         embed.add_field(name="✅ Проверено", value=str(checked), inline=True)
-        embed.add_field(name="🔇 С мутами", value=str(len(found)), inline=True)
+        embed.add_field(name="🚫 С блокировками", value=str(len(found)), inline=True)
         embed.add_field(name="🔗 Без SteamID", value=str(skipped), inline=True)
         embed.add_field(name="⚠️ Ошибок", value=str(errors), inline=True)
         if found:
@@ -4179,29 +4253,31 @@ async def check_all(i):
             for m, _sid, blocks in found[:CHECK_ALL_MAX_MEMBERS]:
                 for b in blocks[:3]:
                     lines.append(
-                        f"• {m.mention} — {_fmt_block_ts(b.get('start_ts') or 0)} · "
+                        f"• {m.mention} — {b.get('kind') or 'Бан'} · "
+                        f"{_fmt_block_ts(b.get('start_ts') or 0)} · "
                         f"{_fmt_block_duration(b.get('start_ts') or 0, b.get('end_ts') or 0)} · "
                         f"{(b.get('reason') or '—')[:60]} · "
                         f"выдал: {b.get('admin') or '—'}")
             if len(found) > CHECK_ALL_MAX_MEMBERS:
                 lines.append(f"…и ещё {len(found) - CHECK_ALL_MAX_MEMBERS}")
-            embed.add_field(name="Муты", value="\n".join(lines)[:1024], inline=False)
-        else:
-            embed.add_field(name="Муты",
-                            value=f"✅ За {CHECK_ALL_DAYS} дн. мутов не найдено",
+            embed.add_field(name="Блокировки", value="\n".join(lines)[:1024],
                             inline=False)
+        else:
+            embed.add_field(
+                name="Блокировки",
+                value=f"✅ За {CHECK_ALL_DAYS} дн. банов и мутов не найдено",
+                inline=False)
         embed.set_footer(text=f"Quantum • {utc_stamp()}")
         await safe_send(i.followup, embed=embed, ephemeral=True)
 
-        # Мини-отчёт в лог-канал: кто получал мут и когда.
+        # Мини-отчёт в лог-канал: кто получал бан/мут и когда.
         try:
             log_ch = bot.get_channel(CHECK_LOG_CHANNEL_ID) if CHECK_LOG_CHANNEL_ID else None
             if log_ch is not None:
                 text = _build_check_log_text(i.user.display_name, checked,
-                                             [(m, sid, blocks) for m, sid, blocks in found],
-                                             skipped, errors)
+                                             found, skipped, errors)
                 await safe_send(log_ch, text,
-                                title=f"🔇 /check_all — клан «{CLAN_NAME}»")
+                                title=f"🚫 /check_all — клан «{CLAN_NAME}»")
         except Exception as e:
             await log_error(bot, "/check_all.log", e)
     except Exception as e:
@@ -4563,9 +4639,9 @@ def _build_check_clan_embed(issues: dict, total: int) -> discord.Embed:
     errors = issues["errors"]
 
     embed = discord.Embed(
-        title=f"🏰 Проверка ролей клана «{CLAN_NAME}»",
+        title="🏰 Проверка ролей кланов",
         color=0x000000, timestamp=now_utc())
-    embed.add_field(name="👥 С ролью клана", value=str(total), inline=True)
+    embed.add_field(name="👥 Участников в проверке", value=str(total), inline=True)
     embed.add_field(name="✅ Проверено", value=str(issues["checked"]), inline=True)
     embed.add_field(name="⚠️ Проблем", value=str(len(extra) + len(missing)
                                                   + len(wrong)), inline=True)
@@ -4601,24 +4677,65 @@ def _build_check_clan_embed(issues: dict, total: int) -> discord.Embed:
     return embed
 
 
+async def sync_clan_roles_for_members(guild, members: list) -> list:
+    """Прогоняет sync_clan_role_by_id по списку и возвращает результаты."""
+    results = []
+    for m in members:
+        sid = await links_repo.get_link(m.id)
+        if not sid:
+            continue
+        try:
+            result = await sync_clan_role_by_id(guild, m, sid)
+        except Exception as e:
+            result = f"⚠️ ошибка синхронизации: {str(e)[:150]}"
+        results.append((m, result))
+        await asyncio.sleep(api.RATE_LIMIT_SECONDS)
+    return results
+
+
 class CheckClanView(discord.ui.View):
-    """Кнопка «Очистить лишние роли» под отчётом /check_clan."""
+    """Кнопки под отчётом /check_clan: синхронизация и очистка ролей."""
 
     def __init__(self):
         super().__init__(timeout=300)
 
-    @discord.ui.button(label="🧹 Очистить лишние роли",
-                       style=discord.ButtonStyle.danger)
-    async def clean(self, i, b):
-        await i.response.defer(ephemeral=True)
+    async def _guard(self, i) -> bool:
         if not i.user.guild_permissions.administrator:
             await safe_send(i.followup, "❌ Нужны права администратора.", ephemeral=True)
+            return False
+        if i.guild is None:
+            await safe_send(i.followup, "❌ Только на сервере.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="🔄 Синхронизировать роли",
+                       style=discord.ButtonStyle.primary)
+    async def sync(self, i, _b):
+        """Снимает старые роли клана и выдаёт актуальные по cs2red."""
+        await i.response.defer(ephemeral=True)
+        if not await self._guard(i):
+            return
+        members = await _clan_sync_members(i.guild)
+        results = await sync_clan_roles_for_members(i.guild, members)
+        changed = [r for _m, r in results
+                   if r.startswith("🔄") or "выдан" in r]
+        problems = [(m, r) for m, r in results
+                    if r.startswith(("⚠️", "❌"))]
+        text = (f"🔄 Синхронизировано участников: **{len(results)}**\n"
+                f"Изменений ролей: **{len(changed)}**")
+        if problems:
+            text += "\n⚠️ " + "\n⚠️ ".join(
+                f"{m.display_name}: {r}" for m, r in problems[:10])
+        await safe_send(i.followup, text, ephemeral=True)
+
+    @discord.ui.button(label="🧹 Очистить лишние роли",
+                       style=discord.ButtonStyle.danger)
+    async def clean(self, i, _b):
+        await i.response.defer(ephemeral=True)
+        if not await self._guard(i):
             return
         guild = i.guild
-        if guild is None:
-            await safe_send(i.followup, "❌ Только на сервере.", ephemeral=True)
-            return
-        members = _talent_members(guild)
+        members = await _clan_sync_members(guild)
         known_names = _load_clan_role_names()
         removed_total = 0
         problems = []
@@ -4662,11 +4779,14 @@ class CheckClanView(discord.ui.View):
 
 
 @bot.tree.command(name="check_clan",
-                  description="Проверить роли клана у всех участников с ролью TALENT")
+                  description="Проверить роли клана у всех привязанных через /link")
 async def check_clan(i):
-    """Ищет лишние роли клана, отсутствующие роли и участников без /link.
+    """Ищет лишние и устаревшие роли клана, а также отсутствующие.
 
-    Отчёт ephemeral + кнопка, которая снимает лишние роли клана.
+    Проверяются не только участники с ролью TALENT, но и все, кто
+    привязан через /link: игрок мог уйти из TALENT в другой клан, и
+    старая роль должна быть снята, а новая — выдана. Отчёт ephemeral +
+    кнопки синхронизации и очистки лишних ролей.
     """
     await i.response.defer(ephemeral=True)
     try:
@@ -4675,15 +4795,19 @@ async def check_clan(i):
             await safe_send(i.followup, "❌ Команда работает только на сервере.",
                             ephemeral=True)
             return
-        members = _talent_members(guild)
+        members = await _clan_sync_members(guild)
         if not members:
-            await safe_send(i.followup,
-                            f"ℹ️ Нет участников с ролью «{CLAN_NAME}».", ephemeral=True)
+            await safe_send(
+                i.followup,
+                "ℹ️ Нет привязанных участников и участников с ролью клана.",
+                ephemeral=True)
             return
 
         issues = await _collect_clan_role_issues(guild, members)
         embed = _build_check_clan_embed(issues, len(members))
-        view = CheckClanView() if issues["extra"] else None
+        has_issues = bool(issues["extra"] or issues["missing"]
+                          or issues["wrong"] or issues["unlinked"])
+        view = CheckClanView() if has_issues else None
         await safe_send(i.followup, embed=embed, view=view, ephemeral=True)
     except Exception as e:
         await log_error(i.client, "/check_clan", e)
@@ -5540,14 +5664,26 @@ def _build_status_embed(target, stats: dict) -> discord.Embed:
         inline=True,
     )
 
-    # Поле 4: список заявок в работе.
+    # Поле 4: список заявок в работе. Показываем заявителя и отметку
+    # «взял», чтобы модератор видел не только номер заявки, но и то,
+    # какие активные заявки закреплены лично за ним.
     tickets = []
     for item in in_work[:20]:
         ident = (item.get("message_id") or item.get("user_id")
                  or item.get("app_id") or "")
-        if ident:
-            tickets.append(f"`ticket-{ident}`")
-    work_text = ", ".join(tickets) if tickets else "Нет активных заявок"
+        if not ident:
+            continue
+        line = f"`ticket-{ident}`"
+        applicant = item.get("user_id") or ""
+        if applicant:
+            line += f" · <@{applicant}>"
+        if item.get("taken_by"):
+            line += " · 🙋 взял"
+        clan = (item.get("clan_name") or "").strip()
+        if clan:
+            line += f" · **{clan}**"
+        tickets.append(line)
+    work_text = "\n".join(tickets) if tickets else "Нет активных заявок"
     embed.add_field(name="🛠 Заявки в работе", value=work_text[:1024], inline=False)
 
     embed.set_footer(text=f"Quantum • {now_utc().strftime('%d.%m.%Y %H:%M')}")
