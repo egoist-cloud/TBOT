@@ -5041,7 +5041,7 @@ async def health(i: discord.Interaction):
 # МОДЕРАТОРЫ
 # ============================================================
 def _moderator_permissions_text(commands) -> str:
-    """Короткое описание прав модератора для /moders и панели."""
+    """Короткое описание прав модератора для /give и уведомлений."""
     if commands is None:
         return "—"
     if "*" in commands:
@@ -5051,28 +5051,137 @@ def _moderator_permissions_text(commands) -> str:
     return ", ".join(f"`/{c}`" for c in commands)
 
 
-@bot.tree.command(name="moders", description="Список модераторов и их команд")
+def _moderator_priority(commands) -> dict:
+    """Права модератора: сколько выдано, уровень и бейдж для /moders."""
+    total = len(MODERATOR_COMMANDS)
+    if commands is None:
+        granted, wildcard = 0, False
+    else:
+        wildcard = "*" in commands
+        granted = (total if wildcard
+                   else len(set(commands) & set(MODERATOR_COMMANDS)))
+    if wildcard or granted >= total:
+        return {"granted": total, "rank": 4, "badge": "👑",
+                "label": "Полный доступ"}
+    if granted >= max(1, round(total * 2 / 3)):
+        return {"granted": granted, "rank": 3, "badge": "🛡",
+                "label": "Высокий"}
+    if granted >= max(1, round(total / 3)):
+        return {"granted": granted, "rank": 2, "badge": "🔹",
+                "label": "Средний"}
+    if granted > 0:
+        return {"granted": granted, "rank": 1, "badge": "🔸",
+                "label": "Базовый"}
+    return {"granted": 0, "rank": 0, "badge": "⛔", "label": "Без прав"}
+
+
+# 3 inline-поля на одного модератора: 8 * 3 = 24 (лимит Discord — 25).
+MODERATORS_PER_EMBED = 8
+
+
+async def _collect_moderator_rows(guild) -> list:
+    """Собирает данные для панели /moders: права, Discord и cs2red."""
+    rows = []
+    for discord_id in await moderation_repo.get_all_moderators():
+        uid = str(discord_id)
+        commands = await moderation_repo.get_moderator_commands(uid)
+        priority = _moderator_priority(commands)
+        member = (guild.get_member(int(uid))
+                  if guild is not None and uid.isdigit() else None)
+        user = bot.get_user(int(uid)) if uid.isdigit() else None
+        target = member or user
+        name = target.display_name if target is not None else uid
+        mention = target.mention if target is not None else f"`{uid}`"
+
+        steam_id = await links_repo.get_link(uid)
+        cs2red = "❌ не привязан"
+        if steam_id:
+            url = f"https://cs2red.ru/profile/{steam_id}"
+            cached = await players_repo.get_player(steam_id)
+            nick = str(cached.get("cs2red_nick")
+                       or cached.get("steam_nick") or "").strip()
+            if nick:
+                safe_nick = " ".join(nick.split())
+                safe_nick = (safe_nick.replace("[", "").replace("]", "")
+                             .replace("(", "").replace(")", "")[:40])
+                cs2red = f"[{safe_nick}]({url})"
+            else:
+                cs2red = f"[{steam_id}]({url})"
+
+        rows.append({
+            "id": uid,
+            "name": discord.utils.escape_markdown(str(name))[:200],
+            "mention": mention,
+            "steam_id": steam_id,
+            "cs2red": cs2red,
+            "total": len(MODERATOR_COMMANDS),
+            **priority,
+        })
+    rows.sort(key=lambda row: (-row["rank"], row["name"].casefold()))
+    return rows
+
+
+def _build_moderator_embeds(rows: list) -> list:
+    """Чёрные embed'ы с таблицей: модератор | права | cs2red."""
+    total = len(rows)
+    chunks = [rows[i:i + MODERATORS_PER_EMBED]
+              for i in range(0, total, MODERATORS_PER_EMBED)]
+    counts = {rank: 0 for rank in range(5)}
+    for row in rows:
+        counts[row["rank"]] += 1
+    linked = sum(1 for row in rows if row["steam_id"])
+
+    embeds = []
+    for page, chunk in enumerate(chunks, 1):
+        title = f"🛠 Модераторы — {total}"
+        if len(chunks) > 1:
+            title += f" ({page}/{len(chunks)})"
+        if page == 1:
+            description = (
+                f"Всего: **{total}** · 👑 **{counts[4]}** · "
+                f"🛡 **{counts[3]}** · 🔹 **{counts[2]}** · "
+                f"🔸 **{counts[1]}** · ⛔ **{counts[0]}**\n"
+                f"С профилем cs2red: **{linked}** из **{total}**\n"
+                "Легенда: 👑 полный · 🛡 высокий · 🔹 средний · "
+                "🔸 базовый · ⛔ без прав")
+        else:
+            description = f"Часть **{page}** из **{len(chunks)}**"
+
+        embed = discord.Embed(title=title, description=description,
+                              color=0x000000, timestamp=now_utc())
+        for row in chunk:
+            embed.add_field(
+                name=f"{row['badge']} {row['name']}"[:256],
+                value=row["mention"][:1024],
+                inline=True)
+            embed.add_field(
+                name=f"📊 {row['granted']}/{row['total']}"[:256],
+                value=(f"**{row['label']}**\n"
+                       f"Приоритет: **{row['rank']}/4**")[:1024],
+                inline=True)
+            embed.add_field(name="🔗 cs2red.ru", value=row["cs2red"][:1024],
+                            inline=True)
+
+        if bot.user:
+            embed.set_thumbnail(url=bot.user.display_avatar.url)
+            embed.set_footer(text=f"Quantum • {utc_stamp()} (UTC)",
+                             icon_url=bot.user.display_avatar.url)
+        else:
+            embed.set_footer(text=f"Quantum • {utc_stamp()} (UTC)")
+        embeds.append(embed)
+    return embeds
+
+
+@bot.tree.command(name="moders", description="Панель модераторов: права, приоритет, cs2red")
 async def moders(i):
     await i.response.defer(ephemeral=True)
     try:
-        mods = await moderation_repo.get_all_moderators()
-        if not mods:
+        rows = await _collect_moderator_rows(i.guild)
+        if not rows:
             await safe_send(i.followup, "ℹ️ Пусто", ephemeral=True)
             return
-        lines = []
-        for u in mods:
-            member = i.guild.get_member(int(u)) if str(u).isdigit() else None
-            target = member or bot.get_user(int(u)) if str(u).isdigit() else None
-            perms = _moderator_permissions_text(
-                await moderation_repo.get_moderator_commands(u))
-            if member:
-                lines.append(f"• {member.mention} — {perms}")
-            elif target:
-                lines.append(f"• @{target.display_name} — {perms}")
-            else:
-                lines.append(f"• `{u}` — {perms}")
-        await safe_send(i.followup, f"🛠 ({len(mods)}):\n" + "\n".join(lines),
-                        title="🛠 Список модераторов", ephemeral=True)
+        await safe_send(i.followup, embeds=_build_moderator_embeds(rows),
+                        ephemeral=True)
     except Exception as e:
         await log_error(i.client, "/moders", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
