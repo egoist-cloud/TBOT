@@ -1,0 +1,36 @@
+#!/bin/sh
+# pre-commit: не пускать в историю сломанные правки.
+#
+# Что делает: ruff по всему проекту, затем pytest. Любая ошибка отменяет
+# коммит. Осознанно обойти: git commit --no-verify.
+#
+# Установка (один раз на клон):
+#   git config core.hooksPath .githooks
+set -eu
+
+# Хук запускается из корня репозитория, но на всякий случай фиксируем cwd:
+# так команды работают и при коммите из подкаталога.
+cd "$(git rev-parse --show-toplevel)"
+
+PY="${PYTHON:-python}"
+if ! command -v "$PY" >/dev/null 2>&1; then
+    echo "[pre-commit] не найден $PY — активируйте venv или задайте PYTHON=..." >&2
+    exit 1
+fi
+
+echo "[pre-commit] ruff"
+if ! "$PY" -m ruff check .; then
+    echo "[pre-commit] ruff нашёл ошибки — коммит отменён" >&2
+    echo "[pre-commit] обойти осознанно: git commit --no-verify" >&2
+    exit 1
+fi
+
+echo "[pre-commit] pytest"
+# --no-cov: таблица покрытия на каждом коммите не нужна и только замедляет хук
+if ! "$PY" -m pytest -q --no-cov; then
+    echo "[pre-commit] тесты упали — коммит отменён" >&2
+    echo "[pre-commit] обойти осознанно: git commit --no-verify" >&2
+    exit 1
+fi
+
+echo "[pre-commit] OK"

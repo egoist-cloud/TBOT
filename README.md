@@ -275,6 +275,7 @@ docker compose run --rm -e FORCE_SEED_IMPORT=1 --entrypoint python \
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
+git config core.hooksPath .githooks   # один раз: ruff + pytest перед каждым коммитом
 ruff check .
 pytest                  # тесты + таблица покрытия по модулям (pytest-cov)
 pytest --cov-report=term-missing   # то же, но с номерами непокрытых строк
