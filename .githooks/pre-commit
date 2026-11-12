@@ -1,8 +1,9 @@
 #!/bin/sh
 # pre-commit: не пускать в историю сломанные правки.
 #
-# Что делает: ruff по всему проекту, затем pytest. Любая ошибка отменяет
-# коммит. Осознанно обойти: git commit --no-verify.
+# Что делает: ruff по всему проекту — всегда; pytest — только если в индексе
+# есть python-файлы или конфиги тестов (коммиты документации не ждут прогон).
+# Любая ошибка отменяет коммит. Осознанно обойти: git commit --no-verify.
 #
 # Установка (один раз на клон):
 #   git config core.hooksPath .githooks
@@ -25,12 +26,33 @@ if ! "$PY" -m ruff check .; then
     exit 1
 fi
 
-echo "[pre-commit] pytest"
-# --no-cov: таблица покрытия на каждом коммите не нужна и только замедляет хук
-if ! "$PY" -m pytest -q --no-cov; then
-    echo "[pre-commit] тесты упали — коммит отменён" >&2
-    echo "[pre-commit] обойти осознанно: git commit --no-verify" >&2
-    exit 1
+# Тесты нужны, только если менялся код или конфиги тестов: иначе коммит
+# документации зря ждал бы ~5 с. Удаления тоже учитываются (--name-only без
+# фильтра): удалённый .py может сломать импорты.
+staged="$(git diff --cached --name-only)"
+run_tests=false
+while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    case "$f" in
+        *.py | pytest.ini | pyproject.toml | setup.cfg | tox.ini | requirements*.txt)
+            run_tests=true
+            break
+            ;;
+    esac
+done <<EOF
+$staged
+EOF
+
+if [ "$run_tests" = true ]; then
+    echo "[pre-commit] pytest"
+    # --no-cov: таблица покрытия на каждом коммите не нужна и замедляет хук
+    if ! "$PY" -m pytest -q --no-cov; then
+        echo "[pre-commit] тесты упали — коммит отменён" >&2
+        echo "[pre-commit] обойти осознанно: git commit --no-verify" >&2
+        exit 1
+    fi
+else
+    echo "[pre-commit] pytest пропущен: в индексе нет python-файлов и конфигов тестов"
 fi
 
 echo "[pre-commit] OK"
