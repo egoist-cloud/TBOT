@@ -53,6 +53,86 @@ cp .env.example .env      # Windows: copy .env.example .env
 python script.py
 ```
 
+## Запуск через Docker Compose
+
+Нужен Docker с плагином Compose (`docker compose version`) и заполненный `.env`:
+`docker-compose.yml` подключает его через `env_file` и без него не стартует.
+
+```bash
+cp .env.example .env            # Windows: copy .env.example .env
+# заполнить минимум DISCORD_TOKEN и GUILD_ID
+
+docker compose up -d --build    # собрать образ и запустить
+docker compose logs -f bot      # логи, в том числе строки [seed]
+docker compose ps               # STATUS: healthy, когда /health отвечает 200
+docker compose down             # остановить; данные в volume остаются
+docker compose down -v          # ВНИМАНИЕ: удаляет и volume с данными
+```
+
+Что важно знать:
+
+- **Данные живут в именованном volume `quantum-data`** (`/data`, `DATA_DIR=/data`):
+  `quantum.db`, `-wal`, `rules.txt`, `ai_training.json`, `error_log.txt`.
+  Пересоздание контейнера и `down` базу не трогают, `down -v` — удаляет.
+- **Порт 8080 — только для health-check** (`GET /` и `GET /health`). Discord
+  работает через исходящий WebSocket, входящие порты боту не нужны.
+- **Контейнер работает не от root** (пользователь `bot`, uid 1001). При первом
+  подключении пустого volume Docker копирует в него `/data` из образа
+  (`rules.txt`, `ai_training.json`) вместе с владельцем — руками `chown` делать
+  не нужно.
+- **`/health` отдаёт 503**, пока бот не залогинился (`is_ready()`) или уже
+  закрывает соединение (`is_closed()`). Поэтому `healthy` в `docker compose ps`
+  означает «бот реально в Discord», а не «процесс жив».
+- **Обновление**: `git pull && docker compose up -d --build`. Миграции SQLite
+  применяются на старте, volume сохраняется.
+- **Если база не нужна** — контейнер можно запустить без `./seed` вообще:
+  шаг импорта просто пропускается (см. ниже).
+
+### Первый старт: что entrypoint делает с seed-файлами
+
+`Dockerfile` ставит `ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]`, а
+`CMD ["python", "script.py"]`. Скрипт делает ровно две вещи:
+
+1. если каталог `${SEED_DIR:-/seed}` существует — запускает
+   `python -m quantum.import_seed`;
+2. дальше `exec "$@"`, то есть обычный запуск бота (`exec` важен: `python`
+   становится PID 1, и SIGTERM от `docker stop` доходит до него).
+
+`docker-compose.yml` монтирует `./seed` **только для чтения** в `/seed`
+(`SEED_DIR=/seed`), поэтому в volume попадают только копии, а исходники на
+хосте не меняются.
+
+Что делает `quantum/import_seed.py`:
+
+- **Копирует только недостающие файлы** из списка `links.json`,
+  `players_db.json`, `moderators.json`, `users_db.json`, `votes.json`,
+  `seen.json`. Если такой файл уже есть в `/data`, он **не перезаписывается**
+  (там может лежать более свежая копия или `*.bak` после прошлого импорта).
+- **Переносит JSON в SQLite** через `import_json_to_sqlite()`, после чего
+  файлы переименовываются в `*.bak` (логика миграций — в
+  `quantum/migrations.py`).
+- **Ставит маркер `/data/.seed_imported`** — повторный рестарт контейнера
+  видит его и ничего не делает (иначе каждый старт копировал бы и импортировал
+  заново).
+- **Не падает, если переносить нечего**: нет каталога `/seed`, он пуст или все
+  файлы уже на месте — печатает `[seed] ...` и продолжает запуск.
+- **Падает с кодом 1, если импорт сломался** — контейнер не стартует, чтобы не
+  работать на полупустой базе. Ошибка видна в `docker compose logs bot`.
+
+Повторить перенос принудительно (например, после ручной правки JSON):
+
+```bash
+# --entrypoint python: штатный entrypoint иначе запустит импорт второй раз
+docker compose run --rm -e FORCE_SEED_IMPORT=1 --entrypoint python \
+  bot -m quantum.import_seed
+```
+
+Нюанс с повтором: после успешного импорта файлы в `/data` переименованы в
+`*.bak`, поэтому при следующем запуске они **снова** копируются из `./seed`
+(под обычным именем их в `/data` уже нет, а `.bak` не трогается). А вот если
+файл в `/data` остался под обычным именем, он не перезаписывается — удалите
+его из volume, если нужна версия из `./seed`.
+
 ## Переменные окружения
 
 Полный список — в [`.env.example`](.env.example). Важное:
@@ -196,11 +276,44 @@ python script.py
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
 ruff check .
-pytest -v
+pytest                  # тесты + таблица покрытия по модулям (pytest-cov)
+pytest --cov-report=term-missing   # то же, но с номерами непокрытых строк
+docker compose config   # проверка compose-файла (нужен временный .env)
 ```
 
-CI (`.github/workflows/ci.yml`) запускает `ruff` и `pytest` на Python 3.12
-для `main`, `fix/**` и `feat/**`.
+Покрытие считается только по коду бота (`--cov=quantum --cov=script`), тесты в
+цифру не входят. Сейчас это ~42 % — подробности и самые «дырявые» модули
+видны прямо в выводе `pytest`.
+
+### Что делает CI (`.github/workflows/ci.yml`)
+
+Запускается на `push` в `main`, `fix/**`, `feat/**`, на любом `pull_request` и
+вручную (`workflow_dispatch`); параллельные прогоны одной ветки отменяют друг
+друга (`concurrency`). Три job'а:
+
+| Job | Что делает | Зачем |
+|---|---|---|
+| `test` | проверка пинов actions → Python 3.12 + зависимости → `ruff check .` → `pytest` с покрытием | ловит незакреплённые actions, ошибки импортов, неиспользуемый код и регрессии |
+| `changes` | по `git diff` решает, тронуты ли только `*.md` и `docs/`, и отдаёт `docs_only` | не собирать образ на правках документации |
+| `docker` | `docker compose config` → сборка через buildx с кэшем `type=gha` → smoke-запуск образа → проверка записи в `/data` на именованном volume | Dockerfile, compose и права тома проверяются на каждом пуше, а не в проде |
+
+Детали, которые легко пропустить:
+
+- **Проверка пинов** (`Check actions are pinned to commit SHA`) падает, если в
+  `.github/workflows` появился `uses:` с тегом или веткой вместо 40-символьного
+  commit SHA. Локальные actions (`./path`) разрешены.
+- **`docker compose config`** запускается на временном `.env`, собранном из
+  `.env.example` (только строки `KEY=VALUE`), поэтому ошибки в
+  `docker-compose.yml` ловятся без настоящих секретов.
+- **Smoke-тест образа** проверяет, что entrypoint отрабатывает без `/seed` и что
+  `quantum.import_seed` и `script` импортируются внутри контейнера.
+- **Проверка тома** запускает образ с именованным volume, убеждается, что
+  процесс не root, `rules.txt` на месте, каталог доступен на запись (создаётся
+  `quantum.db`) и запись переживает пересоздание контейнера.
+- **`job docker` пропускается**, если изменения только в документации; ручной
+  запуск (`workflow_dispatch`) собирает образ всегда.
+- Все actions закреплены по commit SHA, обновляет их Dependabot
+  (`.github/dependabot.yml`, раз в неделю).
 
 ## Данные
 
