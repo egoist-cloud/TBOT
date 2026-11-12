@@ -1,0 +1,22 @@
+# Dependabot: обновляет actions, закреплённые по commit SHA.
+#
+# Actions в .github/workflows/ci.yml прибиты к конкретным коммитам, поэтому
+# сами по себе не получают security-фиксы (в отличие от плавающего тега vN).
+# Dependabot присылает PR, в котором меняет и SHA, и комментарий версии
+# (# vX.Y.Z), так что пин остаётся читаемым и актуальным.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Moscow"
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
+      - "ci"
+    # Отдельная PR на каждое обновление: security-фикс не ждёт остальных.
+    open-pull-requests-limit: 5
