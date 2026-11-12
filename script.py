@@ -4,6 +4,7 @@ Quantum - бот клана (v18: исправлен Cloudflare 429, все safe
 import os
 import re
 import json
+import logging
 import time
 import random
 import asyncio
@@ -90,6 +91,54 @@ def now_utc() -> datetime.datetime:
 
 def log(msg: str):
     print(redact(msg), flush=True)
+
+
+# ---------- logging -> общий лог -----------------------------------------
+# Модули (quantum.env, quantum.db, quantum.ai, ...) пишут через logging.
+# Единый обработчик проводит их записи через тот же вывод и маскировку
+# секретов, что и log(), а уровень задаётся переменной LOG_LEVEL.
+def _log_level(value) -> int:
+    """Уровень из строки (DEBUG/INFO/...); неизвестный — INFO."""
+    name = (value or "INFO").strip().upper()
+    level = getattr(logging, name, None)
+    return level if isinstance(level, int) else logging.INFO
+
+
+class _LogBridge(logging.Handler):
+    """Проводит записи logging в общий лог бота (stdout с маскировкой).
+
+    Формат «LEVEL имя: сообщение» показывает источник записи. ``redact``
+    ищется лениво: при импорте script.py обработчик может сработать до
+    того, как функция объявлена ниже.
+    """
+
+    def emit(self, record):
+        try:
+            text = self.format(record)
+            _redact = globals().get("redact")
+            print(_redact(text) if _redact else text, flush=True)
+        except Exception:
+            self.handleError(record)
+
+
+def setup_logging(level=None) -> None:
+    """Единая настройка логирования (вызывается при импорте script)."""
+    root = logging.getLogger()
+    root.setLevel(level if level is not None else _LOG_LEVEL)
+    # Повторный импорт/перезагрузка не должен плодить обработчики.
+    for handler in list(root.handlers):
+        if isinstance(handler, _LogBridge):
+            root.removeHandler(handler)
+    bridge = _LogBridge()
+    bridge.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    root.addHandler(bridge)
+    # discord.py и aiohttp на INFO шумят на каждый запрос — только важное.
+    logging.getLogger("discord").setLevel(logging.WARNING)
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
+
+
+_LOG_LEVEL = _log_level(os.getenv("LOG_LEVEL"))
+setup_logging()
 
 
 # ============================================================

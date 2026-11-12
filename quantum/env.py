@@ -8,7 +8,10 @@
 """
 from __future__ import annotations
 
+import logging
 import os
+
+log = logging.getLogger("quantum.env")
 
 
 def env_int(name: str, default: int = 0) -> int:
@@ -19,7 +22,8 @@ def env_int(name: str, default: int = 0) -> int:
     try:
         return int(raw)
     except ValueError:
-        print(f"[env] {name}={raw!r} — не число, беру {default}", flush=True)
+        # Не число — берём дефолт, но говорим об этом в общий лог.
+        log.warning("%s=%r — не число, беру %r", name, raw, default)
         return default
 
 
@@ -31,7 +35,7 @@ def env_float(name: str, default: float = 0.0) -> float:
     try:
         return float(raw)
     except ValueError:
-        print(f"[env] {name}={raw!r} — не число, беру {default}", flush=True)
+        log.warning("%s=%r — не число, беру %r", name, raw, default)
         return default
 
 

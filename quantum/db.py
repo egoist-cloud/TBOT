@@ -1,9 +1,12 @@
 """Асинхронный доступ к SQLite через aiosqlite. WAL включён."""
 import asyncio
+import logging
 import os
 from pathlib import Path
 
 import aiosqlite
+
+log = logging.getLogger("quantum.db")
 
 # База кладётся туда же, куда бот складывает JSON (DATA_DIR, по умолчанию ".").
 DATA_DIR = Path(os.getenv("DATA_DIR", ".")).resolve()
@@ -73,9 +76,9 @@ async def _ensure_column(db, table: str, column: str, ddl: str) -> None:
     try:
         await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
         await db.commit()
-        print(f"[db] миграция: {table}.{column} добавлена")
+        log.info("миграция: %s.%s добавлена", table, column)
     except Exception as e:
-        print(f"[db] миграция {table}.{column}: {e}")
+        log.warning("миграция %s.%s: %s", table, column, e)
 
 
 async def init_db() -> None:
@@ -224,5 +227,5 @@ async def init_db() -> None:
         )
         await db.commit()
     except Exception as e:
-        print(f"[db] перенос заявок в историю: {e}")
+        log.warning("перенос заявок в историю: %s", e)
     await db.commit()
