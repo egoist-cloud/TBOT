@@ -6,3 +6,6 @@ ruff>=0.6
 
 # Тесты (запускаются в .github/workflows/ci.yml)
 pytest>=8.0
+
+# Покрытие: pytest --cov=... (отчёт по модулям с непокрытыми строками)
+pytest-cov>=6.0
