@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 import time
 
 import discord
@@ -27,6 +28,8 @@ from .repositories import players as players_repo
 from .repositories import seen as seen_repo
 from .repositories import users as users_repo
 from .repositories import votes as votes_repo
+
+log = logging.getLogger("quantum.agent")
 
 # Канал агента и расписание (в минутах).
 AGENT_HEALTH_INTERVAL_MINUTES = env_int("AGENT_HEALTH_INTERVAL_MINUTES", 120)
@@ -95,7 +98,7 @@ class Agent:
             await ch.send(embed=embed)
             return True
         except Exception as e:
-            print(f"[agent] не смог отправить сообщение: {e}")
+            log.warning("не смог отправить сообщение: %s", e)
             return False
 
     # ------------------------------------------------------------

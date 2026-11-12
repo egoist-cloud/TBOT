@@ -170,8 +170,9 @@ class GeminiProvider(AIProvider):
             ) as r:
                 raw = (await r.text())[:2000]
                 if r.status != 200:
-                    # Отладочный вывод реального ответа Google в консоль (Render).
-                    print(f"Gemini error: {r.status} - {raw[:2000]}")
+                    # Тело ошибки — в лог, а не в stdout: в нём бывают куски
+                    # промпта и служебные данные аккаунта Google.
+                    log.warning("gemini: HTTP %s: %s", r.status, raw[:200])
                     if _is_auth_error(r.status):
                         msg = (f"авторизация {r.status}: неверный API-ключ "
                                f"({self.env_key}): {raw[:200]}")

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import datetime
+import logging
 import os
 
 from ..db import get_db
 from .votes import parse_voters
+
+log = logging.getLogger("quantum.applications")
 
 
 def _now() -> str:
@@ -151,12 +154,13 @@ async def get_history_summary(user_id) -> dict:
 
 
 async def list_pending_applications() -> list:
-    """Все заявки на рассмотрении (нужно, чтобы поднять кнопки после рестарта)."""
+    """Все активные заявки (нужно, чтобы поднять кнопки после рестарта)."""
     db = await get_db()
+    placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)
     cursor = await db.execute(
         "SELECT user_id, status, clan_name, message_id, channel_id, app_id, "
         "taken_by, taken_at, created_at, updated_at FROM applications "
-        "WHERE status = 'pending'"
+        f"WHERE status IN ({placeholders})", ACTIVE_STATUSES
     )
     rows = await cursor.fetchall()
     await cursor.close()
@@ -204,7 +208,7 @@ async def finalize_application(user_id, status: str, moderator_id=None,
         )
         await db.commit()
     except Exception as e:
-        print(f"[applications] обновить историю: {e}")
+        log.warning("не удалось обновить историю заявки: %s", e)
     return True
 
 
@@ -284,8 +288,10 @@ async def count_applications() -> int:
 async def count_pending_applications() -> int:
     """Число активных (на рассмотрении) заявок."""
     db = await get_db()
+    placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)
     cursor = await db.execute(
-        "SELECT COUNT(*) AS c FROM applications WHERE status = 'pending'")
+        f"SELECT COUNT(*) AS c FROM applications "
+        f"WHERE status IN ({placeholders})", ACTIVE_STATUSES)
     row = await cursor.fetchone()
     await cursor.close()
     return row["c"] if row is not None else 0

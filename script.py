@@ -69,6 +69,18 @@ def data_path(name: str) -> Path:
     return DATA_DIR / name
 
 
+def _write_json_file(path, payload) -> None:
+    """Синхронная запись JSON. Вызывать через asyncio.to_thread."""
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _read_json_file(path):
+    """Синхронное чтение JSON. Вызывать через asyncio.to_thread."""
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 UTC = datetime.UTC
 
 
@@ -375,6 +387,10 @@ async def log_error(bot: commands.Bot, context: str, exc):
 # ============================================================
 _send_semaphore = asyncio.Semaphore(2)
 _send_timestamps = deque()
+
+# Фоновые задачи должны жить в ссылке: задача, на которую никто не
+# ссылается, может быть собрана GC до завершения.
+_background_tasks: set = set()
 
 
 async def _rate_limit_send():
@@ -2937,7 +2953,11 @@ class QuestionnaireModal(discord.ui.Modal, title="Заявка в клан"):
             log(f"⚠️ Не сохранил заявку в БД: {ex}")
 
         await safe_send(i.followup, "✅ Ваша заявка отправлена на рассмотрение!", ephemeral=True)
-        asyncio.create_task(_create_application_thread(i, e, app_id))
+        # Держим ссылку на задачу: без неё GC может убить её до создания
+        # ветки, и заявка останется без обсуждения.
+        task = asyncio.create_task(_create_application_thread(i, e, app_id))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
 
 async def _create_application_thread(i, e, app_id: str = ""):
@@ -3286,6 +3306,31 @@ async def on_app_command_error(i, err):
             pass
         return
     await log_error(i.client, f"cmd:{i.command}", err)
+
+
+@bot.event
+async def on_command_error(ctx, err):
+    """Ошибки префиксных команд (``?ask``, ``?rules`` и т.д.).
+
+    Без этого обработчика discord.py только пишет трейсбек в stderr:
+    ошибки префиксных команд не попадали ни в лог-канал, ни в
+    error_log.txt, ни в ИИ-агента.
+    """
+    if isinstance(err, commands.CommandNotFound):
+        return
+    if isinstance(err, commands.CommandOnCooldown):
+        await safe_send(ctx.channel, f"⏳ Подождите {err.retry_after:.0f} сек.")
+        return
+    if isinstance(err, commands.MissingRequiredArgument):
+        await safe_send(ctx.channel, f"❌ Не хватает аргумента: `{err.param.name}`.")
+        return
+    if isinstance(err, commands.CheckFailure):
+        await safe_send(ctx.channel, "❌ Нет доступа.")
+        return
+    # CommandInvokeError заворачивает исходное исключение — логируем его.
+    original = getattr(err, "original", err)
+    command = getattr(ctx.command, "name", "?") if ctx.command else "?"
+    await log_error(ctx.bot, f"prefix:{command}", original)
 
 
 @bot.event
@@ -4030,8 +4075,8 @@ async def export_members(i):
             if isinstance(sid, str) and sid.isdigit() and len(sid) == 17 and sid.startswith("7656119"):
                 valid[did] = sid
         try:
-            with open(data_path("mass_links.json"), "w", encoding="utf-8") as f:
-                json.dump(valid, f, ensure_ascii=False, indent=2)
+            await asyncio.to_thread(_write_json_file,
+                                    data_path("mass_links.json"), valid)
         except Exception as e:
             await log_error(i.client, "/export_members.write", e)
             await safe_send(i.followup, f"❌ {e}", ephemeral=True)
@@ -5421,8 +5466,7 @@ async def health(i: discord.Interaction):
     mass_file = data_path("mass_links.json")
     if mass_file.exists():
         try:
-            with open(mass_file, "r", encoding="utf-8") as f:
-                mass = json.load(f)
+            mass = await asyncio.to_thread(_read_json_file, mass_file)
             total = len(mass)
             valid = sum(1 for k, v in mass.items()
                         if isinstance(v, str) and v.isdigit()

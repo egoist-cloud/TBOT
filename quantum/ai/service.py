@@ -171,19 +171,17 @@ class AIService:
         # 5) провайдеры
         provider = ""
         for prov in self.providers:
-            print(f"DEBUG: Пробую провайдера {prov.name}")
+            log.debug("%s: запрос", prov.name)
             try:
                 result = await prov.complete(messages)
             except Exception as e:
-                print(f"DEBUG: Провайдер {prov.name} бросил исключение: {e}")
                 log.warning("%s: ошибка вызова: %s", prov.name, e)
                 continue
             if result:
                 provider = prov.name
-                print(f"DEBUG: Провайдер {prov.name} ответил успешно")
+                log.debug("%s: ответ получен", prov.name)
                 break
-            else:
-                print(f"DEBUG: Провайдер {prov.name} вернул None")
+            log.debug("%s: пустой ответ", prov.name)
 
         if not provider:
             msg = ("Не удалось получить ответ ни от одного ИИ-провайдера. "
