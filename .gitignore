@@ -1,0 +1,56 @@
+# --- секреты: никогда не коммитить ---
+.env
+.env.*
+!.env.example
+
+# --- служебное ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+dist/
+*.zip
+.idea/
+.vscode/
+mass_links.json.bak
+error_log.txt
+error_log.old.txt
+
+# --- резервные копии и временные файлы ---
+*.bak
+*.tmp
+*.old
+
+# --- рабочие данные бота (SteamID и Discord ID живых игроков) ---
+# ВАЖНО: эти файлы НЕЛЬЗЯ коммитить в публичный репозиторий — там
+# лежат персональные данные игроков. Но они и не должны исчезать:
+# на Render файловая система контейнера временная, и привязки
+# теряются при каждом деплое. Поэтому основное хранилище — SQLite
+# (quantum.db), а синк с отдельным приватным репозиторием задаётся
+# переменными GITHUB_TOKEN / GITHUB_REPO.
+# Раскомментируй строки ниже, если данные уже вынесены в приватный
+# репозиторий и в этом больше не нужны:
+# links.json
+# players_db.json
+# moderators.json
+# users_db.json
+# votes.json
+# seen.json
+# mass_links.json
+
+# --- каталог для переноса JSON-баз в Docker (личные данные) ---
+seed/
+
+# --- локальная БД (восстанавливается из GitHub-синка) ---
+quantum.db
+quantum.db-wal
+quantum.db-shm
+
+# --- кэши инструментов ---
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
