@@ -1,2 +1,10 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shell-скрипты и Dockerfile — всегда LF: с CRLF в контейнере падает shebang
+# ("bad interpreter") и ломается COPY в образ.
+*.sh text eol=lf
+docker-entrypoint.sh text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
