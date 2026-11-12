@@ -1,0 +1,43 @@
+# Что не отправлять в контекст сборки.
+
+# --- секреты: не должны попасть в слои образа ---
+.env
+.env.*
+!.env.example
+
+# --- git и служебные каталоги ---
+.git
+.gitattributes
+.gitignore
+.github
+.pytest_cache
+.ruff_cache
+.mypy_cache
+__pycache__
+*.py[cod]
+.venv
+venv
+env
+
+# --- каталог переноса JSON-баз: личные данные, в образе не нужен ---
+seed
+
+# --- персональные данные игроков: не запекаем в образ ---
+# Перенос в SQLite делается один раз через `docker compose cp` (см. README
+# в ответе): файлы кладутся в /data и импортируются при старте.
+players_db.json
+links.json
+moderators.json
+users_db.json
+votes.json
+seen.json
+mass_links.json
+quantum.db
+quantum.db-wal
+quantum.db-shm
+
+# --- тесты и документация не нужны в рантайме ---
+tests
+*.md
+docker-compose.yml
+.dockerignore

@@ -1,0 +1,56 @@
+# Quantum / TBOT — запуск бота в Docker.
+#
+#   cp .env.example .env        # и заполнить DISCORD_TOKEN, GUILD_ID и т.д.
+#   mkdir seed && cp links.json players_db.json moderators.json seed/   # опционально
+#   docker compose up -d --build
+#   docker compose logs -f bot
+#
+# Файлы из ./seed при первом старте копируются в volume и импортируются
+# в SQLite (см. quantum/import_seed.py), после чего шаг пропускается.
+#
+# Данные лежат в именованном volume quantum-data (/data): quantum.db,
+# quantum.db-wal, rules.txt, ai_training.json, error_log.txt.
+#   docker compose down          # контейнер удалён, данные на месте
+#   docker compose down -v       # ВНИМАНИЕ: удаляет и данные
+
+name: quantum-bot
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: quantum-bot:latest
+    container_name: quantum-bot
+    restart: unless-stopped
+    # Корректная обработка SIGTERM и уборка зомби-процессов (PID 1).
+    init: true
+    stop_grace_period: 30s
+
+    env_file:
+      - .env
+    environment:
+      # Должно совпадать с точкой монтирования тома ниже.
+      DATA_DIR: /data
+      # Откуда entrypoint берёт JSON-базы для первичного переноса.
+      SEED_DIR: /seed
+      # Порт HTTP-health (Flask внутри script.py).
+      PORT: "8080"
+
+    volumes:
+      # Именованный volume, а не bind mount: данные не зависят от ФС хоста,
+      # а при первом подключении Docker сам копирует /data из образа
+      # (rules.txt, ai_training.json) вместе с владельцем-ботом.
+      - quantum-data:/data
+      # JSON-базы для первого переноса: только чтение, каталог может быть
+      # пустым или отсутствовать — тогда шаг импорта пропускается.
+      - ./seed:/seed:ro
+
+    ports:
+      # Нужен только для health-check снаружи; Discord работает через
+      # исходящий WebSocket, входящие порты боту не требуются.
+      - "8080:8080"
+
+volumes:
+  quantum-data:
+    name: quantum-data
