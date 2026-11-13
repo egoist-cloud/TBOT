@@ -2930,9 +2930,15 @@ class QuestionnaireModal(discord.ui.Modal, title="Заявка в клан"):
         # Анти-дубликат: если у пользователя уже есть активная заявка — не создаём новую.
         existing = await applications_repo.get_active_application(i.user.id)
         if existing:
+            # Показываем дату — иначе игрок не понимает, какую заявку ждёт,
+            # а «зависшая» заявка блокирует подачу навсегда.
+            created = _parse_iso_utc(existing.get("created_at"))
+            since = f" от {created.strftime('%d.%m.%Y')}" if created else ""
+            log(f"⏳ заявка {i.user.id}: отклонена подача, активна заявка{since}")
             await safe_send(
                 i.followup,
-                "❌ У вас уже есть заявка на рассмотрении. Дождитесь её завершения.",
+                f"❌ У вас уже есть заявка{since} на рассмотрении. "
+                "Дождитесь её завершения.",
                 ephemeral=True,
             )
             return
@@ -3053,6 +3059,75 @@ async def _create_application_thread(i, e, app_id: str = ""):
         await safe_send(t, content=header, embed=e, view=view)
     except Exception as ex:
         log(f"⚠️ Ветка: {ex}")
+
+
+async def expire_stale_applications(days=None) -> list:
+    """Закрывает заявки, по которым нет решения дольше N дней.
+
+    Без этого «pending»-заявка висит вечно и блокирует игроку новую
+    подачу: on_submit отвечает «у вас уже есть заявка на рассмотрении».
+    Срок совпадает с обещанием в тексте условий (7 дней).
+
+    Возвращает список user_id закрытых заявок.
+    """
+    days = APPLICATION_TTL_DAYS if days is None else int(days)
+    if days <= 0:
+        return []
+    deadline = now_utc() - datetime.timedelta(days=days)
+    try:
+        rows = await applications_repo.list_pending_applications()
+    except Exception as e:
+        log(f"⚠️ автозакрытие заявок: не прочитал список: {e}")
+        return []
+
+    closed = []
+    for row in rows:
+        created = _parse_iso_utc(row.get("created_at"))
+        if created is None or created > deadline:
+            continue
+        user_id = row.get("user_id")
+        reason = f"Автоотклонение: нет решения за {days} дн."
+        try:
+            ok = await applications_repo.finalize_application(
+                user_id, "rejected", moderator_id=None, reason=reason)
+        except Exception as e:
+            log(f"⚠️ автозакрытие заявки {user_id}: {e}")
+            continue
+        if not ok:
+            continue
+        closed.append(user_id)
+        log(f"⌛ Заявка {user_id} закрыта автоматически (старше {days} дн.)")
+        await audit_action(
+            bot, "Автоотклонение заявки",
+            details=f"Игрок: <@{user_id}>\nПричина: {reason}")
+        user = bot.get_user(int(user_id)) if str(user_id).isdigit() else None
+        if user is not None:
+            try:
+                await user.send(
+                    f"⌛ Ваша заявка в клан {CLAN_NAME} отклонена автоматически: "
+                    f"решение не принято за {days} дн. Можно подать новую.")
+            except Exception:
+                pass
+    return closed
+
+
+@tasks.loop(hours=1)
+async def expire_applications():
+    """Раз в час закрывает заявки, превысившие APPLICATION_TTL_DAYS."""
+    try:
+        closed = await expire_stale_applications()
+        if closed:
+            ch = bot.get_channel(LOG_CHANNEL_ID) if LOG_CHANNEL_ID else None
+            if ch is not None:
+                await safe_send(ch, f"⌛ Автоотклонено заявок: {len(closed)}")
+    except Exception as e:
+        await log_error(bot, "expire_applications", e)
+
+
+@expire_applications.before_loop
+async def before_expire_applications():
+    await bot.wait_until_ready()
+    await asyncio.sleep(random.randint(60, 180))
 
 
 async def open_application_modal(i, clan_name: str) -> None:
@@ -3292,6 +3367,8 @@ class MyBot(commands.Bot):
             agent_watch.start()
             health_watch.start()
             daily_summary.start()
+            clan_panel_refresh.start()
+            expire_applications.start()
             if not GUILD_ID:
                 log("⚠️ GUILD_ID = 0 — автосинхронизация ролей клана и /check "
                     "не смогут найти сервер (задайте GUILD_ID)")
@@ -6696,6 +6773,112 @@ def _build_clan_conditions_embed() -> discord.Embed:
     return embed
 
 
+# ---------- панель условий: публикация и автообновление ----------
+# Discord со временем перестаёт принимать нажатия на компоненты старых
+# сообщений, поэтому панель периодически пересоздаётся: старое сообщение
+# удаляется, новое публикуется с чистым view.
+CLAN_PANEL_REFRESH_HOURS = env_int("CLAN_PANEL_REFRESH_HOURS", 72)
+# Заявка без решения дольше этого срока закрывается автоматически — иначе
+# она навсегда блокирует игроку новую подачу (анти-дубликат в on_submit).
+APPLICATION_TTL_DAYS = env_int("APPLICATION_TTL_DAYS", 7)
+
+_PANEL_CHANNEL_FLAG = "clan_panel_channel"
+_PANEL_MESSAGE_FLAG = "clan_panel_message"
+_PANEL_AT_FLAG = "clan_panel_at"
+
+
+def _parse_iso_utc(value):
+    """ISO-дата из БД -> aware datetime в UTC (или None)."""
+    if not value:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+async def _save_clan_panel(channel_id, message_id) -> None:
+    """Запоминает, где лежит текущая панель заявки."""
+    await seen_repo.set_flag(_PANEL_CHANNEL_FLAG, str(channel_id))
+    await seen_repo.set_flag(_PANEL_MESSAGE_FLAG, str(message_id))
+    await seen_repo.set_flag(_PANEL_AT_FLAG, str(time.time()))
+
+
+async def _delete_clan_panel_message(channel, message_id) -> bool:
+    """Удаляет прежнее сообщение панели. False — его уже нет."""
+    try:
+        old = await channel.fetch_message(int(message_id))
+    except discord.NotFound:
+        return False
+    except (discord.Forbidden, discord.HTTPException) as e:
+        log(f"⚠️ панель заявки: не прочитать старое сообщение: {e}")
+        return False
+    try:
+        await old.delete()
+        return True
+    except discord.NotFound:
+        return False
+    except (discord.Forbidden, discord.HTTPException) as e:
+        log(f"⚠️ панель заявки: не удалить старое сообщение: {e}")
+        return False
+
+
+async def refresh_clan_panel(bot) -> str:
+    """Пересоздаёт панель заявки: удаляет старое сообщение, пишет новое."""
+    raw_channel = await seen_repo.get_flag(_PANEL_CHANNEL_FLAG)
+    if not raw_channel:
+        return "панель ещё не публиковалась (!setup_clan)"
+    try:
+        channel_id = int(raw_channel)
+    except (TypeError, ValueError):
+        return "битый id канала панели"
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        return f"канал {channel_id} недоступен"
+
+    raw_message = await seen_repo.get_flag(_PANEL_MESSAGE_FLAG)
+    if raw_message:
+        try:
+            await _delete_clan_panel_message(channel, int(raw_message))
+        except Exception as e:
+            log(f"⚠️ панель: не удалил прежнее сообщение: {e}")
+
+    msg = await safe_send(channel, embed=_build_clan_conditions_embed(),
+                          view=ClanView())
+    if msg is None:
+        return "не удалось отправить новую панель"
+    await _save_clan_panel(channel.id, msg.id)
+    return "панель обновлена"
+
+
+@tasks.loop(hours=6)
+async def clan_panel_refresh():
+    """Раз в CLAN_PANEL_REFRESH_HOURS перепубликует панель заявки."""
+    try:
+        raw_at = await seen_repo.get_flag(_PANEL_AT_FLAG)
+        try:
+            posted_at = float(raw_at or 0)
+        except (TypeError, ValueError):
+            posted_at = 0.0
+        if posted_at <= 0:
+            return  # панель ещё ни разу не публиковали
+        if time.time() - posted_at < CLAN_PANEL_REFRESH_HOURS * 3600:
+            return
+        status = await refresh_clan_panel(bot)
+        log(f"🔄 Панель заявки: {status}")
+    except Exception as e:
+        await log_error(bot, "clan_panel_refresh", e)
+
+
+@clan_panel_refresh.before_loop
+async def before_clan_panel_refresh():
+    await bot.wait_until_ready()
+    await asyncio.sleep(random.randint(30, 120))
+
+
 @bot.command(name="setup_clan", aliases=["setup"])
 @commands.has_permissions(administrator=True)
 async def setup_clan(ctx):
@@ -6716,9 +6899,20 @@ async def setup_clan(ctx):
         await safe_send(ctx.channel, "❌ Нет прав.")
         return
     try:
+        # Повторный запуск не должен оставлять в канале две панели.
+        old_id = await seen_repo.get_flag(_PANEL_MESSAGE_FLAG)
+        if old_id:
+            try:
+                await _delete_clan_panel_message(ctx.channel, int(old_id))
+            except Exception as e:
+                # Удаление старой панели — best-effort: она не должна
+                # мешать публикации новой.
+                log(f"⚠️ панель: не удалил прежнее сообщение: {e}")
         embed = _build_clan_conditions_embed()
         view = ClanView()
-        await safe_send(ctx.channel, embed=embed, view=view)
+        msg = await safe_send(ctx.channel, embed=embed, view=view)
+        if msg is not None:
+            await _save_clan_panel(ctx.channel.id, msg.id)
     except Exception as e:
         await log_error(ctx.bot, "!setup_clan", e)
         await safe_send(ctx.channel, f"❌ Ошибка: {str(e)[:200]}")
