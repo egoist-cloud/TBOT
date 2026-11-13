@@ -2211,6 +2211,8 @@ CLAN_ROLE_COLOR = 0x8E7CF3  # приятный фиолетовый — Discord 
 # Имена ролей, которые бот когда-либо создавал/выдавал. Нужны, чтобы снять
 # роль клана, которого уже нет в /api/clans (клан распался, игрок вышел).
 CLAN_ROLES_FILE = "clan_roles.json"
+# Автоудаление ролей кланов без участников (1 — включено, 0 — выключено).
+CLAN_ROLE_CLEANUP_ENABLED = env_int("CLAN_ROLE_CLEANUP", 1) != 0
 
 
 def _load_clan_role_names() -> set:
@@ -2312,15 +2314,96 @@ async def _remove_roles_checked(member, roles, reason: str = "Синхрониз
 
 
 
+async def _ensure_role_hoisted(role, reason: str = "роли кланов показываем отдельно") -> None:
+    """Включает у роли «показывать участников отдельно» (hoist).
+
+    Ошибки не пробрасываем: роль без hoist полезнее, чем упавшая
+    синхронизация. Причина видна в логе.
+    """
+    if getattr(role, "hoist", False):
+        return
+    try:
+        await role.edit(hoist=True, reason=reason)
+    except discord.Forbidden:
+        log(f"⚠️ роль «{role.name}»: нет прав включить показ отдельно")
+    except discord.HTTPException as e:
+        log(f"⚠️ роль «{role.name}»: не включил показ отдельно: {e}")
+
+
+async def ensure_clan_roles_hoisted(guild, names=None) -> int:
+    """Включает «показывать участников отдельно» у всех ролей кланов.
+
+    Работает и на ролях, созданных до появления hoist: при следующей
+    синхронизации они переключаются сами. Возвращает число изменённых.
+    """
+    names = _load_clan_role_names() if names is None else set(names)
+    if not names:
+        return 0
+    me = getattr(guild, "me", None)
+    top = (me.top_role.position
+           if me is not None and getattr(me, "top_role", None) else -1)
+    changed = 0
+    for role in list(guild.roles):
+        if role.name not in names or getattr(role, "hoist", False):
+            continue
+        if top >= 0 and role.position >= top:
+            continue  # выше роли бота — редактировать нельзя
+        await _ensure_role_hoisted(role)
+        if getattr(role, "hoist", False):
+            changed += 1
+    return changed
+
+
+async def cleanup_empty_clan_roles(guild, names=None) -> tuple[list, list]:
+    """Удаляет роли кланов без участников — только те, что ведёт бот.
+
+    Список известных имён хранится в ``clan_roles.json``: туда попадают
+    роли, которые бот создал или нашёл по имени клана. Служебные роли
+    (BAN, модераторы и любые другие) не удаляются никогда — их нет в списке.
+
+    Возвращает (удалённые имена, ошибки).
+    """
+    deleted: list = []
+    errors: list = []
+    if not CLAN_ROLE_CLEANUP_ENABLED:
+        return deleted, errors
+    names = _load_clan_role_names() if names is None else set(names)
+    if not names:
+        return deleted, errors
+    me = getattr(guild, "me", None)
+    top = (me.top_role.position
+           if me is not None and getattr(me, "top_role", None) else -1)
+    for role in list(guild.roles):
+        if role.name not in names:
+            continue
+        if role.members:
+            continue  # у клана есть носители — роль остаётся
+        if top >= 0 and role.position >= top:
+            errors.append(f"«{role.name}»: роль бота ниже — удалить нельзя")
+            continue
+        try:
+            await role.delete(reason="Клан больше не представлен на сервере")
+        except discord.Forbidden:
+            errors.append(f"«{role.name}»: нет права Manage Roles")
+        except discord.HTTPException as e:
+            errors.append(f"«{role.name}»: {e}")
+        else:
+            deleted.append(role.name)
+            log(f"🧹 Удалена роль клана без участников: «{role.name}»")
+    return deleted, errors
+
+
 async def _find_or_create_clan_role(guild, member, clan_name: str, reason: str = "автосинхронизация"):
     """Находит роль по имени клана или создаёт её.
 
     Возвращает (role, status_text) — status_text непуст, если роль создана.
     """
-    # 1) Повторно не создаём: роль по названию клана.
+    # 1) Повторно не создаём: роль по названию клана. Если роль была
+    #    создана до включения hoist — включаем показ отдельно.
     target = discord.utils.get(guild.roles, name=clan_name)
     if target is not None:
         _remember_clan_role_name(clan_name)
+        await _ensure_role_hoisted(target, reason)
         return target, None
 
     # 2) Проверяем права бота на управление ролями.
@@ -2341,7 +2424,9 @@ async def _find_or_create_clan_role(guild, member, clan_name: str, reason: str =
         target = await guild.create_role(
             name=clan_name,
             color=discord.Colour(CLAN_ROLE_COLOR),
-            hoist=False,
+            # hoist=True — участники клана видны отдельной группой в списке
+            # участников (то самое «показывать отдельно»).
+            hoist=True,
             mentionable=False,
             reason=reason,
         )
@@ -7357,7 +7442,35 @@ async def hourly_clan_sync():
                     if not m.bot and m.id not in linked_ids
                     and any(r.id in managed_ids or r.name in known_names for r in m.roles)]
 
+        # Роли кланов: включаем «показывать отдельно» и удаляем те, что
+        # больше никто не носит. Трогаем только роли из clan_roles.json —
+        # служебные (BAN, модераторы и т.п.) не удаляются.
+        hoisted = 0
+        removed, cleanup_errors = [], []
+        cleanup_skipped = ""
+        try:
+            hoisted = await ensure_clan_roles_hoisted(guild)
+            if stopped:
+                # Синхронизация прервана блокировкой: данных не хватает,
+                # удалять роли на неполном проходе опасно.
+                cleanup_skipped = ("⏸ Удаление пустых ролей кланов пропущено: "
+                                   "синхронизация прервана блокировкой cs2red")
+            else:
+                removed, cleanup_errors = await cleanup_empty_clan_roles(guild)
+        except Exception as e:
+            cleanup_errors = [f"{type(e).__name__}: {e}"]
+
         notes = []
+        if hoisted:
+            notes.append(f"🔔 Ролей клана с показом отдельно включено: {hoisted}")
+        if removed:
+            notes.append("🧹 Удалены роли кланов без участников: "
+                         + ", ".join(f"«{n}»" for n in removed[:20]))
+        if cleanup_errors:
+            notes.append("⚠️ Не удалось удалить роли кланов: "
+                         + "; ".join(cleanup_errors[:10]))
+        if cleanup_skipped:
+            notes.append(cleanup_skipped)
         if stopped:
             notes.append(f"⛔ Остановлено: cs2red блокирует ({stopped}), остальные не проверены.")
         if above:
