@@ -3454,6 +3454,8 @@ class MyBot(commands.Bot):
             daily_summary.start()
             clan_panel_refresh.start()
             expire_applications.start()
+            auto_link_watch.start()
+            sync_all_watch.start()
             if not GUILD_ID:
                 log("⚠️ GUILD_ID = 0 — автосинхронизация ролей клана и /check "
                     "не смогут найти сервер (задайте GUILD_ID)")
@@ -4090,6 +4092,13 @@ async def link_all(i):
     except Exception as e:
         await log_error(i.client, "/link_all", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
+
+
+def _unlinked_members(guild, links) -> list:
+    """Участники без привязки Discord↔Steam (ботов не считаем)."""
+    linked_ids = {str(k) for k in (links or {})}
+    return [m for m in guild.members
+            if not m.bot and str(m.id) not in linked_ids]
 
 
 @bot.tree.command(name="auto_link", description="Авто-привязка по никам через админ-панель cs2red (админ)")
@@ -7496,6 +7505,137 @@ async def hourly_clan_sync():
 async def before_hourly_clan_sync():
     await bot.wait_until_ready()
     await asyncio.sleep(random.randint(60, 180))
+
+
+# ============================================================
+# ФОНОВЫЕ ЗАДАЧИ: АВТО-ПРИВЯЗКА И СИНХРОНИЗАЦИЯ РОЛЕЙ
+# ============================================================
+# Запускают те же функции, что /auto_link и /sync_all: логика одна,
+# меняется только источник «интеракции» — фоновый контекст.
+AUTO_LINK_INTERVAL_HOURS = env_int("AUTO_LINK_INTERVAL_HOURS", 3)
+SYNC_ALL_INTERVAL_MINUTES = env_int("SYNC_ALL_INTERVAL_MINUTES", 90)
+
+
+class _BackgroundActor:
+    """Заглушка автора действия для аудита и подписи Embed'а."""
+
+    def __init__(self, name: str):
+        self.display_name = name
+        self.id = 0
+        self.mention = name
+
+
+class _NullMessage:
+    """Сообщение-заглушка: прогресс некуда править — молча пропускаем."""
+
+    async def edit(self, **kwargs):
+        return None
+
+    async def delete(self):
+        return None
+
+
+class _BackgroundFollowup:
+    """followup для фонового запуска: пишет в лог-канал без ephemeral."""
+
+    def __init__(self, channel):
+        self._channel = channel
+
+    async def send(self, *args, **kwargs):
+        if self._channel is None:
+            return _NullMessage()
+        kwargs.pop("ephemeral", None)
+        msg = await safe_send(self._channel, *args, **kwargs)
+        return msg if msg is not None else _NullMessage()
+
+
+class _BackgroundResponse:
+    """response-заглушка: для close_interaction в обработчике ошибок."""
+
+    def is_done(self) -> bool:
+        return True
+
+    async def send_message(self, *args, **kwargs):
+        return None
+
+    async def defer(self, *args, **kwargs):
+        return None
+
+
+class _BackgroundContext:
+    """Минимальный «Interaction» для вызова командной логики по расписанию."""
+
+    def __init__(self, guild, channel, actor_name: str):
+        self.guild = guild
+        self.client = bot
+        self.user = _BackgroundActor(actor_name)
+        self.followup = _BackgroundFollowup(channel)
+        self.response = _BackgroundResponse()
+
+
+@tasks.loop(hours=max(1, AUTO_LINK_INTERVAL_HOURS))
+async def auto_link_watch():
+    """Авто-привязка по никам раз в N часов — только если есть непривязанные."""
+    try:
+        guild = bot.get_guild(GUILD_ID)
+        if guild is None or not CS2RED_COOKIES:
+            return
+        if api.is_blocked():
+            log(f"⏸ Авто-привязка пропущена: cs2red на паузе ({api.blocked_reason})")
+            return
+        links = await links_repo.get_all_links()
+        unlinked = _unlinked_members(guild, links)
+        if not unlinked:
+            return  # всё уже привязано — повторно не надо
+        lock = _heavy_lock("auto_link")
+        if lock.locked():
+            log("⏸ Авто-привязка пропущена: уже выполняется вручную")
+            return
+        log(f"🔗 Авто-привязка по расписанию: непривязанных {len(unlinked)}")
+        async with lock:
+            channel = bot.get_channel(LOG_CHANNEL_ID) if LOG_CHANNEL_ID else None
+            ctx = _BackgroundContext(guild, channel, "Авто-привязка")
+            await run_auto_link(ctx, ephemeral=False)
+    except Exception as e:
+        await log_error(bot, "auto_link_watch", e)
+
+
+@auto_link_watch.before_loop
+async def before_auto_link_watch():
+    await bot.wait_until_ready()
+    await asyncio.sleep(random.randint(120, 300))
+
+
+@tasks.loop(minutes=max(15, SYNC_ALL_INTERVAL_MINUTES))
+async def sync_all_watch():
+    """Синхронизация ролей всех привязанных раз в N минут."""
+    try:
+        guild = bot.get_guild(GUILD_ID)
+        if guild is None:
+            return
+        links = await links_repo.get_all_links()
+        if not links:
+            return
+        if api.is_blocked():
+            log(f"⏸ Синхронизация ролей пропущена: cs2red на паузе ({api.blocked_reason})")
+            return
+        lock = _heavy_lock("sync_all")
+        if lock.locked():
+            log("⏸ Синхронизация ролей пропущена: уже выполняется вручную")
+            return
+        log(f"🔄 Синхронизация ролей по расписанию: привязок {len(links)}")
+        async with lock:
+            channel = bot.get_channel(LOG_CHANNEL_ID) if LOG_CHANNEL_ID else None
+            ctx = _BackgroundContext(guild, channel, "Синхронизация")
+            await run_sync_all(ctx, ephemeral=False)
+    except Exception as e:
+        await log_error(bot, "sync_all_watch", e)
+
+
+@sync_all_watch.before_loop
+async def before_sync_all_watch():
+    await bot.wait_until_ready()
+    await asyncio.sleep(random.randint(120, 300))
 
 
 # ============================================================
