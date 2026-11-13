@@ -64,6 +64,15 @@ class _FakeMember:
         self.display_name = "Игрок"
         self.top_role = _FakeRole("member", position=top_position)
         self.roles = list(roles)
+        self.guild = None
+
+    async def add_roles(self, role, reason=None):
+        if role not in self.roles:
+            self.roles.append(role)
+
+    async def remove_roles(self, role, reason=None):
+        if role in self.roles:
+            self.roles.remove(role)
 
 
 # ============================================================
@@ -195,3 +204,115 @@ def test_existing_clan_role_gets_hoisted():
     assert guild.created == [], "роль не пересоздаётся"
     assert existing.hoist is True
     print("  ok: старая роль клана получает hoist сама")
+
+
+# ============================================================
+# Удаление роли клана сразу, когда её никто не носит
+# ============================================================
+def test_role_deleted_immediately_when_empty():
+    """Игрок вышел из клана — роль 123 удаляется, не висит до уборки."""
+    role = _FakeRole("123", members=[], position=5)
+    guild = _FakeGuild([role])
+
+    deleted = asyncio.run(botmod._delete_clan_role_if_empty(
+        guild, role, names={"123"}))
+
+    assert deleted == "123"
+    assert role.deleted is True
+    print("  ok: пустая роль клана удаляется сразу")
+
+
+def test_role_kept_when_someone_else_holds_it():
+    """В клане остался другой игрок — роль не трогаем."""
+    role = _FakeRole("123", members=[_FakeMember()], position=5)
+    guild = _FakeGuild([role])
+
+    assert asyncio.run(botmod._delete_clan_role_if_empty(
+        guild, role, names={"123"})) is None
+    assert role.deleted is False
+    print("  ok: роль живёт, пока её кто-то носит")
+
+
+def test_role_not_deleted_if_not_clan_role():
+    """Пустая роль BAN удаляется только вручную, не ботом."""
+    role = _FakeRole("BAN", members=[], position=5)
+    guild = _FakeGuild([role])
+
+    assert asyncio.run(botmod._delete_clan_role_if_empty(
+        guild, role, names=set())) is None
+    assert role.deleted is False
+    print("  ok: чужие роли не удаляются")
+
+
+def test_role_above_bot_not_deleted():
+    """Роль выше роли бота удалить нельзя — просто пропускаем."""
+    role = _FakeRole("123", members=[], position=20)
+    guild = _FakeGuild([role], top_position=10)
+
+    assert asyncio.run(botmod._delete_clan_role_if_empty(
+        guild, role, names={"123"})) is None
+    assert role.deleted is False
+    print("  ok: роль выше бота не удаляется")
+
+
+def test_member_leave_deletes_clan_role(monkeypatch):
+    """Игрок вышел с Discord-сервера — роль клана удаляется."""
+    role = _FakeRole("123", members=[], position=5)
+    guild = _FakeGuild([role])
+    member = _FakeMember(roles=[role])
+    member.guild = guild
+    # Discord может ещё держать ушедшего в кэше роли — он не считается.
+    role.members = [member]
+    forgotten = []
+    monkeypatch.setattr(botmod, "_forget_member_clan_role",
+                        lambda mid: forgotten.append(mid))
+    monkeypatch.setattr(botmod, "_load_clan_role_names", lambda: {"123"})
+
+    asyncio.run(botmod.on_member_remove(member))
+
+    assert role.deleted is True
+    assert forgotten == [member.id]
+    print("  ok: уход с сервера удаляет осиротевшую роль клана")
+
+
+def test_member_leave_keeps_other_roles(monkeypatch):
+    """Служебные роли (не клана) при уходе участника не удаляются."""
+    role = _FakeRole("BAN", members=[], position=5)
+    guild = _FakeGuild([role])
+    member = _FakeMember(roles=[role])
+    member.guild = guild
+    monkeypatch.setattr(botmod, "_forget_member_clan_role", lambda mid: None)
+    monkeypatch.setattr(botmod, "_load_clan_role_names", lambda: {"123"})
+
+    asyncio.run(botmod.on_member_remove(member))
+
+    assert role.deleted is False
+    print("  ok: не-клановые роли не трогаются")
+
+
+def test_leaving_clan_via_sync_deletes_role(monkeypatch):
+    """Синхронизация увидела выход из клана — роль снята и удалена."""
+    role = _FakeRole("123", members=[], position=5)
+    guild = _FakeGuild([role])
+    member = _FakeMember(roles=[role])
+
+    async def fake_clans():
+        return [{"clan_name": "123", "clan_id": 1,
+                 "members": [{"nick": "other"}]}]
+
+    async def fake_player_clan(steam_id, user=None, clans=None):
+        return None, None
+
+    monkeypatch.setattr(botmod.api, "cs2red_clans", fake_clans)
+    monkeypatch.setattr(botmod.api, "player_clan_checked", fake_player_clan)
+    monkeypatch.setattr(botmod, "_load_clan_role_names", lambda: {"123"})
+    monkeypatch.setattr(botmod, "_load_clan_members", lambda: {})
+    monkeypatch.setattr(botmod, "_forget_member_clan_role", lambda mid: None)
+
+    res = asyncio.run(botmod.sync_clan_role_by_id(
+        guild, member, "76561198000000001", user={"id": 7}))
+
+    assert "клан снят" in res, res
+    assert role not in member.roles
+    assert role.deleted is True
+    print("  ok: выход из клана удаляет пустую роль сразу")

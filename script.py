@@ -2456,6 +2456,38 @@ def _clan_roles_above_bot(guild, roles) -> list:
     return [r for r in roles if r.position >= me.top_role.position]
 
 
+async def _delete_clan_role_if_empty(guild, role, names=None,
+                                     exclude_member_id=None) -> str | None:
+    """Удаляет роль клана, если её больше никто не носит.
+
+    Вызывается сразу после того, как игрок вышел из клана или ушёл
+    с сервера, чтобы роль не висела до часовой уборки. Возвращает имя
+    удалённой роли или None. Трогает только роли кланов (clan_roles.json
+    и CLAN_ROLE_MAP), остальные — никогда.
+    """
+    if role is None or role not in getattr(guild, "roles", []):
+        return None
+    names = _load_clan_role_names() if names is None else set(names)
+    is_clan = role.name in names or role.id in CLAN_ROLE_MAP.values()
+    # Ушедший участник может ещё висеть в кэше роли — его не считаем.
+    holders = [m for m in (getattr(role, "members", None) or [])
+               if exclude_member_id is None or m.id != exclude_member_id]
+    if not is_clan or holders:
+        return None
+    if _clan_roles_above_bot(guild, [role]):
+        return None
+    try:
+        await role.delete(reason="Клан больше не представлен на сервере")
+    except discord.Forbidden:
+        log(f"⚠️ не удалил пустую роль клана «{role.name}»: нет права Manage Roles")
+        return None
+    except discord.HTTPException as e:
+        log(f"⚠️ не удалил пустую роль клана «{role.name}»: {e}")
+        return None
+    log(f"🧹 Удалена роль клана без участников: «{role.name}»")
+    return role.name
+
+
 async def _remove_roles_checked(member, roles, reason: str = "Синхронизация клана") -> list:
     """Снимает роли и возвращает список ошибок (пустой — всё снято)."""
     errors = []
@@ -2658,6 +2690,9 @@ async def sync_clan_role_by_id(guild, member, steam_id, user: dict | None = None
             if above:
                 errors.append("выше роли бота: "
                               + ", ".join(f"«{r.name}»" for r in above))
+            # Роль клана, которую больше никто не носит, удаляем сразу.
+            for r in to_remove:
+                await _delete_clan_role_if_empty(guild, r)
             if errors:
                 return "⚠️ клан снят не полностью: " + "; ".join(errors)
             _forget_member_clan_role(member.id)
@@ -2702,6 +2737,9 @@ async def sync_clan_role_by_id(guild, member, steam_id, user: dict | None = None
             held = [r for r in held if r not in above]
         if held:
             errors.extend(await _remove_roles_checked(member, held))
+            # Игрок перешёл в другой клан — старая роль могла опустеть.
+            for r in held:
+                await _delete_clan_role_if_empty(guild, r)
     suffix = (" (не сняты: " + "; ".join(errors) + ")") if errors else ""
 
     if target in member.roles:
@@ -3710,6 +3748,24 @@ async def on_ready():
     log(f"🆔 GUILD_ID: {GUILD_ID}")
     log(f"🍪 CS2RED cookies: {len(CS2RED_COOKIES)} шт.")
     log(f"📡 Guilds: {[g.name for g in bot.guilds]}")
+
+
+@bot.event
+async def on_member_remove(member):
+    """Участник ушёл с сервера: роль клана без носителей удаляем сразу."""
+    try:
+        _forget_member_clan_role(member.id)
+        guild = getattr(member, "guild", None)
+        if guild is None:
+            return
+        names = _load_clan_role_names()
+        managed_ids = set(CLAN_ROLE_MAP.values())
+        for role in list(getattr(member, "roles", [])):
+            if role.name in names or role.id in managed_ids:
+                await _delete_clan_role_if_empty(
+                    guild, role, names=names, exclude_member_id=member.id)
+    except Exception as e:
+        log(f"⚠️ on_member_remove: {type(e).__name__}: {e}")
 
 
 @bot.event

@@ -94,6 +94,11 @@ class _FakeRole:
         self.id = role_id
         self.name = name
         self.position = position
+        self.members = []
+        self.deleted = False
+
+    async def delete(self, reason=None):
+        self.deleted = True
 
     def __eq__(self, other):
         return isinstance(other, _FakeRole) and other.id == self.id
