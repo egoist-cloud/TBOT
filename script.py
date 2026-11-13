@@ -6807,50 +6807,95 @@ async def _save_clan_panel(channel_id, message_id) -> None:
     await seen_repo.set_flag(_PANEL_AT_FLAG, str(time.time()))
 
 
-async def _delete_clan_panel_message(channel, message_id) -> bool:
-    """Удаляет прежнее сообщение панели. False — его уже нет."""
+# Предупреждения о панели не чаще раза в 6 часов на каждую причину:
+# задача крутится часто, а один и тот же текст в логе — шум.
+_PANEL_ALERT_SECONDS = 6 * 3600
+_panel_alert_at: dict = {}
+
+
+def _panel_alert_once(key: str, text: str) -> bool:
+    """Пишет предупреждение о панели в общий лог (с троттлингом)."""
+    now = time.time()
+    if now - _panel_alert_at.get(key, 0.0) < _PANEL_ALERT_SECONDS:
+        return False
+    _panel_alert_at[key] = now
+    log(f"⚠️ Панель заявки: {text}")
+    return True
+
+
+async def _delete_clan_panel_message(channel, message_id) -> tuple[str, str]:
+    """Удаляет прежнее сообщение панели.
+
+    Возвращает (статус, подробности):
+      * ``deleted``   — сообщение удалено;
+      * ``missing``   — его уже нет (удалили вручную) — это норма;
+      * ``forbidden`` — нет права Manage Messages;
+      * ``error``     — прочий сбой (текст исключения в подробностях).
+    """
     try:
         old = await channel.fetch_message(int(message_id))
     except discord.NotFound:
-        return False
-    except (discord.Forbidden, discord.HTTPException) as e:
-        log(f"⚠️ панель заявки: не прочитать старое сообщение: {e}")
-        return False
+        return "missing", ""
+    except discord.Forbidden:
+        return "forbidden", "нет права читать историю канала"
+    except Exception as e:  # noqa: BLE001 - удаление best-effort
+        return "error", f"{type(e).__name__}: {e}"
     try:
         await old.delete()
-        return True
+        return "deleted", ""
     except discord.NotFound:
-        return False
-    except (discord.Forbidden, discord.HTTPException) as e:
-        log(f"⚠️ панель заявки: не удалить старое сообщение: {e}")
-        return False
+        return "missing", ""
+    except discord.Forbidden:
+        return "forbidden", "нет права Manage Messages"
+    except Exception as e:  # noqa: BLE001 - удаление best-effort
+        return "error", f"{type(e).__name__}: {e}"
 
 
 async def refresh_clan_panel(bot) -> str:
-    """Пересоздаёт панель заявки: удаляет старое сообщение, пишет новое."""
+    """Пересоздаёт панель заявки: удаляет старое сообщение, пишет новое.
+
+    Возвращает человекочитаемый статус — его пишет вызывающая задача.
+    Канал ищется по id (переименование не ломает обновление), а вот
+    удалённый канал или отсутствие прав не считаются успехом.
+    """
     raw_channel = await seen_repo.get_flag(_PANEL_CHANNEL_FLAG)
     if not raw_channel:
-        return "панель ещё не публиковалась (!setup_clan)"
+        return ("панель не настроена: выполните !setup_clan в канале "
+                "с условиями")
     try:
         channel_id = int(raw_channel)
     except (TypeError, ValueError):
-        return "битый id канала панели"
+        return f"битый id канала панели в meta: {raw_channel!r}"
     channel = bot.get_channel(channel_id)
     if channel is None:
-        return f"канал {channel_id} недоступен"
+        return (f"канал {channel_id} недоступен: удалён или бот его не видит "
+                f"(проверьте права и что канал не удалили)")
 
+    delete_status, delete_detail = "missing", ""
     raw_message = await seen_repo.get_flag(_PANEL_MESSAGE_FLAG)
     if raw_message:
         try:
-            await _delete_clan_panel_message(channel, int(raw_message))
-        except Exception as e:
-            log(f"⚠️ панель: не удалил прежнее сообщение: {e}")
+            delete_status, delete_detail = await _delete_clan_panel_message(
+                channel, int(raw_message))
+        except Exception as e:  # noqa: BLE001 - удаление не должно мешать публикации
+            delete_status, delete_detail = "error", f"{type(e).__name__}: {e}"
 
-    msg = await safe_send(channel, embed=_build_clan_conditions_embed(),
-                          view=ClanView())
+    try:
+        msg = await safe_send(channel, embed=_build_clan_conditions_embed(),
+                              view=ClanView())
+    except discord.Forbidden:
+        return (f"нет прав на публикацию в канале {channel_id}: нужны "
+                f"Send Messages и Embed Links")
     if msg is None:
-        return "не удалось отправить новую панель"
+        return "не удалось отправить новую панель в канал"
     await _save_clan_panel(channel.id, msg.id)
+
+    if delete_status == "forbidden":
+        return ("панель опубликована, но старое сообщение не удалено "
+                f"({delete_detail}): в канале будет две панели")
+    if delete_status == "error":
+        return ("панель опубликована, старое сообщение удалить не удалось: "
+                f"{delete_detail}")
     return "панель обновлена"
 
 
@@ -6858,19 +6903,46 @@ async def refresh_clan_panel(bot) -> str:
 async def clan_panel_refresh():
     """Раз в CLAN_PANEL_REFRESH_HOURS перепубликует панель заявки."""
     try:
+        raw_channel = await seen_repo.get_flag(_PANEL_CHANNEL_FLAG)
+        if not raw_channel:
+            # Первый деплой без !setup_clan: раньше здесь был тихий return.
+            if _panel_alert_once(
+                    "not-configured",
+                    "не настроена — выполните !setup_clan в канале с условиями"):
+                await _notify_panel_problem(
+                    "Панель заявки не настроена: выполните !setup_clan")
+            return
+
         raw_at = await seen_repo.get_flag(_PANEL_AT_FLAG)
         try:
             posted_at = float(raw_at or 0)
         except (TypeError, ValueError):
             posted_at = 0.0
-        if posted_at <= 0:
-            return  # панель ещё ни разу не публиковали
-        if time.time() - posted_at < CLAN_PANEL_REFRESH_HOURS * 3600:
+        if posted_at and time.time() - posted_at < \
+                CLAN_PANEL_REFRESH_HOURS * 3600:
             return
+
         status = await refresh_clan_panel(bot)
-        log(f"🔄 Панель заявки: {status}")
+        if status == "панель обновлена":
+            _panel_alert_at.pop("refresh", None)
+            log("🔄 Панель заявки обновлена "
+                f"(каждые {CLAN_PANEL_REFRESH_HOURS} ч)")
+            return
+        if _panel_alert_once("refresh", status):
+            await _notify_panel_problem(f"не обновлена — {status}")
     except Exception as e:
         await log_error(bot, "clan_panel_refresh", e)
+
+
+async def _notify_panel_problem(text: str) -> None:
+    """Дублирует проблему с панелью в лог-канал (если он доступен)."""
+    channel = bot.get_channel(LOG_CHANNEL_ID) if LOG_CHANNEL_ID else None
+    if channel is None:
+        return
+    try:
+        await safe_send(channel, f"⚠️ {text}")
+    except Exception as e:  # noqa: BLE001 - лог не должен ронять задачу
+        log(f"⚠️ панель: не смог написать в лог-канал: {e}")
 
 
 @clan_panel_refresh.before_loop
@@ -6903,7 +6975,11 @@ async def setup_clan(ctx):
         old_id = await seen_repo.get_flag(_PANEL_MESSAGE_FLAG)
         if old_id:
             try:
-                await _delete_clan_panel_message(ctx.channel, int(old_id))
+                status, detail = await _delete_clan_panel_message(
+                    ctx.channel, int(old_id))
+                if status not in ("deleted", "missing"):
+                    log(f"⚠️ панель: старое сообщение не удалено ({status}"
+                        f"{': ' + detail if detail else ''})")
             except Exception as e:
                 # Удаление старой панели — best-effort: она не должна
                 # мешать публикации новой.

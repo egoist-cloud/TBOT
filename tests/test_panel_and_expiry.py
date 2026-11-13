@@ -52,7 +52,40 @@ class _FakeBot:
         self.channel = channel
 
     def get_channel(self, channel_id):
+        if self.channel is None:
+            return None
         return self.channel if channel_id == self.channel.id else None
+
+
+def _http_response(status, reason):
+    return type("R", (), {"status": status, "reason": reason})()
+
+
+def _forbidden():
+    return botmod.discord.Forbidden(
+        _http_response(403, "Forbidden"), "Missing Permissions")
+
+
+class _NamedChannel(_FakeChannel):
+    """Канал с именем: переименование не должно мешать обновлению."""
+
+    def __init__(self, channel_id, old_message, name):
+        super().__init__(channel_id, old_message)
+        self.name = name
+
+
+class _ForbiddenDeleteMessage(_FakeMessage):
+    """Старое сообщение есть, но удалить его бот не может."""
+
+    async def delete(self):
+        raise _forbidden()
+
+
+class _ForbiddenSendChannel(_FakeChannel):
+    """Публиковать в канал бот не может."""
+
+    async def send(self, *args, **kwargs):
+        raise _forbidden()
 
 
 async def _seed(user_id, app_id, status="pending"):
@@ -87,7 +120,8 @@ def test_refresh_panel_without_publication():
             await seen_repo.set_flag("clan_panel_channel", "")
             bot = _FakeBot(_FakeChannel(555))
             status = await botmod.refresh_clan_panel(bot)
-            assert "не публиковалась" in status
+            assert "не настроена" in status, status
+            assert "!setup_clan" in status, status
             assert bot.channel.sent == []
         finally:
             await _reset_panel_flags()
@@ -236,6 +270,154 @@ def test_expire_disabled_with_zero_days():
 
     asyncio.run(scenario())
     print("  ok: TTL=0 выключает автозакрытие")
+
+
+# ============================================================
+# Ошибочные ситуации при обновлении панели
+# ============================================================
+def test_refresh_panel_channel_deleted():
+    """Канал удалён: понятный статус, ничего не отправляем."""
+    async def scenario():
+        await init_db()
+        try:
+            bot = _FakeBot(None)  # get_channel -> None
+            await seen_repo.set_flag("clan_panel_channel", "777")
+            await seen_repo.set_flag("clan_panel_message", "111")
+            await seen_repo.set_flag("clan_panel_at", "1")
+
+            status = await botmod.refresh_clan_panel(bot)
+            assert "недоступен" in status, status
+            assert "777" in status
+            # Флаги не трогаем: канал могут вернуть правами/восстановить.
+            assert await seen_repo.get_flag("clan_panel_message") == "111"
+        finally:
+            await _reset_panel_flags()
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: удалённый канал даёт понятный статус")
+
+
+def test_refresh_panel_channel_renamed():
+    """Канал переименовали — поиск по id, обновление проходит."""
+    async def scenario():
+        await init_db()
+        try:
+            old = _FakeMessage(111)
+            channel = _NamedChannel(555, old, "новое-имя-канала")
+            bot = _FakeBot(channel)
+            await seen_repo.set_flag("clan_panel_channel", "555")
+            await seen_repo.set_flag("clan_panel_message", "111")
+            await seen_repo.set_flag("clan_panel_at", "1")
+
+            status = await botmod.refresh_clan_panel(bot)
+            assert status == "панель обновлена", status
+            assert old.deleted is True
+            assert len(channel.sent) == 1
+        finally:
+            await _reset_panel_flags()
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: переименование канала не ломает обновление")
+
+
+def test_refresh_panel_without_manage_messages():
+    """Нет Manage Messages: новая панель публикуется, статус предупреждает."""
+    async def scenario():
+        await init_db()
+        try:
+            old = _ForbiddenDeleteMessage(111)
+            channel = _FakeChannel(555, old_message=old)
+            bot = _FakeBot(channel)
+            await seen_repo.set_flag("clan_panel_channel", "555")
+            await seen_repo.set_flag("clan_panel_message", "111")
+            await seen_repo.set_flag("clan_panel_at", "1")
+
+            status = await botmod.refresh_clan_panel(bot)
+            assert "Manage Messages" in status, status
+            assert "две панели" in status, status
+            assert len(channel.sent) == 1, "новая панель должна уйти"
+            assert await seen_repo.get_flag("clan_panel_message") == \
+                str(channel.sent[0]["message"].id)
+        finally:
+            await _reset_panel_flags()
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: без Manage Messages панель дублируется, но живёт")
+
+
+def test_refresh_panel_without_send_permission():
+    """Нет прав на отправку: статус про права, старые флаги целы."""
+    async def scenario():
+        await init_db()
+        try:
+            channel = _ForbiddenSendChannel(555, old_message=_FakeMessage(111))
+            bot = _FakeBot(channel)
+            await seen_repo.set_flag("clan_panel_channel", "555")
+            await seen_repo.set_flag("clan_panel_message", "111")
+            await seen_repo.set_flag("clan_panel_at", "1")
+
+            status = await botmod.refresh_clan_panel(bot)
+            assert "нет прав на публикацию" in status, status
+            assert "Send Messages" in status
+            assert channel.sent == []
+            assert await seen_repo.get_flag("clan_panel_message") == "111"
+        finally:
+            await _reset_panel_flags()
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: без прав на отправку — понятный статус и без потери флагов")
+
+
+def test_panel_task_warns_when_not_configured(monkeypatch):
+    """Первый деплой без !setup_clan: предупреждение в лог, не чаще раза в 6 ч."""
+    async def scenario():
+        await init_db()
+        try:
+            await _reset_panel_flags()
+            botmod._panel_alert_at.clear()
+            messages = []
+            monkeypatch.setattr(botmod, "log", messages.append)
+
+            await botmod.clan_panel_refresh.coro()
+            assert any("!setup_clan" in m for m in messages), messages
+
+            count = len(messages)
+            await botmod.clan_panel_refresh.coro()
+            assert len(messages) == count, "повтор не должен спамить лог"
+        finally:
+            botmod._panel_alert_at.clear()
+            await _reset_panel_flags()
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: отсутствие настройки панели пишется в лог")
+
+
+def test_panel_task_reports_missing_channel(monkeypatch):
+    """Канал удалён: задача пишет предупреждение, а не молчит."""
+    async def scenario():
+        await init_db()
+        try:
+            await seen_repo.set_flag("clan_panel_channel", "999999")
+            await seen_repo.set_flag("clan_panel_message", "111")
+            await seen_repo.set_flag("clan_panel_at", "1")
+            botmod._panel_alert_at.clear()
+            messages = []
+            monkeypatch.setattr(botmod, "log", messages.append)
+
+            await botmod.clan_panel_refresh.coro()
+            assert any("недоступен" in m for m in messages), messages
+        finally:
+            botmod._panel_alert_at.clear()
+            await _reset_panel_flags()
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: задача сообщает об удалённом канале")
 
 
 def test_parse_iso_utc():
