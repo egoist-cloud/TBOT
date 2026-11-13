@@ -2371,6 +2371,8 @@ CLAN_ROLE_COLOR = 0x8E7CF3  # приятный фиолетовый — Discord 
 CLAN_ROLES_FILE = "clan_roles.json"
 # Автоудаление ролей кланов без участников (1 — включено, 0 — выключено).
 CLAN_ROLE_CLEANUP_ENABLED = env_int("CLAN_ROLE_CLEANUP", 1) != 0
+# Период автоочистки пустых ролей кланов, часы (10 по умолчанию).
+CLAN_ROLE_CLEANUP_HOURS = env_int("CLAN_ROLE_CLEANUP_HOURS", 10)
 
 
 def _load_clan_role_names() -> set:
@@ -3652,6 +3654,7 @@ class MyBot(commands.Bot):
             expire_applications.start()
             auto_link_watch.start()
             sync_all_watch.start()
+            clan_role_cleanup_watch.start()
             if not GUILD_ID:
                 log("⚠️ GUILD_ID = 0 — автосинхронизация ролей клана и /check "
                     "не смогут найти сервер (задайте GUILD_ID)")
@@ -4052,6 +4055,45 @@ async def admlink(i, user: discord.Member, steam_id: str):
     except Exception as e:
         await log_error(i.client, "/admlink", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
+
+
+@bot.tree.command(name="clan_roleclear",
+                  description="Удалить роли кланов, которые никто не носит (админ)")
+@app_commands.default_permissions(administrator=True)
+async def clan_roleclear(i):
+    await i.response.defer(ephemeral=True)
+    if not await _admin_guard(i):
+        return
+    try:
+        guild = i.guild
+        if guild is None:
+            await safe_send(i.followup, "❌ Команда работает только на сервере.",
+                            ephemeral=True)
+            return
+        known = _load_clan_role_names()
+        deleted, errors = await cleanup_empty_clan_roles(guild)
+        lines = [f"🧹 Удалено ролей клана: {len(deleted)}"]
+        if deleted:
+            lines += [f"• «{n}»" for n in deleted[:25]]
+            if len(deleted) > 25:
+                lines.append(f"…и ещё {len(deleted) - 25}")
+        if errors:
+            lines.append("⚠️ Не удалось удалить:")
+            lines += [f"• {e}" for e in errors[:10]]
+        if not deleted and not errors:
+            lines.append("Пустых ролей кланов нет — чистить нечего "
+                         f"(известных ролей кланов: {len(known)}).")
+        await safe_send(i.followup, "\n".join(lines)[:1900], ephemeral=True)
+        await log_to_channel(
+            i.client,
+            f"🧹 /clan_roleclear: удалено {len(deleted)}, ошибок {len(errors)}")
+        await audit_action(
+            i.client, "Принудительная очистка ролей кланов", actor=i.user,
+            details=(f"Удалено: {len(deleted)}\nОшибок: {len(errors)}\n"
+                     f"Известных ролей кланов: {len(known)}"))
+    except Exception as e:
+        await log_error(bot, "/clan_roleclear", e)
+        await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}", ephemeral=True)
 
 
 @bot.tree.command(name="sync_all", description="Синхронизировать всех")
@@ -7665,35 +7707,18 @@ async def hourly_clan_sync():
                     if not m.bot and m.id not in linked_ids
                     and any(r.id in managed_ids or r.name in known_names for r in m.roles)]
 
-        # Роли кланов: включаем «показывать отдельно» и удаляем те, что
-        # больше никто не носит. Трогаем только роли из clan_roles.json —
-        # служебные (BAN, модераторы и т.п.) не удаляются.
+        # Роли кланов: включаем «показывать отдельно». Удаление пустых
+        # ролей вынесено в отдельную задачу (раз в 10 часов), чтобы роли
+        # не исчезали в середине синхронизации.
         hoisted = 0
-        removed, cleanup_errors = [], []
-        cleanup_skipped = ""
         try:
             hoisted = await ensure_clan_roles_hoisted(guild)
-            if stopped:
-                # Синхронизация прервана блокировкой: данных не хватает,
-                # удалять роли на неполном проходе опасно.
-                cleanup_skipped = ("⏸ Удаление пустых ролей кланов пропущено: "
-                                   "синхронизация прервана блокировкой cs2red")
-            else:
-                removed, cleanup_errors = await cleanup_empty_clan_roles(guild)
         except Exception as e:
-            cleanup_errors = [f"{type(e).__name__}: {e}"]
+            log(f"⚠️ hourly_clan_sync: показ отдельно: {e}")
 
         notes = []
         if hoisted:
             notes.append(f"🔔 Ролей клана с показом отдельно включено: {hoisted}")
-        if removed:
-            notes.append("🧹 Удалены роли кланов без участников: "
-                         + ", ".join(f"«{n}»" for n in removed[:20]))
-        if cleanup_errors:
-            notes.append("⚠️ Не удалось удалить роли кланов: "
-                         + "; ".join(cleanup_errors[:10]))
-        if cleanup_skipped:
-            notes.append(cleanup_skipped)
         if stopped:
             notes.append(f"⛔ Остановлено: cs2red блокирует ({stopped}), остальные не проверены.")
         if above:
@@ -7738,6 +7763,11 @@ def _auto_link_first_delay() -> int:
 def _sync_all_first_delay() -> int:
     """Первый автозапуск синхронизации — через полный интервал после старта."""
     return max(60, SYNC_ALL_INTERVAL_MINUTES * 60)
+
+
+def _clan_cleanup_first_delay() -> int:
+    """Первый автозапуск очистки ролей кланов — через полный интервал."""
+    return max(60, CLAN_ROLE_CLEANUP_HOURS * 3600)
 
 
 class _BackgroundActor:
@@ -7863,6 +7893,38 @@ async def before_sync_all_watch():
     await bot.wait_until_ready()
     # Первый прогон — через интервал (2 ч по умолчанию), не при старте.
     await asyncio.sleep(_sync_all_first_delay())
+
+
+@tasks.loop(hours=max(1, CLAN_ROLE_CLEANUP_HOURS))
+async def clan_role_cleanup_watch():
+    """Удаляет роли кланов без участников раз в N часов (10 по умолчанию)."""
+    try:
+        guild = bot.get_guild(GUILD_ID)
+        if guild is None:
+            return
+        deleted, errors = await cleanup_empty_clan_roles(guild)
+        if not deleted and not errors:
+            return
+        log(f"🧹 Автоочистка ролей кланов: удалено {len(deleted)}, "
+            f"ошибок {len(errors)}")
+        channel = bot.get_channel(LOG_CHANNEL_ID) if LOG_CHANNEL_ID else None
+        if channel is None:
+            return
+        text = f"🧹 Удалены пустые роли кланов: {len(deleted)}"
+        if deleted:
+            text += "\n" + ", ".join(f"«{n}»" for n in deleted[:30])
+        if errors:
+            text += "\n⚠️ " + "; ".join(errors[:10])
+        await safe_send(channel, text[:1900])
+    except Exception as e:
+        await log_error(bot, "clan_role_cleanup_watch", e)
+
+
+@clan_role_cleanup_watch.before_loop
+async def before_clan_role_cleanup_watch():
+    await bot.wait_until_ready()
+    # Как и остальные задачи: первый прогон — через полный интервал.
+    await asyncio.sleep(_clan_cleanup_first_delay())
 
 
 # ============================================================

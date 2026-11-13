@@ -316,3 +316,125 @@ def test_leaving_clan_via_sync_deletes_role(monkeypatch):
     assert role not in member.roles
     assert role.deleted is True
     print("  ok: выход из клана удаляет пустую роль сразу")
+
+
+# ============================================================
+# Автоочистка раз в 10 часов и принудительная /clan_roleclear
+# ============================================================
+def test_auto_cleanup_interval_is_ten_hours():
+    """Автоочистка ролей кланов — раз в 10 часов, первый прогон через интервал."""
+    assert botmod.clan_role_cleanup_watch.hours == 10
+    assert botmod._clan_cleanup_first_delay() == 10 * 3600
+    print("  ok: автоочистка раз в 10 часов")
+
+
+class _CmdResponse:
+    def __init__(self):
+        self.deferred = False
+
+    async def defer(self, ephemeral=False):
+        self.deferred = True
+
+
+class _CmdFollowup:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, *args, **kwargs):
+        self.sent.append((args, kwargs))
+
+
+class _CmdInteraction:
+    def __init__(self):
+        self.response = _CmdResponse()
+        self.followup = _CmdFollowup()
+        self.guild = _FakeGuild([])
+        self.user = object()
+        self.client = object()
+
+
+def _sent_text(i) -> str:
+    """Текст последнего ответа: safe_send заворачивает его в Embed."""
+    args, kwargs = i.followup.sent[-1]
+    parts = [str(a) for a in args]
+    embed = kwargs.get("embed")
+    if embed is not None:
+        data = embed.to_dict()
+        parts.append(str(data.get("title", "")))
+        parts.append(str(data.get("description", "")))
+        for field in data.get("fields", []):
+            parts.append(str(field.get("name", "")))
+            parts.append(str(field.get("value", "")))
+    return " ".join(parts)
+
+
+def _prepare_command(monkeypatch, deleted, errors=(), allowed=True):
+    async def guard(_i):
+        return allowed
+
+    async def fake_cleanup(_guild):
+        return list(deleted), list(errors)
+
+    async def noop(*_a, **_kw):
+        return None
+
+    monkeypatch.setattr(botmod, "_admin_guard", guard)
+    monkeypatch.setattr(botmod, "cleanup_empty_clan_roles", fake_cleanup)
+    monkeypatch.setattr(botmod, "_load_clan_role_names", lambda: {"123"})
+    monkeypatch.setattr(botmod, "log_to_channel", noop)
+    monkeypatch.setattr(botmod, "audit_action", noop)
+
+
+def test_clan_roleclear_reports_deleted(monkeypatch):
+    """/clan_roleclear удаляет пустые роли кланов и отчитывается списком."""
+    _prepare_command(monkeypatch, ["123", "плагбой лох"])
+    i = _CmdInteraction()
+
+    asyncio.run(botmod.clan_roleclear.callback(i))
+
+    text = _sent_text(i)
+    assert i.response.deferred is True
+    assert "Удалено ролей клана: 2" in text
+    assert "123" in text and "плагбой лох" in text, text
+    print("  ok: /clan_roleclear показывает удалённые роли")
+
+
+def test_clan_roleclear_nothing_to_clean(monkeypatch):
+    """Пустых ролей нет — понятный ответ, без ошибки."""
+    _prepare_command(monkeypatch, [])
+    i = _CmdInteraction()
+
+    asyncio.run(botmod.clan_roleclear.callback(i))
+
+    assert "чистить нечего" in _sent_text(i)
+    print("  ok: /clan_roleclear без пустых ролей отвечает понятно")
+
+
+def test_clan_roleclear_shows_errors(monkeypatch):
+    """Роль выше бота — команда показывает причину, а не молчит."""
+    _prepare_command(monkeypatch, [], errors=["«123»: роль бота ниже"])
+    i = _CmdInteraction()
+
+    asyncio.run(botmod.clan_roleclear.callback(i))
+
+    text = _sent_text(i)
+    assert "Не удалось удалить" in text and "роль бота ниже" in text
+    print("  ok: /clan_roleclear показывает ошибки")
+
+
+def test_clan_roleclear_requires_admin(monkeypatch):
+    """Без прав админа команда ничего не удаляет."""
+    _prepare_command(monkeypatch, ["123"], allowed=False)
+    called = []
+
+    async def fake_cleanup(_guild):
+        called.append(1)
+        return [], []
+
+    monkeypatch.setattr(botmod, "cleanup_empty_clan_roles", fake_cleanup)
+    i = _CmdInteraction()
+
+    asyncio.run(botmod.clan_roleclear.callback(i))
+
+    assert called == []
+    print("  ok: /clan_roleclear защищена правами админа")
