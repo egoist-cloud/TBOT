@@ -347,8 +347,73 @@ ROLE_DISPLAY_MAP = {1: "Мл. Модер", 3: "Модератор", 5: "Адми
                     6: "С. Админ", 7: "Спонсор", 13: "Гл.Модератор"}
 
 
+# Названия ролей cs2red, если сайт не отдал список (/api/data/main).
+# Ключ — roleId с сайта, значение — название Discord-роли, как на сайте.
+# Переопределяется через env SITE_ROLE_NAMES, например {"2": "Куратор"}.
+SITE_ROLE_NAMES = {
+    1: "Мл. Модер", 3: "Модератор", 5: "Админ",
+    6: "С. Админ", 7: "Спонсор", 13: "Гл.Модератор",
+}
+try:
+    _site_roles_override = json.loads(os.getenv("SITE_ROLE_NAMES", "") or "{}")
+except (ValueError, TypeError):
+    _site_roles_override = {}
+if isinstance(_site_roles_override, dict):
+    for _rid, _rname in _site_roles_override.items():
+        if str(_rid).strip().isdigit() and str(_rname).strip():
+            SITE_ROLE_NAMES[int(_rid)] = str(_rname).strip()
+
+# Discord-роли, которые бот создал сам под роли с сайта. По этому списку
+# роль снимается при смене роли на сайте; чужие роли не трогаются.
+SITE_ROLES_FILE = "site_roles.json"
+
+
+def _role_id_int(role_id):
+    try:
+        return int(role_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def site_role_name(role_id) -> str | None:
+    """Название роли на сайте по roleId (без сетевых запросов)."""
+    rid = _role_id_int(role_id)
+    if rid is None or rid <= 0:
+        return None
+    return (SITE_ROLE_NAMES.get(rid) or ROLE_DISPLAY_MAP.get(rid)
+            or ROLE_MAP.get(rid))
+
+
 def role_display_name(role_id) -> str:
-    return ROLE_DISPLAY_MAP.get(role_id) or ROLE_MAP.get(role_id) or "Игрок"
+    return site_role_name(role_id) or "Игрок"
+
+
+def _load_site_role_names() -> set:
+    try:
+        p = data_path(SITE_ROLES_FILE)
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return {str(x).strip() for x in data if str(x).strip()}
+    except Exception as e:
+        log(f"⚠️ не прочитал {SITE_ROLES_FILE}: {e}")
+    return set()
+
+
+def _remember_site_role_name(name: str):
+    name = (name or "").strip()
+    if not name:
+        return
+    names = _load_site_role_names()
+    if name in names:
+        return
+    names.add(name)
+    try:
+        data_path(SITE_ROLES_FILE).write_text(
+            json.dumps(sorted(names), ensure_ascii=False, indent=2),
+            encoding="utf-8")
+    except Exception as e:
+        log(f"⚠️ не записал {SITE_ROLES_FILE}: {e}")
 
 
 CLAN_ROLE_MAP = {
@@ -1130,6 +1195,8 @@ class API:
         self.cs2red: aiohttp.ClientSession | None = None
         self.sem = asyncio.Semaphore(4)
         self._clans_cache = {"ts": 0.0, "data": None}
+        # Список ролей сайта: roleId -> название (кэш на час).
+        self._roles_cache = {"ts": 0.0, "data": {}}
         # Названия режимов (gamemodeId) для разбивки активности.
         self._categories_cache = {"ts": 0.0, "data": None}
         self.last_status: int | None = None
@@ -1447,6 +1514,39 @@ class API:
                 return u
         self._cache_put(steam_id, users[0])
         return users[0]
+
+    async def cs2red_roles(self) -> dict:
+        """Названия ролей сайта: roleId → «Куратор», «Модератор», ...
+
+        Сайт берёт этот список из /api/data/main — оттуда же берём и мы,
+        чтобы название Discord-роли совпадало с тем, что видит игрок.
+        """
+        ts = asyncio.get_event_loop().time()
+        if self._roles_cache["data"] and ts - self._roles_cache["ts"] < 3600:
+            return self._roles_cache["data"]
+        data = await self._get_json("https://cs2red.ru/api/data/main")
+        roles = None
+        if isinstance(data, dict):
+            inner = data.get("data")
+            if isinstance(inner, dict):
+                roles = inner.get("roles")
+            roles = roles or data.get("roles")
+        out: dict = {}
+        if isinstance(roles, list):
+            for r in roles:
+                if not isinstance(r, dict):
+                    continue
+                name = (r.get("name") or r.get("title")
+                        or r.get("label") or r.get("role"))
+                if isinstance(name, dict):
+                    name = name.get("name") or name.get("title")
+                rid = _role_id_int(r.get("id"))
+                name = str(name or "").strip()
+                if rid is not None and name:
+                    out[rid] = name
+        if out:
+            self._roles_cache = {"ts": ts, "data": out}
+        return out or self._roles_cache["data"] or {}
 
     async def cs2red_search_by_nick(self, nickname: str, limit: int = 10):
         """Ищет игроков в админ-панели cs2red по нику.
@@ -1982,7 +2082,8 @@ async def build_player_profile(guild, discord_id, steam_id=None):
     if user and not user.get("_not_found"):
         profile["cs2red_nick"] = user.get("nick", "-")
         profile["cs2red_role_id"] = user.get("roleId")
-        profile["cs2red_role_name"] = role_display_name(user.get("roleId"))
+        profile["cs2red_role_name"] = (
+            await resolve_site_role_name(user.get("roleId")) or "Игрок")
     full = await api.cs2red_full_user(steam_id)
     if full:
         profile["cs2red_admins"] = full.get("admins", [])
@@ -2168,6 +2269,48 @@ def utc_stamp() -> str:
 # ============================================================
 # СИНХРОНИЗАЦИЯ РОЛЕЙ
 # ============================================================
+async def resolve_site_role_name(role_id) -> str | None:
+    """Название роли с сайта: сначала список cs2red, потом локальная карта."""
+    rid = _role_id_int(role_id)
+    if rid is None or rid <= 0:
+        return None
+    names = await api.cs2red_roles()
+    if rid in names:
+        return names[rid]
+    return site_role_name(rid)
+
+
+_WARNED_SITE_ROLE_IDS: set = set()
+
+
+async def _ensure_site_role(guild, name: str, reason: str = "роль с сайта cs2red"):
+    """Возвращает Discord-роль с названием роли сайта, создавая при необходимости."""
+    role = discord.utils.get(guild.roles, name=name)
+    if role is not None:
+        return role
+    me = getattr(guild, "me", None)
+    perms = getattr(me, "guild_permissions", None)
+    if perms is not None and not getattr(perms, "manage_roles", False):
+        return None
+    try:
+        role = await guild.create_role(
+            name=name,
+            color=discord.Colour(0x2F3136),
+            hoist=False,
+            mentionable=False,
+            reason=reason,
+        )
+    except discord.Forbidden:
+        log(f"⚠️ не создал роль «{name}»: нет права Manage Roles")
+        return None
+    except discord.HTTPException as e:
+        log(f"⚠️ не создал роль «{name}»: {e}")
+        return None
+    _remember_site_role_name(name)
+    log(f"➕ Создана Discord-роль с сайта: «{name}»")
+    return role
+
+
 async def sync_role_by_id(guild, member, steam_id, user: dict | None = None):
     if user is None:
         user = await api.cs2red_user(steam_id)
@@ -2178,27 +2321,42 @@ async def sync_role_by_id(guild, member, steam_id, user: dict | None = None):
         return f"⚠️ {member.display_name}: не найден на cs2red, роль не тронута"
     if not user.get("id"):
         return f"⚠️ {member.display_name}: некорректный ответ cs2red, роль не тронута"
-    tn = ROLE_MAP.get(user.get("roleId"))
-    managed = {n for n in ROLE_MAP.values() if n}
+    role_id = user.get("roleId")
+    tn = await resolve_site_role_name(role_id)
+    managed = {n for n in ROLE_MAP.values() if n} | _load_site_role_names()
     cur = {r for r in member.roles if r.name in managed}
 
     if tn is None:
+        rid = _role_id_int(role_id)
+        if rid and rid not in _WARNED_SITE_ROLE_IDS:
+            _WARNED_SITE_ROLE_IDS.add(rid)
+            log(f"⚠️ roleId={rid} нет в списке ролей cs2red — добавьте в "
+                f'SITE_ROLE_NAMES, например {{"{rid}": "Куратор"}}')
         if cur:
             for r in cur:
-                await member.remove_roles(r)
+                try:
+                    await member.remove_roles(r)
+                except discord.Forbidden:
+                    return f"❌ {member.display_name}: нет прав снять роль"
             return f"🔄 {member.display_name}: сняты"
         return f"ℹ️ {member.display_name}: без изменений"
 
     target = discord.utils.get(guild.roles, name=tn)
     if target is None:
-        return f"⚠️ роль '{tn}' не найдена"
+        # Роли на сервере ещё нет — создаём её сами: имя берём с сайта.
+        target = await _ensure_site_role(guild, tn)
+    if target is None:
+        return f"⚠️ роль '{tn}' не найдена и создать не удалось"
 
     if cur == {target}:
         return f"✅ {member.display_name}: уже '{tn}'"
 
     for r in cur:
         if r != target:
-            await member.remove_roles(r)
+            try:
+                await member.remove_roles(r)
+            except discord.Forbidden:
+                return f"❌ {member.display_name}: нет прав снять роль"
     try:
         await member.add_roles(target)
         return f"✅ {member.display_name}: '{tn}'"
@@ -3710,7 +3868,7 @@ async def unlink(i):
                                target=i.user,
                                details=f"SteamID: `{rid}` (ЛС)")
             return
-        managed_n = {n for n in ROLE_MAP.values() if n}
+        managed_n = {n for n in ROLE_MAP.values() if n} | _load_site_role_names()
         managed_i = set(CLAN_ROLE_MAP.values())
         known_clan_names = _load_clan_role_names()
         stored_role = _load_clan_members().get(str(i.user.id))
