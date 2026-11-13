@@ -23,11 +23,18 @@ def _member(mid, bot=False):
     return SimpleNamespace(id=mid, bot=bot, display_name=f"user{mid}")
 
 
-def test_intervals_are_three_hours_and_ninety_minutes():
-    """Авто-привязка — раз в 3 часа, sync_all — раз в 1.5 часа."""
+def test_intervals_are_three_hours_and_two_hours():
+    """Авто-привязка — раз в 3 часа, sync_all — раз в 2 часа."""
     assert botmod.auto_link_watch.hours == 3
-    assert botmod.sync_all_watch.minutes == 90
-    print("  ok: расписания 3 ч и 90 минут")
+    assert botmod.sync_all_watch.minutes == 120
+    print("  ok: расписания 3 ч и 2 ч")
+
+
+def test_first_run_waits_full_interval():
+    """После перезапуска первый прогон — через полный интервал, не сразу."""
+    assert botmod._sync_all_first_delay() == 120 * 60
+    assert botmod._auto_link_first_delay() == 3 * 3600
+    print("  ok: после старта бот ждёт полный интервал")
 
 
 def test_unlinked_members_skips_linked_and_bots():

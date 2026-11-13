@@ -7727,7 +7727,17 @@ async def before_hourly_clan_sync():
 # Запускают те же функции, что /auto_link и /sync_all: логика одна,
 # меняется только источник «интеракции» — фоновый контекст.
 AUTO_LINK_INTERVAL_HOURS = env_int("AUTO_LINK_INTERVAL_HOURS", 3)
-SYNC_ALL_INTERVAL_MINUTES = env_int("SYNC_ALL_INTERVAL_MINUTES", 90)
+SYNC_ALL_INTERVAL_MINUTES = env_int("SYNC_ALL_INTERVAL_MINUTES", 120)
+
+
+def _auto_link_first_delay() -> int:
+    """Первый автозапуск — через полный интервал после старта бота."""
+    return max(60, AUTO_LINK_INTERVAL_HOURS * 3600)
+
+
+def _sync_all_first_delay() -> int:
+    """Первый автозапуск синхронизации — через полный интервал после старта."""
+    return max(60, SYNC_ALL_INTERVAL_MINUTES * 60)
 
 
 class _BackgroundActor:
@@ -7817,7 +7827,9 @@ async def auto_link_watch():
 @auto_link_watch.before_loop
 async def before_auto_link_watch():
     await bot.wait_until_ready()
-    await asyncio.sleep(random.randint(120, 300))
+    # После перезапуска не стартуем сразу: ждём полный интервал.
+    # Принудительно можно запустить кнопкой или командой.
+    await asyncio.sleep(_auto_link_first_delay())
 
 
 @tasks.loop(minutes=max(15, SYNC_ALL_INTERVAL_MINUTES))
@@ -7849,7 +7861,8 @@ async def sync_all_watch():
 @sync_all_watch.before_loop
 async def before_sync_all_watch():
     await bot.wait_until_ready()
-    await asyncio.sleep(random.randint(120, 300))
+    # Первый прогон — через интервал (2 ч по умолчанию), не при старте.
+    await asyncio.sleep(_sync_all_first_delay())
 
 
 # ============================================================
@@ -8305,13 +8318,21 @@ class PanelView(discord.ui.View):
             return
         button.disabled = True
         await interaction.response.defer(ephemeral=True)
-        # Полный запуск /auto_link (прогресс-бар, защита от 403/429).
-        try:
-            await run_auto_link(interaction, ephemeral=True)
-        except Exception as e:
-            log(f"⚠️ panel_link_all: {e}")
-            await safe_send(interaction.followup, f"❌ Ошибка: {str(e)[:200]}",
+        # Двойной клик и запуск из расписания не должны стартовать второй прогон.
+        lock = _heavy_lock("auto_link")
+        if lock.locked():
+            await safe_send(interaction.followup,
+                            "⏳ Авто-привязка уже выполняется. Подождите.",
                             ephemeral=True)
+            return
+        async with lock:
+            # Полный запуск /auto_link (прогресс-бар, защита от 403/429).
+            try:
+                await run_auto_link(interaction, ephemeral=True)
+            except Exception as e:
+                log(f"⚠️ panel_link_all: {e}")
+                await safe_send(interaction.followup,
+                                f"❌ Ошибка: {str(e)[:200]}", ephemeral=True)
 
     @discord.ui.button(label="🔗 Синхронизация", style=discord.ButtonStyle.secondary,
                        custom_id="panel_sync", row=0)
@@ -8320,13 +8341,20 @@ class PanelView(discord.ui.View):
             return
         button.disabled = True
         await interaction.response.defer(ephemeral=True)
-        # Полный запуск /sync_all (прогресс-бар, остановка при 403/429).
-        try:
-            await run_sync_all(interaction, ephemeral=True)
-        except Exception as e:
-            log(f"⚠️ panel_sync: {e}")
-            await safe_send(interaction.followup, f"❌ Ошибка: {str(e)[:200]}",
+        lock = _heavy_lock("sync_all")
+        if lock.locked():
+            await safe_send(interaction.followup,
+                            "⏳ Синхронизация уже выполняется. Подождите.",
                             ephemeral=True)
+            return
+        async with lock:
+            # Полный запуск /sync_all (прогресс-бар, остановка при 403/429).
+            try:
+                await run_sync_all(interaction, ephemeral=True)
+            except Exception as e:
+                log(f"⚠️ panel_sync: {e}")
+                await safe_send(interaction.followup,
+                                f"❌ Ошибка: {str(e)[:200]}", ephemeral=True)
 
     @discord.ui.button(label="📖 Обновить правила", style=discord.ButtonStyle.secondary,
                        custom_id="panel_rules", row=1)
