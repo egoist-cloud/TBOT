@@ -120,6 +120,13 @@ async def init_db() -> None:
             activity INTEGER NOT NULL DEFAULT 0
         );
 
+        CREATE TABLE IF NOT EXISTS user_stats (
+            discord_id    TEXT PRIMARY KEY,
+            voice_seconds INTEGER NOT NULL DEFAULT 0,
+            messages      INTEGER NOT NULL DEFAULT 0,
+            updated_at    TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS meta (
             key   TEXT PRIMARY KEY,
             value TEXT

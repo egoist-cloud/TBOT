@@ -36,6 +36,7 @@ from quantum.repositories import seen as seen_repo
 from quantum.repositories import links as links_repo
 from quantum.repositories import players as players_repo
 from quantum.repositories import users as users_repo
+from quantum.repositories import stats as stats_repo
 from quantum.repositories import moderation as moderation_repo
 from quantum.repositories import applications as applications_repo
 from quantum.repositories import audit as audit_repo
@@ -3606,7 +3607,7 @@ class ClanView(discord.ui.View):
 # /check и /status остаются модераторскими: это статистика по заявкам,
 # которые модератор брал/решал, и она выдаётся через /give.
 PUBLIC_COMMANDS = {"link", "unlink", "ping", "health", "lookup", "ask",
-                   "rules", "search", "help"}
+                   "rules", "search", "help", "profile"}
 
 # Команды, которые нельзя делегировать через /give: они управляют доступом
 # или меняют данные опаснее, чем обычная модерация. Проверка прав внутри
@@ -3746,6 +3747,7 @@ class MyBot(commands.Bot):
             auto_link_watch.start()
             sync_all_watch.start()
             clan_role_cleanup_watch.start()
+            voice_stats_flush.start()
             if not GUILD_ID:
                 log("⚠️ GUILD_ID = 0 — автосинхронизация ролей клана и /check "
                     "не смогут найти сервер (задайте GUILD_ID)")
@@ -3845,9 +3847,41 @@ async def on_ready():
 
 
 @bot.event
+async def on_message(message):
+    """Считает сообщения для /profile и не мешает префиксным командам."""
+    try:
+        if (not message.author.bot and message.guild is not None
+                and not str(message.content).startswith(bot.command_prefix)):
+            await stats_repo.add_messages(message.author.id)
+    except Exception as e:
+        log(f"⚠️ on_message статистика: {e}")
+    await bot.process_commands(message)
+
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Копит время участника в голосовых каналах."""
+    try:
+        if member.bot:
+            return
+        was_in = before.channel is not None
+        now_in = after.channel is not None
+        if not was_in and now_in:
+            _VOICE_SESSIONS[member.id] = time.monotonic()
+        elif was_in and not now_in:
+            await _voice_flush(member.id)
+            _VOICE_SESSIONS.pop(member.id, None)
+    except Exception as e:
+        log(f"⚠️ on_voice_state_update: {e}")
+
+
+@bot.event
 async def on_member_remove(member):
     """Участник ушёл с сервера: роль клана без носителей удаляем сразу."""
     try:
+        if member.id in _VOICE_SESSIONS:
+            await _voice_flush(member.id)
+            _VOICE_SESSIONS.pop(member.id, None)
         _forget_member_clan_role(member.id)
         guild = getattr(member, "guild", None)
         if guild is None:
@@ -5902,6 +5936,7 @@ HELP_DESCRIPTIONS = {
     "ask": "вопрос по правилам (ИИ)",
     "ping": "проверить, что бот жив",
     "help": "эта справка",
+    "profile": "профиль: войс, сообщения и роли на сайте",
     "search": "история заявок игрока в клан",
     "check": "заявки, которые взял модератор",
     "status": "статистика модератора по заявкам",
@@ -5998,6 +6033,132 @@ def _build_help_embed() -> discord.Embed:
     )
     e.set_footer(text="Quantum • /help")
     return e
+
+
+# ============================================================
+# /profile: ВОЙС, СООБЩЕНИЯ, РОЛИ НА САЙТЕ
+# ============================================================
+_VOICE_SESSIONS: dict = {}  # discord_id -> время последней отметки (monotonic)
+
+
+def _fmt_duration(seconds: int) -> str:
+    """Секунды → «418 ч 48 м» (как в карточке профиля)."""
+    total = max(0, int(seconds))
+    hours, rest = divmod(total, 3600)
+    minutes = rest // 60
+    return f"{hours} ч {minutes} м" if hours else f"{minutes} м"
+
+
+def _fmt_number(value: int) -> str:
+    """1012 → «1 012»."""
+    return f"{int(value):,}".replace(",", " ")
+
+
+async def _voice_flush(discord_id=None) -> None:
+    """Сохраняет накопленное время в войсе (одного или всех участников)."""
+    now = time.monotonic()
+    ids = [discord_id] if discord_id is not None else list(_VOICE_SESSIONS)
+    for uid in ids:
+        started = _VOICE_SESSIONS.get(uid)
+        if started is None:
+            continue
+        seconds = int(now - started)
+        if seconds < 1:
+            continue
+        try:
+            await stats_repo.add_voice_seconds(uid, seconds)
+        except Exception as e:
+            log(f"⚠️ войс-статистика {uid}: {e}")
+            continue
+        _VOICE_SESSIONS[uid] = now
+
+
+async def _site_roles_for(steam_id) -> list:
+    """Роли игрока на cs2red: основная роль, админки и VIP-группы."""
+    roles: list = []
+    try:
+        user = await api.cs2red_user(steam_id)
+    except Exception as e:
+        log(f"⚠️ /profile: cs2red_user: {e}")
+        user = None
+    if user and not user.get("_not_found"):
+        name = await resolve_site_role_name(user.get("roleId"))
+        if name:
+            roles.append(name)
+    try:
+        full = await api.cs2red_full_user(steam_id)
+    except Exception as e:
+        log(f"⚠️ /profile: cs2red_full_user: {e}")
+        full = None
+    if full:
+        for admin in full.get("admins") or []:
+            name = await resolve_site_role_name(admin.get("roleId"))
+            if name:
+                roles.append(name)
+        for vip in full.get("vips") or []:
+            group = str(vip.get("group") or "").strip()
+            if group:
+                roles.append(group)
+    return list(dict.fromkeys(roles))
+
+
+def _build_profile_layout(target, stats: dict, rank: int, total: int,
+                          roles: list, steam_id=None,
+                          top_lines=None) -> discord.ui.LayoutView:
+    """Карточка профиля в стиле Components V2: аватар, роли, статистика."""
+    layout = discord.ui.LayoutView(timeout=300)
+    container = discord.ui.Container(accent_colour=V2_PANEL_ACCENT)
+    roles_text = "\n".join(f"• {r}" for r in roles) if roles else "—"
+    username = getattr(target, "name", None) or target.display_name
+    text = (f"## {target.display_name}\n-# @{username}"
+            f"\n\n**Роли на сайте**\n{roles_text}")
+    if steam_id:
+        text += f"\n-# SteamID: {steam_id}"
+    avatar = getattr(target, "display_avatar", None)
+    if avatar is not None:
+        container.add_item(discord.ui.Section(
+            text, accessory=discord.ui.Thumbnail(avatar.url)))
+    else:
+        container.add_item(discord.ui.TextDisplay(text))
+    container.add_item(discord.ui.Separator())
+    container.add_item(discord.ui.TextDisplay(
+        f"**Онлайн** — {_fmt_duration(stats.get('voice_seconds', 0))}\n"
+        f"**Сообщения** — {_fmt_number(stats.get('messages', 0))}\n"
+        f"**Топ по сообщениям** — #{rank} из {_fmt_number(total)}"))
+    if top_lines:
+        container.add_item(discord.ui.Separator())
+        container.add_item(discord.ui.TextDisplay(
+            "**Мини-топ по сообщениям**\n" + "\n".join(top_lines[:5])))
+    layout.add_item(container)
+    return layout
+
+
+@bot.tree.command(name="profile",
+                  description="Профиль игрока: войс, сообщения и роли на сайте")
+@app_commands.describe(user="Чей профиль показать (по умолчанию — свой)")
+async def profile(i, user: discord.Member | None = None):
+    await i.response.defer()
+    try:
+        target = user
+        if target is None:
+            target = i.guild.get_member(i.user.id) if i.guild else i.user
+        stats = await stats_repo.get_stats(target.id)
+        rank, total = await stats_repo.get_message_rank(target.id)
+        steam_id = await links_repo.get_link(target.id)
+        roles = await _site_roles_for(steam_id) if steam_id else []
+        top_lines = []
+        for idx, (uid, count) in enumerate(
+                await stats_repo.top_by_messages(5), start=1):
+            member = (i.guild.get_member(int(uid))
+                      if i.guild is not None and str(uid).isdigit() else None)
+            name = member.display_name if member is not None else f"id {uid}"
+            top_lines.append(f"**#{idx}** {name} — {_fmt_number(count)}")
+        layout = _build_profile_layout(target, stats, rank, total, roles,
+                                       steam_id, top_lines)
+        await i.followup.send(view=layout)
+    except Exception as e:
+        await log_error(bot, "/profile", e)
+        await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}", ephemeral=True)
 
 
 @bot.tree.command(name="help", description="Список всех команд бота по разделам")
@@ -8139,6 +8300,20 @@ async def before_clan_role_cleanup_watch():
     await bot.wait_until_ready()
     # Как и остальные задачи: первый прогон — через полный интервал.
     await asyncio.sleep(_clan_cleanup_first_delay())
+
+
+@tasks.loop(minutes=5)
+async def voice_stats_flush():
+    """Каждые 5 минут сохраняет время в войсе: рестарт не теряет данные."""
+    try:
+        await _voice_flush()
+    except Exception as e:
+        log(f"⚠️ voice_stats_flush: {e}")
+
+
+@voice_stats_flush.before_loop
+async def before_voice_stats_flush():
+    await bot.wait_until_ready()
 
 
 # ============================================================
