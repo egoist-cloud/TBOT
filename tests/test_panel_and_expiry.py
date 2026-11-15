@@ -13,6 +13,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import discord  # noqa: E402
+
 import script as botmod  # noqa: E402
 from quantum.db import close_db, get_db, init_db  # noqa: E402
 from quantum.repositories import applications as applications_repo  # noqa: E402
@@ -150,9 +152,13 @@ def test_refresh_panel_replaces_message():
             assert len(channel.sent) == 1
 
             sent = channel.sent[0]
-            assert sent["kwargs"].get("embed") is not None
-            assert sent["kwargs"].get("view") is not None
-            assert "Официальные условия" in sent["kwargs"]["embed"].title
+            kwargs = sent["kwargs"]
+            # Панель теперь уходит контейнером Components V2 (без embed).
+            assert isinstance(kwargs.get("view"), discord.ui.LayoutView)
+            texts = " ".join(
+                item.content for item in kwargs["view"].walk_children()
+                if isinstance(item, discord.ui.TextDisplay))
+            assert "Официальные условия" in texts
 
             assert await seen_repo.get_flag("clan_panel_message") == \
                 str(sent["message"].id)

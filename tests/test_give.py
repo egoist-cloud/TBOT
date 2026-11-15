@@ -198,8 +198,10 @@ def test_give_panel_loads_and_saves_permissions(monkeypatch):
             assert panel.is_moderator is True
             assert panel.selected == {"check", "status"}
             assert i.edited is not None
-            assert "есть в /moders" in {
-                f.name: f.value for f in i.edited["embed"].fields}["Статус"]
+            # Панель перерисовывается как Components V2 (без embed).
+            assert "embed" not in i.edited
+            status = {f.name: f.value for f in panel.build_embed().fields}["Статус"]
+            assert "есть в /moders" in status
 
             panel.selected = {"check", "admins"}
             await panel._persist()

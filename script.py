@@ -602,6 +602,85 @@ def _batch_embeds(embeds, limit: int = EMBED_MSG_LIMIT,
     return batches
 
 
+# ============================================================
+# COMPONENTS V2: панели в стиле контейнера (как у ubot)
+# ============================================================
+# Панели-views помечаются v2_style = True. Их Embed автоматически
+# превращается в Container: заголовок, секции через Separator и строки
+# кнопок снизу. Карточки заявок остаются Embed'ами: они читают данные
+# из message.embeds при голосовании.
+V2_PANEL_ACCENT = 0x5865F2
+V2_TEXT_LIMIT = 3900
+
+
+def _v2_split_text(text: str) -> list:
+    """Режет текст на куски под лимит TextDisplay (4000)."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    out = []
+    while len(text) > V2_TEXT_LIMIT:
+        cut = text.rfind("\n", 0, V2_TEXT_LIMIT)
+        if cut <= 0:
+            cut = V2_TEXT_LIMIT
+        out.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    out.append(text)
+    return out
+
+
+def _v2_embed_items(embed) -> list:
+    """Embed → блоки Components V2: заголовок, секции, подпись."""
+    items: list = []
+    head = []
+    if embed.title:
+        head.append(f"## {embed.title}")
+    if embed.description:
+        head.append(embed.description)
+    for chunk in _v2_split_text("\n".join(head)):
+        items.append(discord.ui.TextDisplay(chunk))
+
+    inline_buf: list = []
+
+    def flush_inline():
+        if not inline_buf:
+            return
+        text = "\n".join(f"**{n}** — {v}" for n, v in inline_buf)
+        for chunk in _v2_split_text(text):
+            items.append(discord.ui.TextDisplay(chunk))
+        inline_buf.clear()
+
+    for field in embed.fields:
+        if field.inline:
+            inline_buf.append((field.name, field.value))
+            continue
+        flush_inline()
+        items.append(discord.ui.Separator())
+        for chunk in _v2_split_text(f"**{field.name}**\n{field.value}"):
+            items.append(discord.ui.TextDisplay(chunk))
+    flush_inline()
+    if embed.footer and embed.footer.text:
+        items.append(discord.ui.TextDisplay(f"-# {embed.footer.text}"))
+    return items
+
+
+def _v2_layout_from_embed(embed, view=None) -> discord.ui.LayoutView:
+    """Собирает LayoutView: контейнер с текстом панели и кнопками view."""
+    layout = discord.ui.LayoutView(
+        timeout=getattr(view, "timeout", None) if view is not None else None)
+    container = discord.ui.Container(accent_colour=V2_PANEL_ACCENT)
+    for item in _v2_embed_items(embed):
+        container.add_item(item)
+    if view is not None:
+        rows: dict = {}
+        for item in list(view.children):
+            rows.setdefault(getattr(item, "row", 0) or 0, []).append(item)
+        for num in sorted(rows):
+            container.add_item(discord.ui.ActionRow(*rows[num]))
+    layout.add_item(container)
+    return layout
+
+
 async def safe_send(target, *args, title: str = "", retries: int = 5, **kwargs):
     """
     Отправка с retry. Уважает:
@@ -613,6 +692,16 @@ async def safe_send(target, *args, title: str = "", retries: int = 5, **kwargs):
     Заголовок Embed можно задать через title=.
     Длинный текст разбивается на несколько Embeds.
     """
+    # Панели с v2_style уходят контейнером Components V2:
+    # Embed + View вместе в V2-сообщение положить нельзя.
+    _view = kwargs.get("view")
+    _embed = kwargs.get("embed")
+    if (_view is not None and isinstance(_embed, discord.Embed)
+            and getattr(_view, "v2_style", False)):
+        kwargs["view"] = _v2_layout_from_embed(_embed, _view)
+        kwargs.pop("embed", None)
+        kwargs.pop("content", None)
+
     # Обёртка текста в чёрный Embed, если не задан embed/content/view/file.
     has_embed = "embed" in kwargs or "embeds" in kwargs
     has_content = "content" in kwargs
@@ -3500,6 +3589,8 @@ class ClanView(discord.ui.View):
     работать, даже если бот перезапустили.
     """
 
+    v2_style = True
+
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(ClanSelect())
@@ -5584,6 +5675,8 @@ async def sync_clan_roles_for_members(guild, members: list) -> list:
 class CheckClanView(discord.ui.View):
     """Кнопки под отчётом /check_clan: синхронизация и очистка ролей."""
 
+    v2_style = True
+
     def __init__(self):
         super().__init__(timeout=300)
 
@@ -6373,6 +6466,8 @@ class GivePanelView(discord.ui.View):
     сохраняется кнопкой «Сохранить».
     """
 
+    v2_style = True
+
     def __init__(self, owner_id: int, target=None, permissions=None):
         super().__init__(timeout=900)
         self.owner_id = int(owner_id)
@@ -6473,7 +6568,12 @@ class GivePanelView(discord.ui.View):
 
     async def _edit(self, i):
         self._refresh()
-        await i.edit_original_response(embed=self.build_embed(), view=self)
+        embed = self.build_embed()
+        if getattr(self, "v2_style", False):
+            await i.edit_original_response(
+                view=_v2_layout_from_embed(embed, self))
+        else:
+            await i.edit_original_response(embed=embed, view=self)
 
     async def pick_user(self, i, user):
         try:
@@ -8483,6 +8583,8 @@ async def _panel_guard(interaction) -> bool:
 
 class PanelView(discord.ui.View):
     """Панель управления ботом: кнопки запускают служебные действия."""
+
+    v2_style = True
 
     def __init__(self):
         super().__init__(timeout=None)
