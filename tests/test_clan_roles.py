@@ -18,12 +18,16 @@ import script as botmod  # noqa: E402
 
 
 class _FakeRole:
-    def __init__(self, name, members=(), position=5, hoist=False, rid=1):
+    def __init__(self, name, members=(), position=5, hoist=False, rid=1,
+                 colour=0, admin=False, managed=False):
         self.id = rid
         self.name = name
         self.members = list(members)
         self.position = position
         self.hoist = hoist
+        self.colour = type("C", (), {"value": colour})()
+        self.permissions = type("P", (), {"administrator": admin})()
+        self.managed = managed
         self.deleted = False
         self.delete_reason = ""
         self.edits = []
@@ -438,3 +442,91 @@ def test_clan_roleclear_requires_admin(monkeypatch):
 
     assert called == []
     print("  ok: /clan_roleclear защищена правами админа")
+
+
+# ============================================================
+# Роли бота, потерянные из реестров (главная причина «зависших» ролей)
+# ============================================================
+def test_cleanup_deletes_orphan_bot_role_by_colour():
+    """Пустая фиолетовая роль бота удаляется даже без clan_roles.json."""
+    orphan = _FakeRole("ㅁBrawlStars", position=5, rid=7001,
+                       colour=botmod.CLAN_ROLE_COLOR)
+    guild = _FakeGuild([orphan])
+
+    deleted, errors = asyncio.run(botmod.cleanup_empty_clan_roles(
+        guild, names=set()))
+
+    assert deleted == ["ㅁBrawlStars"], deleted
+    assert errors == []
+    assert orphan.deleted is True
+    print("  ok: осиротевшая роль бота удаляется по цвету")
+
+
+def test_cleanup_keeps_coloured_role_with_members():
+    """Фиолетовая роль с участниками не удаляется."""
+    used = _FakeRole("Undertakers", members=[_FakeMember()], rid=7002,
+                     colour=botmod.CLAN_ROLE_COLOR)
+    guild = _FakeGuild([used])
+
+    deleted, _ = asyncio.run(botmod.cleanup_empty_clan_roles(
+        guild, names=set()))
+
+    assert deleted == []
+    assert used.deleted is False
+    print("  ok: занятая роль остаётся")
+
+
+def test_cleanup_keeps_administrator_and_service_roles():
+    """Роль с админ-правами или служебным словом не удаляем даже пустой."""
+    admin = _FakeRole("Custom", rid=7003, colour=botmod.CLAN_ROLE_COLOR,
+                      admin=True)
+    staff = _FakeRole("Модератор", rid=7004, colour=botmod.CLAN_ROLE_COLOR)
+    guild = _FakeGuild([admin, staff])
+
+    deleted, _ = asyncio.run(botmod.cleanup_empty_clan_roles(
+        guild, names=set()))
+
+    assert deleted == []
+    assert admin.deleted is False and staff.deleted is False
+    print("  ok: админ- и служебные роли защищены")
+
+
+def test_cleanup_deletes_role_tracked_by_id_after_rename():
+    """Роль переименовали на сервере — удаляем по id из bot_roles.json."""
+    role = _FakeRole("новое имя", rid=7005, colour=0x000000)
+    botmod._remember_bot_role(role, "clan")
+    guild = _FakeGuild([role])
+
+    deleted, _ = asyncio.run(botmod.cleanup_empty_clan_roles(
+        guild, names=set()))
+
+    assert deleted == ["новое имя"], deleted
+    assert role.deleted is True
+    assert "7005" not in botmod._load_bot_roles()
+    print("  ok: роль узнаётся по id, даже после переименования")
+
+
+def test_cleanup_ignores_site_role_colour():
+    """Роли с сайта создаются другим цветом и уборкой кланов не трогаются."""
+    site = _FakeRole("Спонсор", rid=7006, colour=0x2F3136)
+    guild = _FakeGuild([site])
+
+    deleted, _ = asyncio.run(botmod.cleanup_empty_clan_roles(
+        guild, names=set()))
+
+    assert deleted == [] and site.deleted is False
+    print("  ok: роли с сайта не путаются с ролями кланов")
+
+
+def test_empty_orphan_deleted_immediately_on_leave():
+    """Вышел последний носитель — фиолетовая роль уходит сразу."""
+    role = _FakeRole("плабой ебырь", rid=7007,
+                     colour=botmod.CLAN_ROLE_COLOR)
+    guild = _FakeGuild([role])
+
+    deleted = asyncio.run(botmod._delete_clan_role_if_empty(
+        guild, role, names=set()))
+
+    assert deleted == "плабой ебырь"
+    assert role.deleted is True
+    print("  ok: осиротевшая роль удаляется сразу при выходе")

@@ -15,6 +15,7 @@ import platform
 import sys
 import threading
 import traceback
+import unicodedata
 import uuid
 from pathlib import Path
 from collections import deque
@@ -2397,6 +2398,7 @@ async def _ensure_site_role(guild, name: str, reason: str = "роль с сай�
         log(f"⚠️ не создал роль «{name}»: {e}")
         return None
     _remember_site_role_name(name)
+    _remember_bot_role(role, "site")
     log(f"➕ Создана Discord-роль с сайта: «{name}»")
     return role
 
@@ -2437,6 +2439,7 @@ async def sync_role_by_id(guild, member, steam_id, user: dict | None = None):
         target = await _ensure_site_role(guild, tn)
     if target is None:
         return f"⚠️ роль '{tn}' не найдена и создать не удалось"
+    _remember_bot_role(target, "site")
 
     if cur == {target}:
         return f"✅ {member.display_name}: уже '{tn}'"
@@ -2497,6 +2500,118 @@ def _known_clan_role_names(clans: list | None) -> set:
     names = {str(c.get("name")).strip() for c in (clans or []) if c.get("name")}
     names |= _load_clan_role_names()
     return names
+
+
+# Реестр ролей, которые бот создал сам: id -> {name, kind}. Нужен, чтобы
+# убирать роли даже после переименования клана на сайте и даже если
+# clan_roles.json потерялся.
+BOT_ROLES_FILE = "bot_roles.json"
+
+
+def _load_bot_roles() -> dict:
+    try:
+        p = data_path(BOT_ROLES_FILE)
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                out = {}
+                for rid, item in data.items():
+                    if not str(rid).strip().isdigit():
+                        continue
+                    if isinstance(item, dict):
+                        out[str(rid).strip()] = {
+                            "name": str(item.get("name") or ""),
+                            "kind": str(item.get("kind") or "clan"),
+                        }
+                    else:  # старый формат: id -> имя
+                        out[str(rid).strip()] = {"name": str(item or ""),
+                                                 "kind": "clan"}
+                return out
+    except Exception as e:
+        log(f"⚠️ не прочитал {BOT_ROLES_FILE}: {e}")
+    return {}
+
+
+def _save_bot_roles(data: dict) -> None:
+    try:
+        data_path(BOT_ROLES_FILE).write_text(
+            json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8")
+    except Exception as e:
+        log(f"⚠️ не записал {BOT_ROLES_FILE}: {e}")
+
+
+def _remember_bot_role(role, kind: str = "clan") -> None:
+    """Запоминает id роли, созданной ботом (переживает переименование)."""
+    if role is None or not getattr(role, "id", None):
+        return
+    data = _load_bot_roles()
+    key = str(role.id)
+    item = {"name": str(getattr(role, "name", "") or ""), "kind": kind}
+    if data.get(key) == item:
+        return
+    data[key] = item
+    _save_bot_roles(data)
+
+
+def _forget_bot_role(role_id) -> None:
+    data = _load_bot_roles()
+    if str(role_id) in data:
+        data.pop(str(role_id), None)
+        _save_bot_roles(data)
+
+
+def _tracked_bot_clan_role_ids() -> set:
+    return {int(rid) for rid, item in _load_bot_roles().items()
+            if item.get("kind") == "clan"}
+
+
+# Служебные слова: роли с ними не удаляем, даже если цвет совпал.
+_PROTECTED_ROLE_WORDS = (
+    "admin", "админ", "модер", "moder", "куратор", "curator", "owner",
+    "владел", "staff", "support", "ticket", "тикет", "bot", "бот", "ban",
+    "бан", "mute", "мут", "event", "ивент",
+)
+
+
+def _norm_role_name(name) -> str:
+    """Нормализация имени роли: NFC, без невидимых символов, нижний регистр."""
+    text = unicodedata.normalize("NFC", str(name or ""))
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    return " ".join(text.split()).casefold()
+
+
+def _role_is_protected(role) -> bool:
+    if getattr(role, "managed", False):
+        return True
+    is_default = getattr(role, "is_default", None)
+    if callable(is_default) and is_default():
+        return True
+    perms = getattr(role, "permissions", None)
+    if perms is not None and getattr(perms, "administrator", False):
+        return True
+    name = _norm_role_name(getattr(role, "name", ""))
+    return any(word in name for word in _PROTECTED_ROLE_WORDS)
+
+
+def _is_bot_clan_role(role, known_norm, tracked_ids,
+                      site_norm=frozenset()) -> bool:
+    """Роль клана, которую ведёт бот: по id, имени или цвету создания.
+
+    Цвет CLAN_ROLE_COLOR бот ставит только своим ролям кланов, поэтому
+    пустую такую роль можно убирать даже если реестры потеряны.
+    """
+    if role is None or _role_is_protected(role):
+        return False
+    name_norm = _norm_role_name(getattr(role, "name", ""))
+    if name_norm in site_norm:
+        return False
+    if getattr(role, "id", None) in tracked_ids:
+        return True
+    if name_norm in known_norm:
+        return True
+    colour = getattr(role, "colour", None)
+    return getattr(colour, "value", None) == CLAN_ROLE_COLOR
 
 
 # Кто какую роль клана получил: discord_id -> role_id. Нужно, чтобы снять
@@ -2560,11 +2675,13 @@ async def _delete_clan_role_if_empty(guild, role, names=None,
     if role is None or role not in getattr(guild, "roles", []):
         return None
     names = _load_clan_role_names() if names is None else set(names)
-    is_clan = role.name in names or role.id in CLAN_ROLE_MAP.values()
+    known_norm = {_norm_role_name(n) for n in names if n}
+    if not _is_bot_clan_role(role, known_norm, _tracked_bot_clan_role_ids()):
+        return None
     # Ушедший участник может ещё висеть в кэше роли — его не считаем.
     holders = [m for m in (getattr(role, "members", None) or [])
                if exclude_member_id is None or m.id != exclude_member_id]
-    if not is_clan or holders:
+    if holders:
         return None
     if _clan_roles_above_bot(guild, [role]):
         return None
@@ -2576,6 +2693,7 @@ async def _delete_clan_role_if_empty(guild, role, names=None,
     except discord.HTTPException as e:
         log(f"⚠️ не удалил пустую роль клана «{role.name}»: {e}")
         return None
+    _forget_bot_role(role.id)
     log(f"🧹 Удалена роль клана без участников: «{role.name}»")
     return role.name
 
@@ -2650,13 +2768,17 @@ async def cleanup_empty_clan_roles(guild, names=None) -> tuple[list, list]:
     if not CLAN_ROLE_CLEANUP_ENABLED:
         return deleted, errors
     names = _load_clan_role_names() if names is None else set(names)
-    if not names:
-        return deleted, errors
+    known_norm = {_norm_role_name(n) for n in names if n}
+    tracked = _tracked_bot_clan_role_ids()
+    site_norm = {_norm_role_name(n) for n in _load_site_role_names() if n}
     me = getattr(guild, "me", None)
     top = (me.top_role.position
            if me is not None and getattr(me, "top_role", None) else -1)
     for role in list(guild.roles):
-        if role.name not in names:
+        # Роль узнаём по id-реестру, имени из clan_roles.json или по цвету,
+        # который бот ставит только ролям кланов. Так убираются и роли,
+        # созданные до появления реестра (или после потери данных).
+        if not _is_bot_clan_role(role, known_norm, tracked, site_norm):
             continue
         if role.members:
             continue  # у клана есть носители — роль остаётся
@@ -2671,6 +2793,7 @@ async def cleanup_empty_clan_roles(guild, names=None) -> tuple[list, list]:
             errors.append(f"«{role.name}»: {e}")
         else:
             deleted.append(role.name)
+            _forget_bot_role(role.id)
             log(f"🧹 Удалена роль клана без участников: «{role.name}»")
     return deleted, errors
 
@@ -2685,6 +2808,7 @@ async def _find_or_create_clan_role(guild, member, clan_name: str, reason: str =
     target = discord.utils.get(guild.roles, name=clan_name)
     if target is not None:
         _remember_clan_role_name(clan_name)
+        _remember_bot_role(target, "clan")
         await _ensure_role_hoisted(target, reason)
         return target, None
 
@@ -2718,6 +2842,7 @@ async def _find_or_create_clan_role(guild, member, clan_name: str, reason: str =
         except discord.Forbidden:
             pass
         _remember_clan_role_name(clan_name)
+        _remember_bot_role(target, "clan")
         return target, f"создана роль клана '{clan_name}'"
     except discord.Forbidden:
         return None, "❌ нет прав Manage Roles (не удалось создать роль клана)"
@@ -2810,6 +2935,7 @@ async def sync_clan_role_by_id(guild, member, steam_id, user: dict | None = None
                 return f"⚠️ {created_status or 'не удалось создать роль клана'}"
 
     _remember_clan_role_name(clan_name)
+    _remember_bot_role(target, "clan")
 
     above_target = _clan_roles_above_bot(guild, [target])
     if above_target:
@@ -2841,6 +2967,7 @@ async def sync_clan_role_by_id(guild, member, steam_id, user: dict | None = None
     try:
         await member.add_roles(target)
         _remember_member_clan_role(member.id, target.id)
+        _remember_bot_role(target, "clan")
         return (f"✅ выдан клан '{clan_name}'"
                 + (f" ({created_status})" if created_status else "") + suffix)
     except discord.Forbidden:
@@ -3839,8 +3966,32 @@ async def on_command_error(ctx, err):
     await log_error(ctx.bot, f"prefix:{command}", original)
 
 
+_INITIAL_ROLE_CLEANUP_DONE = False
+
+
+async def _initial_role_cleanup(delay: int = 60) -> None:
+    """Убирает пустые роли кланов сразу после старта, не ждёт 10 часов."""
+    await asyncio.sleep(delay)
+    try:
+        guild = bot.get_guild(GUILD_ID)
+        if guild is None:
+            return
+        deleted, errors = await cleanup_empty_clan_roles(guild)
+        if deleted:
+            log(f"🧹 Стартовая очистка ролей: удалено {len(deleted)}")
+            await log_to_channel(
+                bot, "🧹 Стартовая очистка: удалено пустых ролей кланов "
+                     f"{len(deleted)}: " +
+                     ", ".join(f"«{n}»" for n in deleted[:20]))
+        if errors:
+            log(f"⚠️ Стартовая очистка ролей: {len(errors)} ошибок")
+    except Exception as e:
+        log(f"⚠️ стартовая очистка ролей: {e}")
+
+
 @bot.event
 async def on_ready():
+    global _INITIAL_ROLE_CLEANUP_DONE
     log(f"✅ Бот {bot.user} готов!")
     log(f"🆔 GUILD_ID: {GUILD_ID}")
     log(f"🍪 CS2RED cookies: {len(CS2RED_COOKIES)} шт.")
@@ -3849,6 +4000,9 @@ async def on_ready():
         log(f"🎭 Панель ролей: {await ensure_role_panel(bot)}")
     except Exception as e:
         log(f"⚠️ панель ролей: {e}")
+    if not _INITIAL_ROLE_CLEANUP_DONE:
+        _INITIAL_ROLE_CLEANUP_DONE = True
+        asyncio.create_task(_initial_role_cleanup())
 
 
 @bot.event
