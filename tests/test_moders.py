@@ -120,9 +120,9 @@ def test_moders_panel_has_priority_and_cs2red_links(monkeypatch):
             names = [field.name for field in embed.fields]
             values = [field.value for field in embed.fields]
             assert any(name.startswith("👑 Full") for name in names)
-            assert "📊 15/15" in names
-            assert "📊 2/15" in names
-            assert "📊 0/15" in names
+            assert "📊 16/16" in names
+            assert "📊 2/16" in names
+            assert "📊 0/16" in names
             assert any("Приоритет: **4/4**" in value for value in values)
             assert any("Приоритет: **1/4**" in value for value in values)
             assert any("Приоритет: **0/4**" in value for value in values)

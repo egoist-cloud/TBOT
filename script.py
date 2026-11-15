@@ -3766,7 +3766,8 @@ ADMIN_ONLY_COMMANDS = {
 # Команды, которые админ может выдать модератору. Порядок = порядок в меню.
 MODERATOR_COMMANDS = [
     "check", "check_all", "check_bans", "check_mutes", "check_clan",
-    "check_onlineall", "activity", "activity_all", "activity_show",
+    "check_onlineall", "activity_week", "activity", "activity_all",
+    "activity_show",
     "search", "player_info", "clan_info", "status", "admins", "moders",
 ]
 
@@ -5708,6 +5709,219 @@ async def check_onlineall(i):
 
 
 # ============================================================
+# /activity_week — недельный отчёт по активности клана
+# ============================================================
+def _below_online_threshold(data: dict, week: str = "week") -> bool:
+    """Онлайн за указанную неделю ниже ONLINE_MIN_HOURS."""
+    value = (data.get(week) or {}).get("total")
+    return value is not None and value < ONLINE_MIN_HOURS
+
+
+def _two_weeks_below(data: dict) -> bool:
+    """Игрок ниже порога и на текущей, и на прошлой неделе."""
+    return (_below_online_threshold(data, "week")
+            and _below_online_threshold(data, "prev"))
+
+
+def _build_weekly_report_embed(rows: list, low: list, no_link: list,
+                               errors: list, checked: int,
+                               total: int) -> discord.Embed:
+    """Недельный отчёт: топ, малоактивные и отметка «две недели подряд»."""
+    embed = discord.Embed(
+        title=f"📊 Недельный отчёт — клан «{CLAN_NAME}»",
+        color=0x000000, timestamp=now_utc())
+    two_weeks = [item for item in low if _two_weeks_below(item[1])]
+    embed.add_field(name="👥 Игроков с ролью", value=str(total), inline=True)
+    embed.add_field(name="✅ Проверено", value=str(checked), inline=True)
+    embed.add_field(name=f"⚠️ Онлайн < {ONLINE_MIN_HOURS:g} ч.",
+                    value=str(len(low)), inline=True)
+    embed.add_field(name="🔴 Две недели подряд", value=str(len(two_weeks)),
+                    inline=True)
+
+    top = rows[:CHECK_ALL_MAX_MEMBERS]
+    if top:
+        lines = []
+        for place, (member, data) in enumerate(top, 1):
+            week = (data.get("week") or {}).get("total")
+            prev = (data.get("prev") or {}).get("total")
+            lines.append(f"**{place}.** {member.display_name} — "
+                         f"{_fmt_hours(week)} (прошлая {_fmt_hours(prev)})")
+        embed.add_field(name="🏆 Топ активности", value="\n".join(lines)[:1024],
+                        inline=False)
+    else:
+        embed.add_field(name="🏆 Топ активности",
+                        value="ℹ️ Нет игроков выше порога.", inline=False)
+
+    if low:
+        lines = []
+        for member, data in low[:CHECK_ALL_MAX_MEMBERS]:
+            week = (data.get("week") or {}).get("total")
+            prev = (data.get("prev") or {}).get("total")
+            mark = " — 🔴 2 недели подряд" if _two_weeks_below(data) else ""
+            lines.append(f"• {member.mention} — {_fmt_hours(week)} "
+                         f"(прошлая {_fmt_hours(prev)}){mark}")
+        if len(low) > CHECK_ALL_MAX_MEMBERS:
+            lines.append(f"…и ещё {len(low) - CHECK_ALL_MAX_MEMBERS}")
+        embed.add_field(name="⚠️ Малоактивные", value="\n".join(lines)[:1024],
+                        inline=False)
+    else:
+        embed.add_field(name="⚠️ Малоактивные",
+                        value=f"✅ У всех онлайн ≥ {ONLINE_MIN_HOURS:g} ч.",
+                        inline=False)
+
+    if no_link:
+        embed.add_field(name="🔗 Без /link",
+                        value=", ".join(m.display_name for m in no_link[:20])[:1024],
+                        inline=False)
+    if errors:
+        lines = [f"• {m.display_name} — {txt[:80]}" for m, txt in errors[:10]]
+        embed.add_field(name="⚠️ Не удалось проверить",
+                        value="\n".join(lines)[:1024], inline=False)
+    embed.set_footer(text=f"Quantum • {utc_stamp()}")
+    return embed
+
+
+async def _send_activity_warning(member) -> str:
+    """Отправляет игроку предупреждение в ЛС. Роль не трогает."""
+    text = (
+        f"⚠️ Предупреждение по активности в клане «{CLAN_NAME}»\n"
+        f"Твой онлайн за текущую неделю ниже порога "
+        f"{ONLINE_MIN_HOURS:g} ч.\n"
+        "Пожалуйста, удели игре больше времени. Роль пока не снята."
+    )
+    try:
+        await member.send(text)
+    except discord.Forbidden:
+        return (f"❌ Не удалось отправить предупреждение {member.mention}: "
+                "у игрока закрыты личные сообщения.")
+    except discord.HTTPException as e:
+        return (f"❌ Не удалось отправить предупреждение {member.mention}: "
+                f"{str(e)[:150]}")
+    return f"✅ Предупреждение отправлено {member.mention} в ЛС."
+
+
+async def _remove_activity_role(guild, member) -> str:
+    """Снимает роль клана по кнопке. Автоматического снятия нет."""
+    role = guild.get_role(TALENT_ROLE_ID) if guild is not None else None
+    if role is None and guild is not None:
+        role = discord.utils.get(guild.roles, name=CLAN_NAME)
+    if role is None:
+        return "❌ Роль клана не найдена на сервере."
+    if role not in member.roles:
+        return f"ℹ️ У {member.mention} уже нет роли «{role.name}»."
+    errors = await _remove_roles_checked(
+        member, [role], reason="Недельный отчёт: низкая активность")
+    if errors:
+        return "⚠️ " + "; ".join(errors)
+    return f"✅ Роль «{role.name}» снята с {member.mention}."
+
+
+async def _weekly_action(interaction, action: str, target_id: int) -> None:
+    """Кнопки отчёта: предупредить или снять роль (только вручную)."""
+    if not await _panel_guard(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    member = guild.get_member(int(target_id)) if guild is not None else None
+    if member is None:
+        await safe_send(interaction.followup,
+                        "❌ Игрок уже не на сервере.", ephemeral=True)
+        return
+    if action == "warn":
+        text = await _send_activity_warning(member)
+        details = "Предупреждение об активности"
+    else:
+        text = await _remove_activity_role(guild, member)
+        details = "Снятие роли за низкую активность (вручную)"
+    await safe_send(interaction.followup, text, ephemeral=True)
+    await audit_action(interaction.client, details, actor=interaction.user,
+                       target=member, details=text[:500])
+
+
+def _weekly_button(action: str, member, row: int) -> discord.ui.Button:
+    """Кнопка действия для одного малоактивного игрока."""
+    name = (member.display_name or "игрок")[:20]
+    if action == "warn":
+        button = discord.ui.Button(
+            label=f"⚠️ Предупредить: {name}",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"week_warn:{member.id}", row=row)
+    else:
+        button = discord.ui.Button(
+            label=f"🚫 Снять роль: {name}",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"week_remove:{member.id}", row=row)
+
+    async def callback(interaction):
+        await _weekly_action(interaction, action, member.id)
+
+    button.callback = callback
+    return button
+
+
+class WeeklyActivityView(discord.ui.View):
+    """Кнопки под недельным отчётом: до 5 малоактивных игроков."""
+
+    def __init__(self, low_members: list):
+        super().__init__(timeout=None)
+        for row, member in enumerate(low_members[:5]):
+            self.add_item(_weekly_button("warn", member, row))
+            self.add_item(_weekly_button("remove", member, row))
+
+
+@bot.tree.command(name="activity_week",
+                  description="Недельный отчёт по активности клана")
+@single_flight("activity_week",
+               "⏳ /activity_week уже выполняется. Подождите.")
+async def activity_week(i):
+    """Топ, малоактивные и отметка «две недели подряд».
+
+    Роль по отчёту не снимается автоматически: только кнопкой и только
+    модератором/админом. Ответ ephemeral.
+    """
+    await i.response.defer(ephemeral=True)
+    try:
+        guild = i.guild
+        if guild is None:
+            await safe_send(i.followup, "❌ Команда работает только на сервере.",
+                            ephemeral=True)
+            return
+        if not CS2RED_COOKIES:
+            await safe_send(i.followup,
+                            "❌ Нет cookie cs2red (CS2RED_COOKIE_STRING) — "
+                            "профиль активности недоступен.", ephemeral=True)
+            return
+        members = _talent_members(guild)
+        if not members:
+            await safe_send(i.followup,
+                            f"ℹ️ Нет участников с ролью «{CLAN_NAME}».",
+                            ephemeral=True)
+            return
+
+        async def progress(done, total):
+            if done % 5 == 0:
+                try:
+                    await i.edit_original_response(
+                        content=f"⏳ Проверено {done}/{total}…")
+                except Exception:
+                    pass
+
+        rows, low, no_link, errors, checked = await collect_online_stats(
+            members, progress=progress)
+        embed = _build_weekly_report_embed(rows, low, no_link, errors,
+                                           checked, len(members))
+        view = WeeklyActivityView([m for m, _ in low])
+        await safe_send(i.followup, embed=embed, view=view, ephemeral=True)
+    except Exception as e:
+        await log_error(i.client, "/activity_week", e)
+        try:
+            await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}",
+                            ephemeral=True)
+        except Exception:
+            pass
+
+
+# ============================================================
 # /activity <steam_id> — активность одного игрока (вкладка «Активность»)
 # ============================================================
 def _build_activity_embed(steam_id: str, data: dict) -> discord.Embed:
@@ -6213,6 +6427,7 @@ HELP_DESCRIPTIONS = {
     "check_mutes": "муты игрока",
     "check_all": "баны и муты у всех с ролью TALENT",
     "check_onlineall": "недельный онлайн клана TALENT",
+    "activity_week": "недельный отчёт: топ, малоактивные, две недели подряд",
     "check_clan": "роли клана у всех привязанных через /link",
     "moders": "панель модераторов: права и приоритет",
     "admins": "администраторы и модераторы клана",
