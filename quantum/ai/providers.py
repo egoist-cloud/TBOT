@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -111,7 +112,8 @@ class AIProvider:
             return f"{self.name}: выключен (нет {self.env_key})"
         state = f"ошибка: {self.last_error[:120]}" if self.last_error else "работает"
         if self.cooldown_left:
-            state += f", пауза после лимита ещё {self.cooldown_left} с"
+            state += (f", пауза после лимита/ошибки ещё "
+                      f"{_fmt_duration(self.cooldown_left)}")
         return (f"{self.name}: {state}, запросов {self.requests}, "
                 f"ошибок {self.failures}, последний HTTP {self.last_status}")
 
@@ -132,6 +134,46 @@ def _is_auth_error(status: int) -> bool:
     return status in (401, 403)
 
 
+def _fmt_duration(seconds: int) -> str:
+    """Секунды в человекочитаемый вид для /health и /ai_status.
+
+    Округляем вверх до минуты: cooldown_left уже усечён до целых секунд,
+    и 7199 с иначе показывались бы как «1 ч 59 мин».
+    """
+    minutes = max(1, (int(seconds) + 59) // 60)
+    if minutes >= 60:
+        return f"{minutes // 60} ч {minutes % 60} мин"
+    return f"{minutes} мин"
+
+
+def _parse_json_body(raw: str) -> dict | None:
+    """JSON из тела ответа, включая SSE-строки ``data: {...}``.
+
+    Некоторые OpenAI-совместимые шлюзы отвечают 200 с SSE или HTML
+    (страница логина при неверном токене), а не объектом JSON.
+    """
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        data = None
+    if isinstance(data, dict):
+        return data
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        chunk = line[5:].strip()
+        if not chunk or chunk == "[DONE]":
+            continue
+        try:
+            parsed = json.loads(chunk)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
 class GeminiProvider(AIProvider):
     """Gemini generateContent API (generativelanguage.googleapis.com).
 
@@ -149,13 +191,24 @@ class GeminiProvider(AIProvider):
     # ломает его, если задать там имя Gemini-модели. ``AI_MODEL`` остаётся
     # запасным вариантом для обратной совместимости.
     model_env = "GEMINI_MODEL"
-    default_model = "gemini-2.5-flash"
+    # Алиас Google всегда указывает на актуальную flash-модель: жёсткое имя
+    # (gemini-2.5-flash) однажды отключают, и провайдер получает 404.
+    default_model = "gemini-flash-latest"
     api_url_env = "GEMINI_API_URL"
     default_api_url = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    models_url_env = "GEMINI_MODELS_URL"
+    default_models_url = "https://generativelanguage.googleapis.com/v1beta/models"
     max_output_env = "AI_MAX_OUTPUT_TOKENS"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Модель, найденная через ListModels, если настроенная недоступна.
+        self._resolved_model = ""
 
     @property
     def _model(self) -> str:
+        if self._resolved_model:
+            return self._resolved_model
         # Приоритет: GEMINI_MODEL → AI_MODEL → модель по умолчанию.
         # ``AI_MODEL`` берём только если в нём явно Gemini-модель: в старых
         # .env переменная была общей с LLM7 и там мог лежать селектор
@@ -179,6 +232,39 @@ class GeminiProvider(AIProvider):
         """URL эндпоинта; {model} в шаблоне подставляется моделью."""
         template = os.getenv(self.api_url_env) or self.default_api_url
         return template.format(model=self._model)
+
+    async def _discover_model(self) -> str | None:
+        """Выбрать доступную flash-модель через ListModels (один раз на 404)."""
+        url = os.getenv(self.models_url_env) or self.default_models_url
+        try:
+            async with self.session.get(
+                url, headers={"x-goog-api-key": self._api_key()},
+                timeout=aiohttp.ClientTimeout(total=self.timeout),
+            ) as r:
+                if r.status != 200:
+                    log.warning("gemini: список моделей HTTP %s", r.status)
+                    return None
+                data = await r.json(content_type=None)
+        except Exception as e:  # noqa: BLE001 - без списка работаем как раньше
+            log.warning("gemini: список моделей: %s", e)
+            return None
+        names = []
+        for item in (data or {}).get("models", []) or []:
+            if not isinstance(item, dict):
+                continue
+            methods = item.get("supportedGenerationMethods") or []
+            name = str(item.get("name") or "").removeprefix("models/")
+            if "generateContent" not in methods or not name.startswith("gemini"):
+                continue
+            if any(bad in name for bad in ("embedding", "image", "tts", "live",
+                                           "vision", "aqa")):
+                continue
+            names.append(name)
+        # Стабильные flash-модели важнее preview/experimental и lite.
+        names.sort(key=lambda name: ("preview" in name or "exp" in name,
+                                     "lite" in name or "flash" not in name,
+                                     name))
+        return names[0] if names else None
 
     async def complete(self, messages: list) -> str | None:
         if not self.enabled:
@@ -213,8 +299,16 @@ class GeminiProvider(AIProvider):
             "x-goog-api-key": self._api_key(),
             "Content-Type": "application/json",
         }
-        url = self._build_url()
-        return await self._post(url, headers, body)
+        result = await self._post(self._build_url(), headers, body)
+        if result is None and self.last_status == 404:
+            # Настроенная модель отключена/переименована — берём доступную.
+            fallback = await self._discover_model()
+            if fallback and fallback != self._model:
+                log.info("gemini: модель %s недоступна, переключаюсь на %s",
+                         self._model, fallback)
+                self._resolved_model = fallback
+                result = await self._post(self._build_url(), headers, body)
+        return result
 
     async def _post(self, url: str, headers: dict, body: dict) -> str | None:
         self.requests += 1
@@ -236,10 +330,11 @@ class GeminiProvider(AIProvider):
                         msg = f"временный сбой {r.status}: {raw[:200]}"
                         self._record(r.status, msg, self._retry_after(r))
                     elif r.status == 400:
-                        msg = f"неверный запрос (проверь AI_MODEL): {raw[:200]}"
+                        msg = f"неверный запрос (проверь GEMINI_MODEL): {raw[:200]}"
                         self._record(r.status, msg)
                     elif r.status == 404:
-                        msg = f"модель не найдена (проверь AI_MODEL): {raw[:200]}"
+                        msg = (f"модель не найдена (проверь GEMINI_MODEL): "
+                               f"{raw[:200]}")
                         self._record(r.status, msg)
                     else:
                         msg = f"HTTP {r.status}: {raw[:200]}"
@@ -248,7 +343,11 @@ class GeminiProvider(AIProvider):
                 try:
                     data = await r.json(content_type=None)
                 except Exception:
-                    self._record(r.status, "не удалось разобрать JSON в ответе")
+                    data = _parse_json_body(raw)
+                if not isinstance(data, dict):
+                    ctype = r.headers.get("Content-Type", "?")
+                    msg = f"ответ не JSON ({ctype}): {raw[:200]}"
+                    self._record(None, msg)
                     return None
                 self._record(r.status, "")
         except asyncio.TimeoutError:
@@ -342,7 +441,15 @@ class _OpenAICompatProvider(AIProvider):
                 try:
                     data = await r.json(content_type=None)
                 except Exception:
-                    self._record(r.status, "не удалось разобрать JSON в ответе")
+                    data = _parse_json_body(raw)
+                if not isinstance(data, dict):
+                    ctype = r.headers.get("Content-Type", "?")
+                    msg = f"ответ не JSON ({ctype}): {raw[:200]}"
+                    self._record(None, msg)
+                    return None
+                if isinstance(data.get("error"), (dict, str)):
+                    msg = f"ошибка API: {str(data['error'])[:200]}"
+                    self._record(400, msg)
                     return None
                 self._record(r.status, "")
         except asyncio.TimeoutError:
@@ -357,8 +464,6 @@ class _OpenAICompatProvider(AIProvider):
     @staticmethod
     def _extract(data: dict) -> str | None:
         if not isinstance(data, dict):
-            return None
-        if isinstance(data.get("error"), (dict, str)):
             return None
         choices = data.get("choices") or []
         if not choices:

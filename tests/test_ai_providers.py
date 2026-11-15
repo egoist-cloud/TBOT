@@ -99,14 +99,20 @@ class _FakePost:
 class _FakeSession:
     """Сессия-заглушка: пишет вызовы и отдаёт заданный ответ/ошибку."""
 
-    def __init__(self, response=None, error=None):
+    def __init__(self, response=None, error=None, get_response=None):
         self.response = response
         self.error = error
+        self.get_response = get_response
         self.calls = []
+        self.get_calls = []
 
     def post(self, url, **kwargs):
         self.calls.append({"url": url, **kwargs})
         return _FakePost(self.response, self.error)
+
+    def get(self, url, **kwargs):
+        self.get_calls.append({"url": url, **kwargs})
+        return _FakePost(self.get_response)
 
 
 def _gemini_payload(*texts):
@@ -215,10 +221,10 @@ def test_make_providers_only_with_keys_in_order(monkeypatch):
 def test_gemini_model_priority(monkeypatch):
     """GEMINI_MODEL → AI_MODEL (только gemini-модель) → значение по умолчанию."""
     provider = GeminiProvider(_FakeSession())
-    assert provider._model == "gemini-2.5-flash"
+    assert provider._model == "gemini-flash-latest"
 
     monkeypatch.setenv("AI_MODEL", "default")     # селектор LLM7, не Gemini
-    assert provider._model == "gemini-2.5-flash"
+    assert provider._model == "gemini-flash-latest"
 
     monkeypatch.setenv("AI_MODEL", "gemini-2.0-pro")
     assert provider._model == "gemini-2.0-pro"
@@ -246,13 +252,13 @@ def test_gemini_build_url(monkeypatch):
     provider = GeminiProvider(_FakeSession())
     url = provider._build_url()
     assert url.startswith("https://generativelanguage.googleapis.com/")
-    assert "gemini-2.5-flash" in url
+    assert "gemini-flash-latest" in url
     assert url.endswith(":generateContent")
 
     monkeypatch.setenv("GEMINI_API_URL",
                        "https://proxy.test/v1/models/{model}:generateContent")
     assert provider._build_url() == \
-        "https://proxy.test/v1/models/gemini-2.5-flash:generateContent"
+        "https://proxy.test/v1/models/gemini-flash-latest:generateContent"
     print("  ok: URL Gemini")
 
 
@@ -716,3 +722,104 @@ def test_provider_catalog_cloudflare_needs_account_id(monkeypatch):
     catalog = {item["name"]: item for item in provider_catalog()}
     assert catalog["cloudflare"]["enabled"] is True
     assert "CLOUDFLARE_ACCOUNT_ID" in catalog["cloudflare"]["env"]
+
+
+def test_gemini_falls_back_to_discovered_model(monkeypatch):
+    """404 на настроенной модели: ListModels и повтор с доступной моделью."""
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-removed-model")
+    payload = {"candidates": [{"content": {"parts": [{"text": "ОК"}]}}]}
+    models = {"models": [
+        {"name": "models/gemini-9-pro", "supportedGenerationMethods": ["generateContent"]},
+        {"name": "models/gemini-9-flash", "supportedGenerationMethods": ["generateContent"]},
+        {"name": "models/gemini-embedding-1", "supportedGenerationMethods": ["embedContent"]},
+    ]}
+
+    class _SeqSession(_FakeSession):
+        def __init__(self):
+            super().__init__(get_response=_FakeResponse(payload=models))
+            self._responses = [
+                _FakeResponse(status=404, body='{"error": "not found"}'),
+                _FakeResponse(payload=payload),
+            ]
+
+        def post(self, url, **kwargs):
+            self.calls.append({"url": url, **kwargs})
+            return _FakePost(self._responses.pop(0))
+
+    session = _SeqSession()
+    provider = GeminiProvider(session)
+
+    assert _complete(provider) == "ОК"
+    assert provider._model == "gemini-9-flash"
+    assert len(session.get_calls) == 1
+    assert "gemini-9-flash" in session.calls[-1]["url"]
+    assert provider.last_status == 200
+    assert provider.last_error == ""
+    print("  ok: Gemini переключился на доступную модель")
+
+
+def test_gemini_404_without_model_list_keeps_error(monkeypatch):
+    """404 и пустой список моделей: понятная ошибка, без падения."""
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    session = _FakeSession(
+        _FakeResponse(status=404, body='{"error": "not found"}'),
+        get_response=_FakeResponse(payload={"models": []}))
+    provider = GeminiProvider(session)
+
+    assert _complete(provider) is None
+    assert "модель не найдена" in provider.last_error
+    assert provider.last_status == 404
+    print("  ok: 404 без резервной модели — ошибка остаётся")
+
+
+def test_openai_html_200_is_reported_and_cooled_down(monkeypatch):
+    """200 с HTML вместо JSON: понятная причина и пауза, без ложного успеха."""
+    monkeypatch.setenv("GITHUB_MODELS_TOKEN", "k")
+    session = _FakeSession(_FakeResponse(
+        status=200, body="<html><body>Sign in</body></html>",
+        json_error=ValueError("Expecting value"),
+        headers={"Content-Type": "text/html"}))
+    provider = GitHubModelsProvider(session)
+
+    assert _complete(provider) is None
+    assert "не JSON" in provider.last_error
+    assert "text/html" in provider.last_error
+    assert provider.cooldown_left > 0, "без паузы бот будет долбить шлюз"
+    print("  ok: HTML вместо JSON — ошибка и пауза")
+
+
+def test_openai_error_payload_with_200(monkeypatch):
+    """200 с объектом error внутри — ошибка API, а не пустой ответ."""
+    monkeypatch.setenv("GITHUB_MODELS_TOKEN", "k")
+    provider = GitHubModelsProvider(_FakeSession(_FakeResponse(
+        payload={"error": {"message": "quota exceeded"}})))
+
+    assert _complete(provider) is None
+    assert "quota exceeded" in provider.last_error
+    assert provider.last_status == 400
+    print("  ok: error внутри 200 распознан")
+
+
+def test_openai_sse_body_is_parsed(monkeypatch):
+    """SSE-ответ (data: {...}) разбирается как обычный JSON."""
+    monkeypatch.setenv("GROQ_API_KEY", "k")
+    body = ('data: {"choices": [{"message": {"content": "привет"}}]}\n'
+            "data: [DONE]\n")
+    provider = GroqProvider(_FakeSession(_FakeResponse(
+        body=body, json_error=ValueError("Expecting value"))))
+
+    assert _complete(provider) == "привет"
+    print("  ok: SSE-ответ провайдера разобран")
+
+
+def test_status_line_shows_human_cooldown(monkeypatch):
+    """Пауза в /health — в часах и минутах, а не в секундах."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    provider = OpenRouterProvider(_FakeSession())
+    provider._record(429, "лимит", retry_after=7200)
+
+    line = provider.status_line()
+
+    assert "2 ч" in line
+    assert "7200" not in line
