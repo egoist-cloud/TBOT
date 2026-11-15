@@ -91,9 +91,13 @@ def _parse_idea(text: str) -> dict:
 class Agent:
     """Наблюдатель за ботом: ошибки, отчёты, идеи."""
 
-    def __init__(self, bot, channel_id: int = 0, redact=None):
+    def __init__(self, bot, channel_id: int = 0, redact=None,
+                 idea_channel_id: int | None = None):
         self.bot = bot
         self.channel_id = int(channel_id or 0)
+        # Идеи по коду можно вынести в отдельный канал, чтобы не мешались
+        # с отчётами о состоянии; по умолчанию — тот же канал агента.
+        self.idea_channel_id = int(idea_channel_id or self.channel_id)
         # Маскирование секретов: в канал агента не должны попадать токены
         # и cookie из текста исключений (URL Steam с ?key=, заголовки).
         self._redact = redact or (lambda text: str(text))
@@ -106,18 +110,20 @@ class Agent:
     # ------------------------------------------------------------
     # Служебное
     # ------------------------------------------------------------
-    def channel(self):
-        """Канал агента (None, если канала нет или он недоступен)."""
-        if not self.channel_id:
+    def channel(self, channel_id: int | None = None):
+        """Канал агента/идей (None, если канала нет или он недоступен)."""
+        cid = self.channel_id if channel_id is None else int(channel_id)
+        if not cid:
             return None
         try:
-            return self.bot.get_channel(self.channel_id)
+            return self.bot.get_channel(cid)
         except Exception:
             return None
 
-    async def post(self, embed: discord.Embed) -> bool:
-        """Отправляет Embed в канал агента. False — канал недоступен."""
-        ch = self.channel()
+    async def post(self, embed: discord.Embed,
+                   channel_id: int | None = None) -> bool:
+        """Отправляет Embed в канал агента (или указанный). False — нет канала."""
+        ch = self.channel(channel_id)
         if ch is None:
             return False
         try:
@@ -319,18 +325,21 @@ class Agent:
         """Один цикл: отчёт по расписанию, затем идея по расписанию."""
         now = time.time()
 
-        if now - await self._flag_time(_FLAG_HEALTH) >= \
-                AGENT_HEALTH_INTERVAL_MINUTES * 60:
+        # 0 — отключить рассылку совсем (например, идеи есть, отчёты не нужны).
+        if (AGENT_HEALTH_INTERVAL_MINUTES > 0
+                and now - await self._flag_time(_FLAG_HEALTH) >=
+                AGENT_HEALTH_INTERVAL_MINUTES * 60):
             embed = await self.build_health_embed(extra)
             await self.post(embed)
             await seen_repo.set_flag(_FLAG_HEALTH, str(now))
 
-        if now - await self._flag_time(_FLAG_IDEA) >= \
-                AGENT_IDEA_INTERVAL_MINUTES * 60:
+        if (AGENT_IDEA_INTERVAL_MINUTES > 0
+                and now - await self._flag_time(_FLAG_IDEA) >=
+                AGENT_IDEA_INTERVAL_MINUTES * 60):
             stats = await self.snapshot(extra)
             embed = await self.build_idea_embed(providers, stats)
             if embed is not None:
-                await self.post(embed)
+                await self.post(embed, channel_id=self.idea_channel_id)
                 await self.remember_idea(embed.description or "")
                 # Флаг ставим только после успешной идеи: если все
                 # провайдеры были в паузе, попробуем в следующий цикл.
@@ -342,7 +351,7 @@ class Agent:
         embed = await self.build_idea_embed(providers, stats)
         if embed is None:
             return None
-        if not await self.post(embed):
+        if not await self.post(embed, channel_id=self.idea_channel_id):
             return None
         await self.remember_idea(embed.description or "")
         await seen_repo.set_flag(_FLAG_IDEA, str(time.time()))

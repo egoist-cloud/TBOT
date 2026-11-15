@@ -164,6 +164,9 @@ CHECK_LOG_CHANNEL_ID = env_int("CHECK_LOG_CHANNEL_ID", LOG_CHANNEL_ID)
 
 # Канал ИИ-агента: ошибки команд, отчёты о состоянии, идеи по улучшению.
 AGENT_CHANNEL_ID = env_int("AGENT_CHANNEL_ID", 1556427610160889907)
+# Идеи по улучшению кода можно увести в отдельный канал; по умолчанию —
+# тот же канал, что и отчёты агента.
+AGENT_IDEA_CHANNEL_ID = env_int("AGENT_IDEA_CHANNEL_ID", AGENT_CHANNEL_ID)
 
 ALLOWED_ROLE_ID = env_int("ALLOWED_ROLE_ID", 0)
 REVIEWER_ROLE_ID_2 = env_int("REVIEWER_ROLE_ID_2", 0)
@@ -3935,7 +3938,8 @@ class MyBot(commands.Bot):
 bot = MyBot()
 
 # ИИ-агент: наблюдает за системой, пишет об ошибках и предлагает идеи.
-agent = Agent(bot, AGENT_CHANNEL_ID, redact=redact)
+agent = Agent(bot, AGENT_CHANNEL_ID, redact=redact,
+              idea_channel_id=AGENT_IDEA_CHANNEL_ID)
 
 # ИИ-сервис (каскад провайдеров + кэш + RAG). Инициализируется в setup_hook.
 ai_service: AIService | None = None
@@ -8686,9 +8690,10 @@ async def agent_idea(i):
                 "⚠️ ИИ не дал ответ (все провайдеры заняты или в паузе). "
                 "Попробуй позже.", ephemeral=True)
             return
-        await safe_send(i.followup,
-                        f"✅ Идея опубликована в канале <#{AGENT_CHANNEL_ID}>.",
-                        ephemeral=True)
+        await safe_send(
+            i.followup,
+            f"✅ Идея опубликована в канале <#{AGENT_IDEA_CHANNEL_ID}>.",
+            ephemeral=True)
     except Exception as e:
         await log_error(i.client, "/agent_idea", e)
         await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}", ephemeral=True)

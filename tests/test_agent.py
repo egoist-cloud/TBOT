@@ -251,3 +251,100 @@ def test_idea_prompt_rejects_repeat_ideas():
         {}, ["Добавить /admins", "Сделать отчёт"], "")
     assert "Добавить /admins" in prompt
     assert "не повторяй" in prompt
+
+
+# ============================================================
+# Отчёты и идеи — в разные каналы
+# ============================================================
+from quantum import agent as agentmod  # noqa: E402
+from quantum.repositories import seen as seen_repo  # noqa: E402
+
+
+class _SplitBot:
+    def __init__(self, mapping):
+        self.mapping = mapping
+
+    def get_channel(self, channel_id):
+        return self.mapping.get(int(channel_id))
+
+
+async def _reset_agent_flags():
+    for flag in ("agent_last_health", "agent_last_idea"):
+        await seen_repo.set_flag(flag, "0")
+    await seen_repo.set_flag("agent_ideas", "[]")
+
+
+def test_idea_channel_defaults_to_agent_channel():
+    """Без AGENT_IDEA_CHANNEL_ID идеи идут в канал агента (старое поведение)."""
+    assert Agent(_FakeBot(), 111).idea_channel_id == 111
+    print("  ok: канал идей по умолчанию — канал агента")
+
+
+def test_reports_and_ideas_use_separate_channels():
+    """Отчёт уходит в AGENT_CHANNEL_ID, идея — в AGENT_IDEA_CHANNEL_ID."""
+    async def scenario():
+        await init_db()
+        try:
+            await _reset_agent_flags()
+            reports, ideas = _FakeChannel(), _FakeChannel()
+            agent = Agent(_SplitBot({111: reports, 222: ideas}), 111,
+                          idea_channel_id=222)
+
+            await agent.run_cycle([_FakeProvider()], {})
+
+            assert len(reports.sent) == 1
+            assert reports.sent[0].title == "🩺 Наблюдение за системой"
+            assert len(ideas.sent) == 1
+            assert ideas.sent[0].title == "💡 Идея от ИИ-агента"
+        finally:
+            await _reset_agent_flags()
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: отчёт и идея разошлись по разным каналам")
+
+
+def test_health_reports_can_be_disabled(monkeypatch):
+    """AGENT_HEALTH_INTERVAL_MINUTES=0 — отчёты не публикуются, идеи остаются."""
+    async def scenario():
+        await init_db()
+        try:
+            await _reset_agent_flags()
+            monkeypatch.setattr(agentmod, "AGENT_HEALTH_INTERVAL_MINUTES", 0)
+            reports, ideas = _FakeChannel(), _FakeChannel()
+            agent = Agent(_SplitBot({111: reports, 222: ideas}), 111,
+                          idea_channel_id=222)
+
+            await agent.run_cycle([_FakeProvider()], {})
+
+            assert reports.sent == [], "отчёты отключены"
+            assert len(ideas.sent) == 1, "идеи продолжают приходить"
+        finally:
+            await _reset_agent_flags()
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: отчёты можно отключить, идеи остаются")
+
+
+def test_force_idea_goes_to_idea_channel():
+    """Ручная /agent_idea публикует в канал идей, а не отчётов."""
+    async def scenario():
+        await init_db()
+        try:
+            await _reset_agent_flags()
+            reports, ideas = _FakeChannel(), _FakeChannel()
+            agent = Agent(_SplitBot({111: reports, 222: ideas}), 111,
+                          idea_channel_id=222)
+
+            embed = await agent.force_idea([_FakeProvider()], {})
+
+            assert embed is not None
+            assert reports.sent == []
+            assert len(ideas.sent) == 1
+        finally:
+            await _reset_agent_flags()
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: ручная идея идёт в канал идей")
