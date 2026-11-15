@@ -4708,6 +4708,8 @@ async def run_auto_link(i, ephemeral: bool = False):
     try:
         # Все участники сервера (без ботов).
         members = [m for m in i.guild.members if not m.bot]
+        # Сначала возвращаем связи, потерянные при сбросе БД.
+        await _reconcile_links_from_players(i.guild)
         # Уже привязанные ID из БД.
         linked = await links_repo.get_all_links()
 
@@ -4782,12 +4784,12 @@ async def run_auto_link(i, ephemeral: bool = False):
                     errors.append(f"{m.display_name}: cs2red не ответил")
                     continue
 
-                steam_id = None
-                if len(users) == 1:
-                    steam_id = api.extract_steam64(users[0])
+                matched = _pick_nick_match(users, nick)
+                steam_id = api.extract_steam64(matched) if matched else None
 
                 if steam_id is None:
-                    skipped_ambigu.append(f"{m.display_name} ({nick})")
+                    skipped_ambigu.append(
+                        f"{m.display_name} ({nick}: найдено {len(users)})")
                 else:
                     await links_repo.add_link(m.id, steam_id)
                     added.append(f"{m.display_name} → `{steam_id}`")
@@ -5354,6 +5356,44 @@ def _talent_members(guild) -> list:
     return [m for m in guild.members if role in m.roles and not m.bot]
 
 
+async def _reconcile_links_from_players(guild) -> int:
+    """Восстанавливает links из профилей players (discord_id ↔ steamid64).
+
+    Профиль игрока уже содержит Discord ID, если он когда-то был привязан.
+    Если запись в links потерялась (новая БД, сброс DATA_DIR), игрок с ролью
+    выглядел «не авторизованным». Восстанавливаем только безопасные пары:
+    Discord без привязки, Steam без владельца, участник существует.
+    """
+    try:
+        profiles = await players_repo.get_all_players()
+    except Exception as e:
+        log(f"⚠️ reconcile links: players: {e}")
+        return 0
+    links = await links_repo.get_all_links()
+    by_discord = {str(k): str(v) for k, v in links.items()}
+    owners = {str(v): str(k) for k, v in links.items()}
+    restored = 0
+    for steam, profile in (profiles or {}).items():
+        if not isinstance(profile, dict):
+            continue
+        discord_id = str(profile.get("discord_id") or "").strip()
+        steam = str(steam or "").strip()
+        if not discord_id.isdigit() or not steam.isdigit():
+            continue
+        if discord_id in by_discord or owners.get(steam, discord_id) != discord_id:
+            continue
+        member = guild.get_member(int(discord_id))
+        if member is None or member.bot:
+            continue
+        await links_repo.add_link(discord_id, steam)
+        by_discord[discord_id] = steam
+        owners[steam] = discord_id
+        restored += 1
+    if restored:
+        log(f"🔗 Восстановлено привязок из базы игроков: {restored}")
+    return restored
+
+
 async def _clan_sync_members(guild) -> list:
     """Кого проверять при синхронизации ролей клана.
 
@@ -5774,6 +5814,38 @@ def _member_clan_roles(guild, member, known_names: set) -> list:
             if r.id in managed_ids or r.name in known_names]
 
 
+async def _relink_role_members(members: list) -> tuple[int, list]:
+    """Пытается привязать по нику участников с ролью клана без /link.
+
+    Возвращает (сколько привязано, список неудач). Ограничено
+    CHECK_CLAN_RELINK_LIMIT, чтобы проверка не висела бесконечно и не
+    выжигала лимит cs2red.
+    """
+    if not CHECK_CLAN_AUTO_LINK:
+        return 0, []
+    links = await links_repo.get_all_links()
+    linked_ids = {str(k) for k in links}
+    # members уже включает всех с ролью TALENT, ролью клана или привязкой —
+    # значит без /link здесь именно те, кого просили перепроверить.
+    candidates = [m for m in members if str(m.id) not in linked_ids]
+    added, failed = 0, []
+    for member in candidates[:CHECK_CLAN_RELINK_LIMIT]:
+        if api.is_blocked():
+            failed.append("cs2red на паузе — привязка остановлена")
+            break
+        try:
+            steam, err = await _auto_link_member(member, quiet=True)
+        except Exception as e:
+            failed.append(f"{member.display_name}: {str(e)[:80]}")
+            continue
+        if steam:
+            added += 1
+        else:
+            failed.append(f"{member.display_name}: {err}")
+        await asyncio.sleep(api.RATE_LIMIT_SECONDS)
+    return added, failed
+
+
 async def _collect_clan_role_issues(guild, members: list) -> dict:
     """Собирает проблемы с ролями клана у участников.
 
@@ -5826,7 +5898,7 @@ async def _collect_clan_role_issues(guild, members: list) -> dict:
     return issues
 
 
-def _build_check_clan_embed(issues: dict, total: int) -> discord.Embed:
+def _build_check_clan_embed(issues: dict, total: int, relinked: int = 0) -> discord.Embed:
     """Embed с результатами /check_clan."""
     extra = issues["extra"]
     unlinked = issues["unlinked"]
@@ -5841,6 +5913,9 @@ def _build_check_clan_embed(issues: dict, total: int) -> discord.Embed:
     embed.add_field(name="✅ Проверено", value=str(issues["checked"]), inline=True)
     embed.add_field(name="⚠️ Проблем", value=str(len(extra) + len(missing)
                                                   + len(wrong)), inline=True)
+    if relinked:
+        embed.add_field(name="➕ Привязано по никам", value=str(relinked),
+                        inline=True)
 
     def fmt(rows, tail="") -> str:
         out = []
@@ -5985,8 +6060,9 @@ class CheckClanView(discord.ui.View):
                      f"Проблем: {len(problems)}"))
 
 
-@bot.tree.command(name="check_clan",
-                  description="Проверить роли клана у всех привязанных через /link")
+@bot.tree.command(
+    name="check_clan",
+    description="Проверить роли клана, восстановить привязки и привязать по никам")
 @single_flight("check_clan", "⏳ /check_clan уже выполняется. Подождите.")
 async def check_clan(i):
     """Ищет лишние и устаревшие роли клана, а также отсутствующие.
@@ -6003,6 +6079,9 @@ async def check_clan(i):
             await safe_send(i.followup, "❌ Команда работает только на сервере.",
                             ephemeral=True)
             return
+        # Сначала восстанавливаем потерянные links из базы игроков, затем
+        # пробуем привязать по никам тех, у кого есть роль, но нет /link.
+        await _reconcile_links_from_players(guild)
         members = await _clan_sync_members(guild)
         if not members:
             await safe_send(
@@ -6010,9 +6089,14 @@ async def check_clan(i):
                 "ℹ️ Нет привязанных участников и участников с ролью клана.",
                 ephemeral=True)
             return
+        relinked, relink_failed = await _relink_role_members(members)
 
         issues = await _collect_clan_role_issues(guild, members)
-        embed = _build_check_clan_embed(issues, len(members))
+        embed = _build_check_clan_embed(issues, len(members), relinked)
+        if relink_failed:
+            embed.add_field(
+                name="Не удалось привязать",
+                value="\n".join(relink_failed[:8])[:1000], inline=False)
         has_issues = bool(issues["extra"] or issues["missing"]
                           or issues["wrong"] or issues["unlinked"])
         view = CheckClanView() if has_issues else None
@@ -8411,12 +8495,19 @@ async def before_hourly_clan_sync():
 # Запускают те же функции, что /auto_link и /sync_all: логика одна,
 # меняется только источник «интеракции» — фоновый контекст.
 AUTO_LINK_INTERVAL_HOURS = env_int("AUTO_LINK_INTERVAL_HOURS", 3)
+# Привязка по никам прямо в /check_clan для участников с ролью без /link.
+CHECK_CLAN_AUTO_LINK = env_int("CHECK_CLAN_AUTO_LINK", 1)
+CHECK_CLAN_RELINK_LIMIT = env_int("CHECK_CLAN_RELINK_LIMIT", 25)
 SYNC_ALL_INTERVAL_MINUTES = env_int("SYNC_ALL_INTERVAL_MINUTES", 120)
 
 
 def _auto_link_first_delay() -> int:
-    """Первый автозапуск — через полный интервал после старта бота."""
-    return max(60, AUTO_LINK_INTERVAL_HOURS * 3600)
+    """Первый автозапуск — через 10–20 минут после старта.
+
+    Раньше ждали полный интервал (3 ч), но хостинг перезапускается чаще,
+    и авто-привязка не успевала выполниться ни разу.
+    """
+    return random.randint(600, 1200)
 
 
 def _sync_all_first_delay() -> int:
@@ -8496,6 +8587,7 @@ async def auto_link_watch():
         if api.is_blocked():
             log(f"⏸ Авто-привязка пропущена: cs2red на паузе ({api.blocked_reason})")
             return
+        await _reconcile_links_from_players(guild)
         links = await links_repo.get_all_links()
         unlinked = _unlinked_members(guild, links)
         if not unlinked:
@@ -9219,32 +9311,74 @@ def _role_panel_embed() -> discord.Embed:
     return e
 
 
-async def _auto_link_member(member):
+def _norm_nick(value) -> str:
+    """Ник для сравнения: без регистра и лишних пробелов."""
+    return " ".join(str(value or "").casefold().split())
+
+
+def _nick_variants(member) -> list[str]:
+    """Варианты ника участника: display_name, global_name, username."""
+    out: list[str] = []
+    for value in (getattr(member, "display_name", ""),
+                  getattr(member, "global_name", ""),
+                  getattr(member, "name", "")):
+        text = " ".join(str(value or "").split())
+        if not text:
+            continue
+        for variant in (text, text.strip("[](){}<>|_-*~. ")):
+            if variant and variant not in out:
+                out.append(variant)
+    return out[:4]
+
+
+def _pick_nick_match(users: list, wanted: str):
+    """Один точный игрок из результатов поиска (None — неоднозначно)."""
+    if not users:
+        return None
+    if len(users) == 1:
+        return users[0]
+    exact = [u for u in users
+             if isinstance(u, dict) and _norm_nick(u.get("nick")) == _norm_nick(wanted)]
+    return exact[0] if len(exact) == 1 else None
+
+
+async def _auto_link_member(member, quiet: bool = False):
     """Привязывает участника по нику. Возвращает (steam_id, текст ошибки)."""
-    nick = (getattr(member, "display_name", "") or "").strip()
-    if not nick:
+    variants = _nick_variants(member)
+    if not variants:
         return None, "❌ Не вижу твой ник — привяжи SteamID через `/link`."
-    users = await api.cs2red_search_by_nick(nick)
-    if users is None:
-        reason = getattr(api, "blocked_reason", "")
-        if reason == "403":
-            return None, "❌ Ошибка авторизации на cs2red — сообщи админу."
-        if reason == "429":
-            return None, ("⏳ cs2red временно ограничил запросы — "
-                          "попробуй через 5 минут.")
-        return None, "❌ cs2red не ответил. Попробуй позже."
-    if len(users) != 1:
-        return None, (f"⚠️ Нашёл профилей: {len(users)}. "
-                      "Привяжи точно через `/link`.")
-    steam = api.extract_steam64(users[0])
+    matched, tried, last_users = None, [], []
+    for nick in variants:
+        tried.append(nick)
+        users = await api.cs2red_search_by_nick(nick)
+        last_users = users or []
+        if users is None:
+            reason = getattr(api, "blocked_reason", "")
+            if reason == "403":
+                return None, "❌ Ошибка авторизации на cs2red — сообщи админу."
+            if reason == "429":
+                return None, ("⏳ cs2red временно ограничил запросы — "
+                              "попробуй через 5 минут.")
+            return None, "❌ cs2red не ответил. Попробуй позже."
+        matched = _pick_nick_match(users, nick)
+        if matched is not None:
+            break
+    if matched is None:
+        if len(last_users) > 1:
+            return None, (f"⚠️ Нашёл профилей: {len(last_users)}. "
+                          "Привяжи точно через `/link`.")
+        return None, (f"⚠️ Не нашёл профиль по нику "
+                      f"({', '.join(tried)}). Привяжи через `/link`.")
+    steam = api.extract_steam64(matched)
     if not steam:
         return None, "⚠️ Не смог определить SteamID — привяжи через `/link`."
     owner = await links_repo.get_owner_of(steam)
     if owner and str(owner) != str(member.id):
         return None, "❌ Этот SteamID уже привязан к другому Discord."
     await links_repo.add_link(member.id, steam)
-    await log_to_channel(
-        bot, f"🎭 Роль: {member.mention} привязан по нику → `{steam}`")
+    if not quiet:
+        await log_to_channel(
+            bot, f"🎭 Роль: {member.mention} привязан по нику → `{steam}`")
     return steam, None
 
 

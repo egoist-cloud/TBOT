@@ -30,11 +30,14 @@ def test_intervals_are_three_hours_and_two_hours():
     print("  ok: расписания 3 ч и 2 ч")
 
 
-def test_first_run_waits_full_interval():
-    """После перезапуска первый прогон — через полный интервал, не сразу."""
+def test_first_run_delays():
+    """Синхронизация ролей ждёт полный интервал, авто-привязка — 10–20 мин."""
     assert botmod._sync_all_first_delay() == 120 * 60
-    assert botmod._auto_link_first_delay() == 3 * 3600
-    print("  ok: после старта бот ждёт полный интервал")
+    # Хостинг перезапускается чаще 3 часов, поэтому авто-привязка не должна
+    # ждать полный интервал: иначе она не успевает запуститься ни разу.
+    delay = botmod._auto_link_first_delay()
+    assert 10 * 60 <= delay <= 20 * 60, delay
+    print("  ok: задержки первого прогона")
 
 
 def test_unlinked_members_skips_linked_and_bots():
