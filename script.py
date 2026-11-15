@@ -3753,7 +3753,7 @@ PUBLIC_COMMANDS = {"link", "unlink", "ping", "health", "lookup", "ask",
 ADMIN_ONLY_COMMANDS = {
     "give", "take", "admlink", "auto_link", "sync_all", "export_members",
     "link_all", "player_list", "player_note", "ai_clear_cache", "panel",
-    "activity_set", "activity_clear", "rolepanel",
+    "activity_set", "activity_clear", "rolepanel", "agent_idea",
 }
 
 # Команды, которые админ может выдать модератору. Порядок = порядок в меню.
@@ -6128,6 +6128,7 @@ HELP_DESCRIPTIONS = {
     "give": "выдать доступ модератора",
     "panel": "панель управления ботом",
     "rolepanel": "опубликовать панель «Получить роль»",
+    "agent_idea": "идея по улучшению кода прямо сейчас",
     "sync_all": "синхронизировать роли всех привязанных",
     "auto_link": "авто-привязка по никам",
     "link_all": "массовая привязка из базы",
@@ -8594,27 +8595,100 @@ async def before_voice_stats_flush():
 # ============================================================
 AGENT_CHECK_MINUTES = env_int("AGENT_CHECK_MINUTES", 30)
 
+# Сводка по коду для идей агента: считается один раз за процесс.
+_CODE_OVERVIEW_CACHE: dict = {}
+_CODE_OVERVIEW_DIRS_SKIP = {"tests", "__pycache__", "venv", ".venv", "node_modules",
+                           ".git", "data", ".mypy_cache", ".pytest_cache"}
+
+
+def _code_overview() -> str:
+    """Краткая структура кода: файлы, размер, число команд — для промпта."""
+    cached = _CODE_OVERVIEW_CACHE.get("text")
+    if cached is not None:
+        return cached
+    root = Path(__file__).resolve().parent
+    files = []
+    try:
+        for path in root.rglob("*.py"):
+            rel = path.relative_to(root)
+            if any(part in _CODE_OVERVIEW_DIRS_SKIP for part in rel.parts):
+                continue
+            try:
+                with path.open(encoding="utf-8", errors="ignore") as fh:
+                    lines = sum(1 for _ in fh)
+            except OSError:
+                continue
+            files.append((rel.as_posix(), lines))
+    except Exception as e:
+        log(f"⚠️ code overview: {e}")
+    total = sum(lines for _, lines in files)
+    biggest = sorted(files, key=lambda item: -item[1])[:10]
+    listing = ", ".join(f"{name} (~{lines})" for name, lines in biggest)
+    text = (f"Python-файлов: {len(files)}, всего ~{total} строк. "
+            f"Крупнейшие: {listing}. "
+            f"Слэш-команд: {len(bot.tree.get_commands())}.")
+    _CODE_OVERVIEW_CACHE["text"] = text[:1200]
+    return _CODE_OVERVIEW_CACHE["text"]
+
+
+def _agent_extra() -> dict:
+    """Контекст для отчётов и идей агента."""
+    return {
+        "uptime": _uptime_str(),
+        "ping": f"{bot.latency * 1000:.0f} мс",
+        "ai": _ai_status(),
+        "rules": _rules_status(),
+        "github": _github_status(),
+        "cs2red": getattr(api, "last_status", None) or "нет данных",
+        "code_overview": _code_overview(),
+    }
+
 
 @tasks.loop(minutes=AGENT_CHECK_MINUTES)
 async def agent_watch():
     """Цикл ИИ-агента: следит за системой, шлёт отчёты и идеи.
 
-    Отчёт и идея публикуются по своему расписанию (agent.py), а не каждый
-    цикл: иначе канал агента забивается сообщениями.
+    Отчёт (раз в AGENT_HEALTH_INTERVAL_MINUTES) и идея по улучшению кода
+    (раз в AGENT_IDEA_INTERVAL_MINUTES, по умолчанию 6 ч) публикуются
+    в AGENT_CHANNEL_ID. На идею тратится один запрос к ИИ.
     """
     try:
         providers = ai_service.providers if ai_service else []
-        extra = {
-            "uptime": _uptime_str(),
-            "ping": f"{bot.latency * 1000:.0f} мс",
-            "ai": _ai_status(),
-            "rules": _rules_status(),
-            "github": _github_status(),
-            "cs2red": getattr(api, "last_status", None) or "нет данных",
-        }
-        await agent.run_cycle(providers=providers, extra=extra)
+        await agent.run_cycle(providers=providers, extra=_agent_extra())
     except Exception as e:
         await log_error(bot, "agent_watch", e)
+
+
+@bot.tree.command(name="agent_idea",
+                  description="Сгенерировать идею по улучшению кода сейчас (админ)")
+@app_commands.default_permissions(administrator=True)
+async def agent_idea(i):
+    """Ручной запуск идеи: не ждать 6 часов и проверить, что всё работает."""
+    await i.response.defer(ephemeral=True)
+    if not await _admin_guard(i):
+        return
+    providers = ai_service.providers if ai_service else []
+    if not providers:
+        await safe_send(
+            i.followup,
+            "❌ Нет ИИ-провайдеров: задайте хотя бы один ключ "
+            "(GROQ_API_KEY / GEMINI_API_KEY / CEREBRAS_API_KEY и т.п.).",
+            ephemeral=True)
+        return
+    try:
+        embed = await agent.force_idea(providers, _agent_extra())
+        if embed is None:
+            await safe_send(
+                i.followup,
+                "⚠️ ИИ не дал ответ (все провайдеры заняты или в паузе). "
+                "Попробуй позже.", ephemeral=True)
+            return
+        await safe_send(i.followup,
+                        f"✅ Идея опубликована в канале <#{AGENT_CHANNEL_ID}>.",
+                        ephemeral=True)
+    except Exception as e:
+        await log_error(i.client, "/agent_idea", e)
+        await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}", ephemeral=True)
 
 
 @agent_watch.before_loop

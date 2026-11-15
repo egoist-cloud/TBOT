@@ -209,3 +209,45 @@ def test_ask_provider_skips_paused_provider():
 
     asyncio.run(scenario())
     print("  ok: агент пропускает провайдера в паузе")
+
+
+def test_idea_prompt_mentions_code_and_project():
+    """Промпт идеи содержит структуру кода и знания о проекте."""
+    agent = _agent()
+    agent.project_context = "Команда /profile показывает войс и сообщения."
+    prompt = agent.build_idea_prompt(
+        {"links": 10}, [], "script.py (~9500), quantum/ai/service.py (~300)")
+
+    assert "улучшению кода" in prompt
+    assert "Структура кода" in prompt
+    assert "script.py" in prompt
+    assert "/profile" in prompt
+    print("  ok: идея генерируется с контекстом кода")
+
+
+def test_force_idea_posts_and_sets_schedule():
+    """Ручная идея публикуется в канал агента и сдвигает расписание."""
+    async def scenario():
+        await init_db()
+        try:
+            ch = _FakeChannel()
+            agent = _agent(ch)
+            embed = await agent.force_idea(
+                [_FakeProvider()], {"code_overview": "script.py (~9500)"})
+
+            assert embed is not None
+            assert len(ch.sent) == 1
+            assert ch.sent[0].title == "💡 Идея от ИИ-агента"
+        finally:
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: ручная идея публикуется")
+
+
+def test_idea_prompt_rejects_repeat_ideas():
+    """Уже предложенные идеи передаются в промпт как запрет на повтор."""
+    prompt = _agent().build_idea_prompt(
+        {}, ["Добавить /admins", "Сделать отчёт"], "")
+    assert "Добавить /admins" in prompt
+    assert "не повторяй" in prompt

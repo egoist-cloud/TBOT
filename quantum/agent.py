@@ -16,7 +16,9 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import os
 import time
+from pathlib import Path
 
 import discord
 
@@ -30,6 +32,28 @@ from .repositories import users as users_repo
 from .repositories import votes as votes_repo
 
 log = logging.getLogger("quantum.agent")
+
+
+def load_project_context() -> str:
+    """База знаний проекта (ai_project.md) для идей агента.
+
+    Ищем в DATA_DIR и в корне репозитория: на хостинге DATA_DIR может быть
+    отдельным томом, и файла там нет.
+    """
+    name = os.getenv("AI_PROJECT_FILE") or "ai_project.md"
+    path = Path(name)
+    if path.is_absolute():
+        candidates = [path]
+    else:
+        candidates = [Path(os.getenv("DATA_DIR", ".")) / name,
+                      Path(__file__).resolve().parents[1] / name]
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate.read_text(encoding="utf-8").strip()[:2000]
+        except Exception as e:  # noqa: BLE001 - знания не должны ронять агента
+            log.warning("ai_project.md (%s): %s", candidate, e)
+    return ""
 
 # Канал агента и расписание (в минутах).
 AGENT_HEALTH_INTERVAL_MINUTES = env_int("AGENT_HEALTH_INTERVAL_MINUTES", 120)
@@ -76,6 +100,8 @@ class Agent:
         # Счётчик ошибок по командам: контекст -> количество.
         self.error_stats: dict[str, int] = {}
         self.started_at = time.time()
+        # Факты о проекте: идеи должны быть про этот бот, а не абстрактные.
+        self.project_context = load_project_context()
 
     # ------------------------------------------------------------
     # Служебное
@@ -219,31 +245,47 @@ class Agent:
                 return str(result), str(getattr(prov, "name", "?"))
         return "", ""
 
-    def build_idea_prompt(self, stats: dict, known: list | None = None) -> str:
-        """Промпт для генерации идеи по улучшению бота."""
+    def build_idea_prompt(self, stats: dict, known: list | None = None,
+                          code_overview: str = "") -> str:
+        """Промпт для идеи по улучшению этого кода.
+
+        project_context и code_overview дают ИИ конкретику (команды, модули,
+        правила проекта), иначе ответы получаются общими.
+        """
         known = ", ".join(known or []) or "—"
-        return (
-            "Ты — ИИ-агент, который наблюдает за Discord-ботом игрового клана "
-            "и предлагает, что в нём улучшить.\n\n"
+        parts = [
+            "Ты — ИИ-агент, который наблюдает за Discord-ботом игрового клуба "
+            "TALENT (Python, discord.py) и предлагает, что улучшить в его коде.",
             "Возможности бота: привязка Discord↔Steam, заявки в клан с "
-            "голосованием, роли клана, RAG-ответы по правилам, синк данных "
-            "с GitHub, панель администратора, статистика модераторов.\n\n"
+            "голосованием, роли клана и сайта, RAG-ответы по правилам, "
+            "ИИ-каскад с фолбэком провайдеров, /profile со статистикой, "
+            "панели Components V2, синк данных с GitHub.",
             f"Текущее состояние: привязок {stats.get('links')}, "
             f"заявок {stats.get('apps')} (в работе {stats.get('apps_pending')}), "
             f"голосов {stats.get('votes')}, модераторов {stats.get('mods')}, "
-            f"ошибок за сессию {stats.get('errors')}.\n"
-            f"Уже предлагалось (не повторяй): {known}\n\n"
-            "Предложи ОДНУ конкретную идею, которую реально реализовать "
-            "за несколько часов в этом боте. Формат ответа строго такой:\n"
+            f"ошибок за сессию {stats.get('errors')}.",
+            f"Уже предлагалось (не повторяй): {known}",
+        ]
+        if self.project_context:
+            parts.append("Знания о проекте:\n" + self.project_context)
+        if code_overview:
+            parts.append("Структура кода:\n" + code_overview)
+        parts.append(
+            "Предложи ОДНУ конкретную идею по улучшению кода, которую реально "
+            "реализовать за несколько часов: назови файл/функцию, если это "
+            "уместно. Не предлагай новые платные сервисы. Формат ответа строго "
+            "такой:\n"
             "ИДЕЯ: <до 120 символов>\n"
             "ПОЛЬЗА: <зачем это клану, до 200 символов>\n"
             "РЕАЛИЗАЦИЯ: <как сделать, до 300 символов>"
         )
+        return "\n\n".join(parts)
 
     async def build_idea_embed(self, providers, stats: dict):
         """Embed с идеей агента (None — если ИИ недоступен)."""
         known = await self.known_ideas()
-        prompt = self.build_idea_prompt(stats, known)
+        prompt = self.build_idea_prompt(
+            stats, known, str(stats.get("code_overview") or ""))
         text, provider = await self.ask_provider(providers, prompt)
         if not text:
             return None
@@ -293,3 +335,15 @@ class Agent:
                 # Флаг ставим только после успешной идеи: если все
                 # провайдеры были в паузе, попробуем в следующий цикл.
                 await seen_repo.set_flag(_FLAG_IDEA, str(now))
+
+    async def force_idea(self, providers, extra: dict | None = None):
+        """Сгенерировать и опубликовать идею по запросу (без расписания)."""
+        stats = await self.snapshot(extra)
+        embed = await self.build_idea_embed(providers, stats)
+        if embed is None:
+            return None
+        if not await self.post(embed):
+            return None
+        await self.remember_idea(embed.description or "")
+        await seen_repo.set_flag(_FLAG_IDEA, str(time.time()))
+        return embed
