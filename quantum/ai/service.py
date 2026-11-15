@@ -61,6 +61,16 @@ _SYSTEM_PROMPT = (
     "Больше ничего не пиши."
 )
 
+# Режим обычного вопроса: правила не нашлись, но ИИ знает проект и диалог.
+_SYSTEM_CHAT_PROMPT = (
+    "Ты — ИИ-помощник Discord-бота игрового клуба TALENT (CS2, cs2red.ru). "
+    "Отвечай по-русски, кратко и по делу (обычно 1-5 предложений).\n"
+    "Используй историю диалога и информацию о проекте ниже. Не выдумывай "
+    "команды, роли и правила, которых там нет; если ответа нет — скажи, что "
+    "не знаешь, и предложи спросить у администратора.\n"
+    "Не используй поля ОТВЕТ/НАКАЗАНИЕ/ОСНОВАНИЕ — это разговорный ответ."
+)
+
 _DATA_DIR_ENV = "DATA_DIR"
 
 
@@ -69,20 +79,33 @@ def _default_data_dir() -> str:
 
 
 def _build_messages(query: str, rules_context: str, examples: str,
-                    history=None, project_context: str = "") -> list:
+                    history=None, project_context: str = "",
+                    general: bool = False) -> list:
     """Промпт: системная инструкция + знания проекта + история диалога.
 
     history — прошлые реплики [{"role": "user"/"assistant", "content": ...}],
     чтобы ИИ понимал продолжение разговора («а за это какое наказание?»).
     project_context — факты о боте/командах/сайте из ai_project.md.
+    general — вопрос не про правила: обычный ответ без полей формата.
     """
-    system = _SYSTEM_PROMPT
-    if project_context:
-        system += (
-            "\n\nИНФОРМАЦИЯ О ПРОЕКТЕ (бот клуба TALENT, команды, роли, сайт, кланы):\n"
-            f"{project_context}\n"
-            "Если вопрос про бота, его команды, роли или сайт — отвечай этой "
-            "информацией обычным текстом, без полей ОТВЕТ/НАКАЗАНИЕ/ОСНОВАНИЕ.")
+    if general:
+        system = _SYSTEM_CHAT_PROMPT
+        if project_context:
+            system += ("\n\nИНФОРМАЦИЯ О ПРОЕКТЕ (бот клуба TALENT, команды, "
+                       f"роли, сайт, кланы):\n{project_context}")
+        user_block = f"ВОПРОС: {query}"
+        if examples:
+            user_block += f"\n\nПРИМЕРЫ ОТВЕТОВ (шаблон стиля):\n{examples}"
+    else:
+        system = _SYSTEM_PROMPT
+        if project_context:
+            system += (
+                "\n\nИНФОРМАЦИЯ О ПРОЕКТЕ (бот клуба TALENT, команды, роли, "
+                f"сайт, кланы):\n{project_context}")
+        user_block = (f"ПРАВИЛА (релевантные пункты):\n{rules_context}\n\n"
+                      f"ВОПРОС ИГРОКА: {query}")
+        if examples:
+            user_block += f"\n\nПРИМЕРЫ ОТВЕТОВ (шаблон стиля):\n{examples}"
     messages: list = [{"role": "system", "content": system}]
     for item in history or []:
         if not isinstance(item, dict):
@@ -91,9 +114,6 @@ def _build_messages(query: str, rules_context: str, examples: str,
         content = str(item.get("content") or "").strip()
         if role in ("user", "assistant") and content:
             messages.append({"role": role, "content": content[:1500]})
-    user_block = f"ПРАВИЛА (релевантные пункты):\n{rules_context}\n\nВОПРОС ИГРОКА: {query}"
-    if examples:
-        user_block += f"\n\nПРИМЕРЫ ОТВЕТОВ (шаблон стиля):\n{examples}"
     messages.append({"role": "user", "content": user_block})
     return messages
 
@@ -116,17 +136,26 @@ class AIService:
         self.project_context = self._load_project_context()
 
     def _load_project_context(self) -> str:
-        """Факты о проекте из ai_project.md (если файл есть)."""
+        """Факты о проекте из ai_project.md (если файл есть).
+
+        Ищем в DATA_DIR, а если там нет (на хостинге DATA_DIR может быть
+        отдельным томом) — рядом с кодом, в корне проекта.
+        """
         name = os.getenv("AI_PROJECT_FILE") or "ai_project.md"
-        path = Path(self.data_dir) / name
-        try:
-            if not path.is_file():
-                return ""
-            text = path.read_text(encoding="utf-8")
-        except Exception as e:
-            log.warning("ai_project.md: %s", e)
-            return ""
-        return text.strip()[:4000]
+        path = Path(name)
+        if path.is_absolute():
+            candidates = [path]
+        else:
+            project_root = Path(__file__).resolve().parents[2]
+            candidates = [Path(self.data_dir) / name,
+                          project_root / name]
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    return candidate.read_text(encoding="utf-8").strip()[:4000]
+            except Exception as e:
+                log.warning("ai_project.md (%s): %s", candidate, e)
+        return ""
 
     # ---------- подготовка ----------
     def ensure_rules(self) -> int:
@@ -205,7 +234,8 @@ class AIService:
         # 4) промпт
         examples = await asyncio.to_thread(self._load_examples)
         messages = _build_messages(query, rules_context, examples, history,
-                                   self.project_context)
+                                   self.project_context,
+                                   general=not rules_hits)
 
         # 5) провайдеры: пропускаем те, что в паузе после лимита/ошибки
         provider = ""
@@ -228,6 +258,8 @@ class AIService:
             log.debug("%s: пустой ответ", prov.name)
 
         if not provider:
+            # Запрос не дошёл до ИИ — не тратим попытку пользователя.
+            self.limiter.release_last(user_id)
             if self.providers and skipped == len(self.providers):
                 msg = ("Все ИИ-провайдеры временно в паузе после лимита — "
                        "попробуй через несколько минут.")

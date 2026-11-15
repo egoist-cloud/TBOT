@@ -57,3 +57,12 @@ class RateLimiter:
         key = str(user_id)
         with self._lock:
             self._data.pop(key, None)
+
+    def release_last(self, user_id) -> None:
+        """Возвращает один запрос: он не дошёл до ИИ (все провайдеры упали)."""
+        key = str(user_id)
+        with self._lock:
+            stamps = self._data.get(key) or []
+            if stamps:
+                stamps.pop()
+            self._data[key] = stamps

@@ -1613,7 +1613,7 @@ class API:
         Сайт берёт этот список из /api/data/main — оттуда же берём и мы,
         чтобы название Discord-роли совпадало с тем, что видит игрок.
         """
-        ts = asyncio.get_event_loop().time()
+        ts = time.monotonic()
         if self._roles_cache["data"] and ts - self._roles_cache["ts"] < 3600:
             return self._roles_cache["data"]
         data = await self._get_json("https://cs2red.ru/api/data/main")
@@ -1686,7 +1686,7 @@ class API:
         return None
 
     async def cs2red_clans(self):
-        ts = asyncio.get_event_loop().time()
+        ts = time.monotonic()
         if self._clans_cache["data"] is not None and ts - self._clans_cache["ts"] < CLANS_CACHE_TTL:
             return self._clans_cache["data"]
         data = await self._get_json("https://cs2red.ru/api/clans")
@@ -1702,7 +1702,7 @@ class API:
         Справочник меняется редко, поэтому кэшируем на час. Если запрос
         не удался, возвращаем то, что уже было (или пустой словарь).
         """
-        ts = asyncio.get_event_loop().time()
+        ts = time.monotonic()
         cached = self._categories_cache
         if (cached["data"] is not None
                 and ts - cached["ts"] < 3600):
@@ -2591,6 +2591,10 @@ def _role_is_protected(role) -> bool:
     perms = getattr(role, "permissions", None)
     if perms is not None and getattr(perms, "administrator", False):
         return True
+    # Роль с любыми правами — не одноразовая роль клана: не удаляем.
+    value = getattr(perms, "value", 0) if perms is not None else 0
+    if isinstance(value, int) and value:
+        return True
     name = _norm_role_name(getattr(role, "name", ""))
     return any(word in name for word in _PROTECTED_ROLE_WORDS)
 
@@ -2676,6 +2680,9 @@ async def _delete_clan_role_if_empty(guild, role, names=None,
     if role is None or role not in getattr(guild, "roles", []):
         return None
     names = _load_clan_role_names() if names is None else set(names)
+    # Без полного кэша участников не удаляем: можно снести занятую роль.
+    if not getattr(guild, "chunked", True):
+        return None
     known_norm = {_norm_role_name(n) for n in names if n}
     if not _is_bot_clan_role(role, known_norm, _tracked_bot_clan_role_ids()):
         return None
@@ -2769,6 +2776,9 @@ async def cleanup_empty_clan_roles(guild, names=None) -> tuple[list, list]:
     if not CLAN_ROLE_CLEANUP_ENABLED:
         return deleted, errors
     names = _load_clan_role_names() if names is None else set(names)
+    # Пока кэш участников не заполнен, role.members может врать — не рискуем.
+    if not getattr(guild, "chunked", True):
+        return deleted, ["участники ещё не загружены — уборка отложена"]
     known_norm = {_norm_role_name(n) for n in names if n}
     tracked = _tracked_bot_clan_role_ids()
     site_norm = {_norm_role_name(n) for n in _load_site_role_names() if n}
@@ -4004,7 +4014,9 @@ async def on_ready():
         log(f"⚠️ панель ролей: {e}")
     if not _INITIAL_ROLE_CLEANUP_DONE:
         _INITIAL_ROLE_CLEANUP_DONE = True
-        asyncio.create_task(_initial_role_cleanup())
+        # Ссылку держим на боте: непривязанную задачу может собрать GC.
+        bot._initial_cleanup_task = asyncio.create_task(
+            _initial_role_cleanup())
 
 
 @bot.event
@@ -6254,11 +6266,17 @@ async def _site_roles_for(steam_id) -> list:
         full = None
     if full:
         for admin in full.get("admins") or []:
-            name = await resolve_site_role_name(admin.get("roleId"))
+            # API может вернуть объект {"roleId": N} или просто id/имя.
+            rid = admin.get("roleId") if isinstance(admin, dict) else admin
+            name = await resolve_site_role_name(rid)
             if name:
                 roles.append(name)
         for vip in full.get("vips") or []:
-            group = str(vip.get("group") or "").strip()
+            if isinstance(vip, dict):
+                group = str(vip.get("group") or vip.get("name") or "")
+            else:
+                group = str(vip or "")
+            group = group.strip()
             if group:
                 roles.append(group)
     return list(dict.fromkeys(roles))
@@ -6283,10 +6301,12 @@ def _build_profile_layout(target, stats: dict, rank: int, total: int,
     else:
         container.add_item(discord.ui.TextDisplay(text))
     container.add_item(discord.ui.Separator())
+    messages = int(stats.get("messages", 0) or 0)
+    rank_text = f"#{rank} из {_fmt_number(total)}" if messages else "—"
     container.add_item(discord.ui.TextDisplay(
         f"**Онлайн** — {_fmt_duration(stats.get('voice_seconds', 0))}\n"
-        f"**Сообщения** — {_fmt_number(stats.get('messages', 0))}\n"
-        f"**Топ по сообщениям** — #{rank} из {_fmt_number(total)}"))
+        f"**Сообщения** — {_fmt_number(messages)}\n"
+        f"**Топ по сообщениям** — {rank_text}"))
     if top_lines:
         container.add_item(discord.ui.Separator())
         container.add_item(discord.ui.TextDisplay(
@@ -6309,12 +6329,17 @@ async def profile(i, user: discord.Member | None = None):
         steam_id = await links_repo.get_link(target.id)
         roles = await _site_roles_for(steam_id) if steam_id else []
         top_lines = []
-        for idx, (uid, count) in enumerate(
-                await stats_repo.top_by_messages(5), start=1):
+        for uid, count in await stats_repo.top_by_messages(10):
             member = (i.guild.get_member(int(uid))
                       if i.guild is not None and str(uid).isdigit() else None)
-            name = member.display_name if member is not None else f"id {uid}"
-            top_lines.append(f"**#{idx}** {name} — {_fmt_number(count)}")
+            if member is None:
+                # Не показываем чужие id: в мини-топе только участники сервера.
+                continue
+            top_lines.append(
+                f"**#{len(top_lines) + 1}** {member.display_name} — "
+                f"{_fmt_number(count)}")
+            if len(top_lines) >= 5:
+                break
         layout = _build_profile_layout(target, stats, rank, total, roles,
                                        steam_id, top_lines)
         await i.followup.send(view=layout)
@@ -8750,8 +8775,9 @@ def _build_ai_embed(res: dict, query: str) -> discord.Embed:
             embed.add_field(name=f"Ответ (часть {idx}/{len(chunks)})",
                             value=chunk, inline=False)
 
-    # Для VIP-пунктов поле «Наказание» скрываем: это описание функций, а не санкция.
-    if not is_vip:
+    # «Наказание» имеет смысл только для ответа по правилу: в обычном
+    # разговоре (без rules_used) такого поля нет.
+    if rules_used and not is_vip:
         embed.add_field(name="Наказание", value=_field(punishment), inline=False)
 
     # Для VIP-пунктов поле «Основание» не выводим (это описание функций).
@@ -9059,9 +9085,17 @@ async def ensure_role_panel(client) -> str:
             await channel.fetch_message(int(old_id))
             return "панель уже на месте"
         except discord.NotFound:
-            pass
+            pass  # сообщение удалили — публикуем заново
+        except discord.Forbidden:
+            # Нет доступа к истории: не публикуем вторую панель вслепую.
+            log("⚠️ панель ролей: нет доступа к истории канала")
+            return "нет доступа к истории канала — панель не проверена"
+        except discord.HTTPException as e:
+            log(f"⚠️ панель ролей: не проверил сообщение: {e}")
+            return "не удалось проверить панель, попробуй позже"
         except Exception as e:
             log(f"⚠️ панель ролей: {e}")
+            return "не удалось проверить панель, попробуй позже"
     msg = await safe_send(channel, embed=_role_panel_embed(),
                           view=RoleClaimView())
     if msg is None:
@@ -9378,7 +9412,7 @@ def flask_health():
 
 
 def run_health_server():
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
 
 
 # ============================================================

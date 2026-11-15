@@ -202,11 +202,18 @@ class Agent:
             _FLAG_IDEAS, json.dumps(ideas[-MAX_IDEAS:], ensure_ascii=False))
 
     async def ask_provider(self, providers, prompt: str) -> tuple[str, str]:
-        """Прямой вызов ИИ-провайдера (без RAG и лимитера пользователей)."""
+        """Прямой вызов ИИ-провайдера (без RAG и лимитера пользователей).
+
+        Провайдеры в паузе после лимита/ошибки пропускаются — их не дёргаем
+        зря, идею сгенерирует следующий доступный.
+        """
         for prov in providers or []:
+            if not getattr(prov, "available", True):
+                continue
             try:
                 result = await prov.complete([{"role": "user", "content": prompt}])
-            except Exception:
+            except Exception as e:
+                log.warning("agent: %s: %s", getattr(prov, "name", "?"), e)
                 continue
             if result:
                 return str(result), str(getattr(prov, "name", "?"))
@@ -283,4 +290,6 @@ class Agent:
             if embed is not None:
                 await self.post(embed)
                 await self.remember_idea(embed.description or "")
-            await seen_repo.set_flag(_FLAG_IDEA, str(now))
+                # Флаг ставим только после успешной идеи: если все
+                # провайдеры были в паузе, попробуем в следующий цикл.
+                await seen_repo.set_flag(_FLAG_IDEA, str(now))

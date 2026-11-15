@@ -188,3 +188,24 @@ def test_admins_embed_layout():
     assert "Администраторов: **2**" in fields["📊 Сводка"]
     assert "TALENT" in embed.description
     print("  ok: embed /admins собран по формату")
+
+
+def test_ask_provider_skips_paused_provider():
+    """Провайдер в паузе после лимита не вызывается — берём следующий."""
+    class _Paused(_FakeProvider):
+        name = "Paused"
+        available = False
+
+        async def complete(self, messages):  # pragma: no cover - не должен
+            raise AssertionError("провайдер в паузе не должен вызываться")
+
+    class _Working(_FakeProvider):
+        name = "Working"
+
+    async def scenario():
+        text, provider = await _agent().ask_provider(
+            [_Paused(), _Working()], "придумай идею")
+        assert text and provider == "Working"
+
+    asyncio.run(scenario())
+    print("  ok: агент пропускает провайдера в паузе")

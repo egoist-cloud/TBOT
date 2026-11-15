@@ -530,3 +530,18 @@ def test_empty_orphan_deleted_immediately_on_leave():
     assert deleted == "плабой ебырь"
     assert role.deleted is True
     print("  ok: осиротевшая роль удаляется сразу при выходе")
+
+
+def test_cleanup_waits_for_full_member_cache():
+    """Пока участники не догружены, пустые роли не удаляем."""
+    role = _FakeRole("i hate lj", colour=botmod.CLAN_ROLE_COLOR, rid=7010)
+    guild = _FakeGuild([role])
+    guild.chunked = False
+
+    deleted, errors = asyncio.run(botmod.cleanup_empty_clan_roles(
+        guild, names={"i hate lj"}))
+
+    assert deleted == []
+    assert role.deleted is False
+    assert errors and "не загружены" in errors[0]
+    print("  ok: уборка ждёт полный кэш участников")

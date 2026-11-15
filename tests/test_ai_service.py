@@ -267,8 +267,8 @@ def test_ask_falls_back_to_next_provider():
     print("  ok: каскад переживает ошибку провайдера")
 
 
-def test_ask_without_rule_hits_uses_placeholder():
-    """Если RAG ничего не нашёл, в промпт уходит явная заглушка."""
+def test_ask_without_rule_hits_uses_general_mode():
+    """Если RAG ничего не нашёл, вопрос идёт в разговорном режиме."""
     async def scenario():
         await init_db()
         try:
@@ -281,8 +281,11 @@ def test_ask_without_rule_hits_uses_placeholder():
                 result = await service.ask(7, "вопрос без совпадений в правилах")
                 assert result["ok"] is True
                 assert result["rules_used"] == []
+                system = provider.messages[0][0]["content"]
                 user_prompt = provider.messages[0][1]["content"]
-                assert "Релевантные пункты не найдены." in user_prompt
+                assert "ИИ-помощник Discord-бота" in system
+                assert user_prompt.startswith("ВОПРОС:")
+                assert "ПРАВИЛА" not in user_prompt
         finally:
             await close_db()
 
@@ -412,3 +415,67 @@ def test_project_context_loaded_and_used(tmp_path):
 
     asyncio.run(scenario())
     print("  ok: знания проекта в промпте")
+
+
+def test_project_context_falls_back_to_project_root(tmp_path):
+    """Если ai_project.md нет в DATA_DIR, берём файл из корня проекта."""
+    async def scenario():
+        async with aiohttp.ClientSession() as session:
+            service = AIService(session, data_dir=str(tmp_path))
+            assert "TALENT" in service.project_context
+            print("  ok: знания проекта найдены в корне репозитория")
+
+    asyncio.run(scenario())
+
+
+def test_build_messages_general_mode():
+    """Без найденных правил — разговорный промпт без формата полей."""
+    messages = _build_messages(
+        "что умеет /profile?", "Релевантные пункты не найдены.", "",
+        project_context="Команда /profile показывает войс.", general=True)
+    system = messages[0]["content"]
+    assert "ОТВЕТ/НАКАЗАНИЕ/ОСНОВАНИЕ" in system
+    assert "ИНФОРМАЦИЯ О ПРОЕКТЕ" in system
+    assert "ВОПРОС: что умеет /profile?" in messages[-1]["content"]
+    assert "ПРАВИЛА" not in messages[-1]["content"]
+    print("  ok: разговорный режим промпта")
+
+
+def test_ask_without_rules_uses_general_prompt():
+    """Вопрос не по правилам уходит в разговорный режим."""
+    async def scenario():
+        await init_db()
+        try:
+            async with aiohttp.ClientSession() as session:
+                service = AIService(session, data_dir=str(ROOT))
+                service.rules.search = lambda query, top_k=3: []
+                provider = _FakeProvider("Fake", answer="просто ответ")
+                service.providers = [provider]
+                result = await service.ask(26, "привет, как дела у бота?")
+                assert result["ok"] is True
+                system = provider.messages[0][0]["content"]
+                assert "ИИ-помощник Discord-бота" in system
+        finally:
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: вопрос не по правилам — разговорный режим")
+
+
+def test_failed_request_returns_quota():
+    """Если ни один провайдер не ответил, попытка пользователя возвращается."""
+    async def scenario():
+        await init_db()
+        try:
+            async with aiohttp.ClientSession() as session:
+                service = AIService(session, data_dir=str(ROOT))
+                service.limiter = RateLimiter(max_per_hour=1)
+                service.providers = [_FakeProvider("A", available=False)]
+                first = await service.ask(27, "запрос без ответа")
+                assert first["ok"] is False
+                assert service.limiter.remaining(27) == 1
+        finally:
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: неудачный запрос не съедает лимит")

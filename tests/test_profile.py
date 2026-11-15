@@ -243,3 +243,34 @@ def test_voice_event_accumulates(monkeypatch):
     assert 77 not in botmod._VOICE_SESSIONS
     assert added and added[0][0] == 77 and added[0][1] >= 125
     print("  ok: войс копится и сохраняется при выходе")
+
+
+def test_profile_zero_messages_has_no_rank(monkeypatch):
+    """Без сообщений место в топе не показываем — прочерк, а не «#1 из 1»."""
+    _patch_profile(monkeypatch, {"voice_seconds": 0, "messages": 0}, (1, 1))
+    i = _Interaction()
+
+    asyncio.run(botmod.profile.callback(i, None))
+
+    text = _text_of(i.followup.sent[-1][1]["view"])
+    assert "**Топ по сообщениям** — —" in text, text
+    assert "#1 из" not in text
+    print("  ok: без сообщений места в топе нет")
+
+
+def test_profile_handles_plain_admin_and_vip_values(monkeypatch):
+    """API может вернуть admins/vips как id или строки — не падаем."""
+    _patch_profile(monkeypatch,
+                   {"voice_seconds": 60, "messages": 3}, (1, 2))
+
+    async def full(_sid):
+        return {"admins": [5], "vips": ["Спонсор"]}
+
+    monkeypatch.setattr(botmod.api, "cs2red_full_user", full)
+    i = _Interaction()
+
+    asyncio.run(botmod.profile.callback(i, None))
+
+    text = _text_of(i.followup.sent[-1][1]["view"])
+    assert "Админ" in text and "Спонсор" in text, text
+    print("  ok: простые admins/vips не ломают профиль")
