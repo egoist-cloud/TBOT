@@ -68,15 +68,34 @@ def _default_data_dir() -> str:
     return os.getenv(_DATA_DIR_ENV, ".")
 
 
-def _build_messages(query: str, rules_context: str, examples: str) -> list:
+def _build_messages(query: str, rules_context: str, examples: str,
+                    history=None, project_context: str = "") -> list:
+    """Промпт: системная инструкция + знания проекта + история диалога.
+
+    history — прошлые реплики [{"role": "user"/"assistant", "content": ...}],
+    чтобы ИИ понимал продолжение разговора («а за это какое наказание?»).
+    project_context — факты о боте/командах/сайте из ai_project.md.
+    """
     system = _SYSTEM_PROMPT
+    if project_context:
+        system += (
+            "\n\nИНФОРМАЦИЯ О ПРОЕКТЕ (бот клуба TALENT, команды, роли, сайт, кланы):\n"
+            f"{project_context}\n"
+            "Если вопрос про бота, его команды, роли или сайт — отвечай этой "
+            "информацией обычным текстом, без полей ОТВЕТ/НАКАЗАНИЕ/ОСНОВАНИЕ.")
+    messages: list = [{"role": "system", "content": system}]
+    for item in history or []:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = str(item.get("content") or "").strip()
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content[:1500]})
     user_block = f"ПРАВИЛА (релевантные пункты):\n{rules_context}\n\nВОПРОС ИГРОКА: {query}"
     if examples:
         user_block += f"\n\nПРИМЕРЫ ОТВЕТОВ (шаблон стиля):\n{examples}"
-    return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user_block},
-    ]
+    messages.append({"role": "user", "content": user_block})
+    return messages
 
 
 class AIService:
@@ -94,6 +113,20 @@ class AIService:
         self.limiter = RateLimiter()
         self.rules = RulesIndex(self.data_dir)
         self._cache_warm = False
+        self.project_context = self._load_project_context()
+
+    def _load_project_context(self) -> str:
+        """Факты о проекте из ai_project.md (если файл есть)."""
+        name = os.getenv("AI_PROJECT_FILE") or "ai_project.md"
+        path = Path(self.data_dir) / name
+        try:
+            if not path.is_file():
+                return ""
+            text = path.read_text(encoding="utf-8")
+        except Exception as e:
+            log.warning("ai_project.md: %s", e)
+            return ""
+        return text.strip()[:4000]
 
     # ---------- подготовка ----------
     def ensure_rules(self) -> int:
@@ -124,10 +157,13 @@ class AIService:
         return "\n\n".join(lines)
 
     # ---------- основной вход ----------
-    async def ask(self, user_id, query: str) -> dict:
+    async def ask(self, user_id, query: str, history=None) -> dict:
         """Главный метод. Возвращает словарь:
         {"ok": bool, "response": str, "rules_used": [ids], "provider": str,
          "cached": bool, "error": str, "limited": bool, "remaining": int}
+
+        history — прошлые реплики диалога (список словарей role/content).
+        С историей кэш не используется: ответ зависит от контекста.
         """
         query = (query or "").strip()
         if not query:
@@ -135,12 +171,14 @@ class AIService:
                     "provider": "", "cached": False,
                     "error": "пустой запрос", "limited": False, "remaining": 0}
 
-        # 1) кэш
-        cached = await get_cached(query)
-        if cached is not None:
-            return {"ok": True, "response": cached, "rules_used": [],
-                    "provider": "cache", "cached": True, "error": "",
-                    "limited": False, "remaining": self.limiter.remaining(user_id)}
+        # 1) кэш (только для вопроса без истории диалога)
+        if not history:
+            cached = await get_cached(query)
+            if cached is not None:
+                return {"ok": True, "response": cached, "rules_used": [],
+                        "provider": "cache", "cached": True, "error": "",
+                        "limited": False,
+                        "remaining": self.limiter.remaining(user_id)}
         if not self._cache_warm:
             from .cache import setup_cache_cleanup
             await setup_cache_cleanup()
@@ -166,11 +204,17 @@ class AIService:
 
         # 4) промпт
         examples = await asyncio.to_thread(self._load_examples)
-        messages = _build_messages(query, rules_context, examples)
+        messages = _build_messages(query, rules_context, examples, history,
+                                   self.project_context)
 
-        # 5) провайдеры
+        # 5) провайдеры: пропускаем те, что в паузе после лимита/ошибки
         provider = ""
+        skipped = 0
         for prov in self.providers:
+            if not getattr(prov, "available", True):
+                skipped += 1
+                log.debug("%s: в паузе после ошибки, пропуск", prov.name)
+                continue
             log.debug("%s: запрос", prov.name)
             try:
                 result = await prov.complete(messages)
@@ -184,15 +228,21 @@ class AIService:
             log.debug("%s: пустой ответ", prov.name)
 
         if not provider:
-            msg = ("Не удалось получить ответ ни от одного ИИ-провайдера. "
-                   "Проверь, что задан хотя бы один ключ "
-                   "(GEMINI_API_KEY / OPENROUTER_API_KEY / LLM7_API_KEY).")
+            if self.providers and skipped == len(self.providers):
+                msg = ("Все ИИ-провайдеры временно в паузе после лимита — "
+                       "попробуй через несколько минут.")
+            else:
+                msg = ("Не удалось получить ответ ни от одного ИИ-провайдера. "
+                       "Проверь, что задан хотя бы один ключ "
+                       "(GEMINI_API_KEY / GROQ_API_KEY / CEREBRAS_API_KEY / "
+                       "MISTRAL_API_KEY / OPENROUTER_API_KEY / LLM7_API_KEY).")
             return {"ok": False, "response": "", "rules_used": rules_used,
                     "provider": "", "cached": False, "error": msg,
                     "limited": False, "remaining": self.limiter.remaining(user_id)}
 
-        # 6) кэшируем
-        await set_cached(query, result)
+        # 6) кэшируем только ответы без контекста диалога
+        if not history:
+            await set_cached(query, result)
         return {"ok": True, "response": result, "rules_used": rules_used,
                 "provider": provider, "cached": False, "error": "",
                 "limited": False, "remaining": self.limiter.remaining(user_id)}

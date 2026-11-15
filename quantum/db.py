@@ -138,6 +138,15 @@ async def init_db() -> None:
             expires_at INTEGER NOT NULL
         );
 
+        -- История диалогов с ИИ: /ask помнит предыдущие реплики игрока.
+        CREATE TABLE IF NOT EXISTS ai_dialog (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    TEXT NOT NULL,
+            role       TEXT NOT NULL,
+            content    TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS applications (
             user_id     TEXT PRIMARY KEY,
             status      TEXT NOT NULL DEFAULT 'pending',
@@ -209,6 +218,7 @@ async def init_db() -> None:
     await db.executescript(
         """
         CREATE INDEX IF NOT EXISTS idx_ai_cache_expires ON ai_cache (expires_at);
+        CREATE INDEX IF NOT EXISTS idx_ai_dialog_user ON ai_dialog (user_id);
         CREATE INDEX IF NOT EXISTS idx_applications_app ON applications (app_id);
         CREATE INDEX IF NOT EXISTS idx_app_history_user ON application_history (user_id);
         CREATE INDEX IF NOT EXISTS idx_app_history_taken ON application_history (taken_by);

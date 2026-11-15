@@ -13,6 +13,11 @@
   * сетевой сбой, таймаут, 429, 5xx  -> None (сработает следующий провайдер)
   * 401/403 (ошибка авторизации)      -> логируем, тоже возвращаем None
   * 400 (неверный запрос/модель)      -> логируем, возвращаем None
+
+Исчерпанный лимит не должен тормозить каждый запрос: после 429 (и других
+постоянных ошибок) провайдер уходит в паузу — cooldown_until. Пока пауза
+не истекла, `available` == False и сервис его просто пропускает.
+
 Все ключи берутся из os.environ, не хардкодятся.
 """
 from __future__ import annotations
@@ -20,15 +25,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 
 import aiohttp
 
-from ..env import env_float
+from ..env import env_float, env_int
 
 log = logging.getLogger("quantum.ai")
 
 # Общий таймаут на один запрос к провайдеру (сек).
 DEFAULT_TIMEOUT = env_float("AI_REQUEST_TIMEOUT", 30.0)
+
+# Паузы после ошибок (сек): лимит/квота, неверный ключ, битая модель, сбой.
+COOLDOWN_LIMIT = env_int("AI_PROVIDER_COOLDOWN_SECONDS", 600)
+COOLDOWN_AUTH = env_int("AI_PROVIDER_AUTH_COOLDOWN_SECONDS", 3600)
+COOLDOWN_CONFIG = env_int("AI_PROVIDER_CONFIG_COOLDOWN_SECONDS", 1800)
+COOLDOWN_ERROR = env_int("AI_PROVIDER_ERROR_COOLDOWN_SECONDS", 120)
 
 
 class AIProvider:
@@ -44,30 +56,73 @@ class AIProvider:
         self.failures = 0
         self.last_error = ""
         self.last_status: int | None = None
+        # До какого момента провайдер в паузе (monotonic-время).
+        self.cooldown_until = 0.0
 
     @property
     def enabled(self) -> bool:
         return bool(self._api_key())
 
+    @property
+    def available(self) -> bool:
+        """Включён и не в паузе после исчерпанного лимита/ошибки."""
+        return self.enabled and time.time() >= self.cooldown_until
+
+    @property
+    def cooldown_left(self) -> int:
+        return max(0, int(self.cooldown_until - time.time()))
+
     def _api_key(self) -> str:
         return (os.getenv(self.env_key) or "").strip()
 
-    def _record(self, status: int | None, err: str) -> None:
+    def _start_cooldown(self, status: int | None, retry_after=None) -> None:
+        """Ставит провайдеру паузу: пока она идёт, его не вызываем."""
+        if status == 200:
+            self.cooldown_until = 0.0
+            return
+        secs = COOLDOWN_ERROR
+        if status in (401, 403):
+            secs = COOLDOWN_AUTH
+        elif status == 429:
+            secs = COOLDOWN_LIMIT
+            try:
+                if retry_after is not None:
+                    secs = max(secs, int(float(retry_after)))
+            except (TypeError, ValueError):
+                pass
+        elif status in (400, 404):
+            secs = COOLDOWN_CONFIG
+        self.cooldown_until = time.time() + max(5, secs)
+
+    def _record(self, status: int | None, err: str, retry_after=None) -> None:
         """Обновляет статистику вызова: счётчики, последний статус и ошибку."""
         self.last_status = status
         if err:
             self.failures += 1
             self.last_error = err
+            self._start_cooldown(status, retry_after)
         else:
             self.last_error = ""
+            self._start_cooldown(status)
 
     def status_line(self) -> str:
-        """Строка для /health: включён/выключен, ошибки, статусы."""
+        """Строка для /health: включён/выключен, ошибки, пауза, статусы."""
         if not self.enabled:
             return f"{self.name}: выключен (нет {self.env_key})"
         state = f"ошибка: {self.last_error[:120]}" if self.last_error else "работает"
+        if self.cooldown_left:
+            state += f", пауза после лимита ещё {self.cooldown_left} с"
         return (f"{self.name}: {state}, запросов {self.requests}, "
                 f"ошибок {self.failures}, последний HTTP {self.last_status}")
+
+    @staticmethod
+    def _retry_after(response) -> str | None:
+        """Заголовок Retry-After (429 часто его отдаёт)."""
+        headers = getattr(response, "headers", None) or {}
+        try:
+            return headers.get("Retry-After")
+        except AttributeError:
+            return None
 
     async def complete(self, messages: list) -> str | None:  # pragma: no cover - абстракция
         raise NotImplementedError
@@ -179,7 +234,7 @@ class GeminiProvider(AIProvider):
                         self._record(r.status, msg)
                     elif r.status in (429,) or r.status >= 500:
                         msg = f"временный сбой {r.status}: {raw[:200]}"
-                        self._record(r.status, msg)
+                        self._record(r.status, msg, self._retry_after(r))
                     elif r.status == 400:
                         msg = f"неверный запрос (проверь AI_MODEL): {raw[:200]}"
                         self._record(r.status, msg)
@@ -231,6 +286,8 @@ class _OpenAICompatProvider(AIProvider):
     model_env = ""
     default_model = "gpt-4o-mini"
     max_output_env = "AI_MAX_OUTPUT_TOKENS"
+    # Доп. заголовки конкретного провайдера (например, Accept у GitHub).
+    extra_headers: dict = {}
 
     @property
     def _base_url(self) -> str:
@@ -259,6 +316,7 @@ class _OpenAICompatProvider(AIProvider):
             "Authorization": f"Bearer {self._api_key()}",
             "Content-Type": "application/json",
         }
+        headers.update(self.extra_headers)
         url = f"{self._base_url}/chat/completions"
         self.requests += 1
         try:
@@ -274,7 +332,7 @@ class _OpenAICompatProvider(AIProvider):
                         self._record(r.status, msg)
                     elif r.status in (429,) or r.status >= 500:
                         msg = f"временный сбой {r.status}: {raw[:200]}"
-                        self._record(r.status, msg)
+                        self._record(r.status, msg, self._retry_after(r))
                     elif r.status == 400:
                         msg = f"неверный запрос (проверь модель): {raw[:200]}"
                         self._record(r.status, msg)
@@ -338,13 +396,158 @@ class LLM7Provider(_OpenAICompatProvider):
         return os.getenv("LLM7_MODEL") or self.default_model
 
 
+class GroqProvider(_OpenAICompatProvider):
+    """Groq — быстрый бесплатный тир (llama/gpt-oss)."""
+
+    name = "groq"
+    env_key = "GROQ_API_KEY"
+    base_url_env = "GROQ_BASE_URL"
+    default_base_url = "https://api.groq.com/openai/v1"
+    model_env = "GROQ_MODEL"
+    default_model = "llama-3.3-70b-versatile"
+
+
+class CerebrasProvider(_OpenAICompatProvider):
+    """Cerebras Cloud — бесплатный тир gpt-oss/Llama."""
+
+    name = "cerebras"
+    env_key = "CEREBRAS_API_KEY"
+    base_url_env = "CEREBRAS_BASE_URL"
+    default_base_url = "https://api.cerebras.ai/v1"
+    model_env = "CEREBRAS_MODEL"
+    default_model = "gpt-oss-120b"
+
+
+class MistralProvider(_OpenAICompatProvider):
+    """Mistral La Plateforme (Experiment plan)."""
+
+    name = "mistral"
+    env_key = "MISTRAL_API_KEY"
+    base_url_env = "MISTRAL_BASE_URL"
+    default_base_url = "https://api.mistral.ai/v1"
+    model_env = "MISTRAL_MODEL"
+    default_model = "mistral-small-latest"
+
+
+class GitHubModelsProvider(_OpenAICompatProvider):
+    """GitHub Models — модели из маркетплейса по токену GitHub."""
+
+    name = "github"
+    env_key = "GITHUB_MODELS_TOKEN"
+    base_url_env = "GITHUB_MODELS_BASE_URL"
+    default_base_url = "https://models.github.ai/inference"
+    model_env = "GITHUB_MODELS_MODEL"
+    default_model = "openai/gpt-4o-mini"
+    extra_headers = {"Accept": "application/json"}
+
+    def _api_key(self) -> str:
+        # Отдельный токен, иначе — общий GITHUB_TOKEN (если у него есть
+        # доступ к GitHub Models).
+        return (os.getenv("GITHUB_MODELS_TOKEN")
+                or os.getenv("GITHUB_TOKEN") or "").strip()
+
+
+class NvidiaProvider(_OpenAICompatProvider):
+    """NVIDIA NIM (build.nvidia.com) — 40 запросов/минуту бесплатно."""
+
+    name = "nvidia"
+    env_key = "NVIDIA_API_KEY"
+    base_url_env = "NVIDIA_BASE_URL"
+    default_base_url = "https://integrate.api.nvidia.com/v1"
+    model_env = "NVIDIA_MODEL"
+    default_model = "meta/llama-3.3-70b-instruct"
+
+
+class SambaNovaProvider(_OpenAICompatProvider):
+    """SambaNova Cloud — стартовые $5 кредитов."""
+
+    name = "sambanova"
+    env_key = "SAMBANOVA_API_KEY"
+    base_url_env = "SAMBANOVA_BASE_URL"
+    default_base_url = "https://api.sambanova.ai/v1"
+    model_env = "SAMBANOVA_MODEL"
+    default_model = "Meta-Llama-3.3-70B-Instruct"
+
+
+class CohereProvider(_OpenAICompatProvider):
+    """Cohere через OpenAI-совместимый эндпоинт /compatibility/v1."""
+
+    name = "cohere"
+    env_key = "COHERE_API_KEY"
+    base_url_env = "COHERE_BASE_URL"
+    default_base_url = "https://api.cohere.ai/compatibility/v1"
+    model_env = "COHERE_MODEL"
+    default_model = "command-a-03-2025"
+
+
+class HuggingFaceProvider(_OpenAICompatProvider):
+    """HuggingFace Inference Providers (router, OpenAI-совместимый)."""
+
+    name = "huggingface"
+    env_key = "HUGGINGFACE_API_KEY"
+    base_url_env = "HUGGINGFACE_BASE_URL"
+    default_base_url = "https://router.huggingface.co/v1"
+    model_env = "HUGGINGFACE_MODEL"
+    default_model = "meta-llama/Llama-3.1-8B-Instruct"
+
+
+class CloudflareProvider(_OpenAICompatProvider):
+    """Cloudflare Workers AI — нужен и токен, и account id."""
+
+    name = "cloudflare"
+    env_key = "CLOUDFLARE_API_TOKEN"
+    base_url_env = "CLOUDFLARE_AI_BASE_URL"
+    default_base_url = ""
+    model_env = "CLOUDFLARE_AI_MODEL"
+    default_model = "@cf/meta/llama-3.1-8b-instruct"
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self._api_key() and self._account_id())
+
+    def _account_id(self) -> str:
+        return (os.getenv("CLOUDFLARE_ACCOUNT_ID") or "").strip()
+
+    @property
+    def _base_url(self) -> str:
+        explicit = (os.getenv(self.base_url_env) or "").strip()
+        if explicit:
+            return explicit.rstrip("/")
+        return ("https://api.cloudflare.com/client/v4/accounts/"
+                f"{self._account_id()}/ai/v1")
+
+
+# Порядок каскада: сначала самые быстрые/щедрые бесплатные тиры.
+_PROVIDER_CLASSES = (
+    GeminiProvider,
+    GroqProvider,
+    CerebrasProvider,
+    MistralProvider,
+    GitHubModelsProvider,
+    OpenRouterProvider,
+    NvidiaProvider,
+    SambaNovaProvider,
+    CohereProvider,
+    HuggingFaceProvider,
+    CloudflareProvider,
+    LLM7Provider,
+)
+
+
 def make_providers(
     session: aiohttp.ClientSession,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> list[AIProvider]:
-    """Собирает каскад провайдеров в порядке приоритета: Gemini -> OpenRouter -> LLM7."""
+    """Собирает каскад провайдеров в порядке приоритета.
+
+    В список попадают только те, у кого есть ключ. Порядок задан в
+    ``_PROVIDER_CLASSES``: Gemini → Groq → Cerebras → Mistral → GitHub →
+    OpenRouter → NVIDIA → SambaNova → Cohere → HuggingFace → Cloudflare →
+    LLM7. Если у провайдера кончился лимит, он уходит в паузу, а запрос
+    обслуживает следующий.
+    """
     result: list[AIProvider] = []
-    for cls in (GeminiProvider, OpenRouterProvider, LLM7Provider):
+    for cls in _PROVIDER_CLASSES:
         inst = cls(session, timeout=timeout)
         if inst.enabled:
             result.append(inst)

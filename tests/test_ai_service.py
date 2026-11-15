@@ -28,10 +28,11 @@ ROOT = Path(__file__).resolve().parent.parent
 class _FakeProvider:
     """Провайдер-заглушка: либо ответ, либо исключение."""
 
-    def __init__(self, name, answer=None, error=None):
+    def __init__(self, name, answer=None, error=None, available=True):
         self.name = name
         self._answer = answer
         self._error = error
+        self.available = available
         self.calls = 0
         self.messages: list = []
 
@@ -287,3 +288,127 @@ def test_ask_without_rule_hits_uses_placeholder():
 
     asyncio.run(scenario())
     print("  ok: пустой RAG даёт заглушку в промпте")
+
+
+# ============================================================
+# История диалога
+# ============================================================
+def test_ask_passes_history_to_provider():
+    """История реплик идёт в промпт между system и новым вопросом."""
+    async def scenario():
+        await init_db()
+        try:
+            async with aiohttp.ClientSession() as session:
+                service = AIService(session, data_dir=str(ROOT))
+                provider = _FakeProvider("Fake", answer="ответ с контекстом")
+                service.providers = [provider]
+                history = [
+                    {"role": "user", "content": "первый вопрос"},
+                    {"role": "assistant", "content": "первый ответ"},
+                ]
+
+                result = await service.ask(21, "а за это что?", history=history)
+                assert result["ok"] is True
+                messages = provider.messages[0]
+                assert [m["role"] for m in messages] == \
+                    ["system", "user", "assistant", "user"]
+                assert messages[1]["content"] == "первый вопрос"
+                assert messages[2]["content"] == "первый ответ"
+                assert "а за это что?" in messages[3]["content"]
+        finally:
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: история диалога попадает в промпт")
+
+
+def test_ask_with_history_skips_cache():
+    """Ответы с контекстом диалога не кэшируются (они персональные)."""
+    async def scenario():
+        await init_db()
+        try:
+            async with aiohttp.ClientSession() as session:
+                service = AIService(session, data_dir=str(ROOT))
+                provider = _FakeProvider("Fake", answer="уникальный ответ 42")
+                service.providers = [provider]
+                question = "уникальный вопрос про диалог 42"
+
+                result = await service.ask(
+                    22, question,
+                    history=[{"role": "user", "content": "до этого"}])
+                assert result["ok"] is True
+                assert await ai_cache.get_cached(question) is None
+        finally:
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: с историей кэш не используется")
+
+
+# ============================================================
+# Пауза провайдеров
+# ============================================================
+def test_ask_skips_provider_in_cooldown():
+    """Провайдер в паузе пропускается, отвечает следующий."""
+    async def scenario():
+        await init_db()
+        try:
+            async with aiohttp.ClientSession() as session:
+                service = AIService(session, data_dir=str(ROOT))
+                limited = _FakeProvider("Limited", answer="не должен", available=False)
+                working = _FakeProvider("Working", answer="ответ второго")
+                service.providers = [limited, working]
+
+                result = await service.ask(23, "вопрос после лимита 7.2")
+                assert result["ok"] is True
+                assert result["provider"] == "Working"
+                assert limited.calls == 0
+        finally:
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: провайдер в паузе пропущен")
+
+
+def test_ask_all_providers_in_cooldown_message():
+    """Если все в паузе — понятное сообщение, а не общая ошибка ключей."""
+    async def scenario():
+        await init_db()
+        try:
+            async with aiohttp.ClientSession() as session:
+                service = AIService(session, data_dir=str(ROOT))
+                service.providers = [
+                    _FakeProvider("A", available=False),
+                    _FakeProvider("B", available=False),
+                ]
+                result = await service.ask(24, "все лимиты кончились")
+                assert result["ok"] is False
+                assert "паузе" in result["error"]
+        finally:
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: все в паузе — понятная ошибка")
+
+
+# ============================================================
+# База знаний проекта
+# ============================================================
+def test_project_context_loaded_and_used(tmp_path):
+    """ai_project.md попадает в system-промпт."""
+    (tmp_path / "ai_project.md").write_text(
+        "Команда /profile показывает войс и сообщения.", encoding="utf-8")
+
+    async def scenario():
+        async with aiohttp.ClientSession() as session:
+            service = AIService(session, data_dir=str(tmp_path))
+            assert "войс" in service.project_context
+            provider = _FakeProvider("Fake", answer="ok")
+            service.providers = [provider]
+            await service.ask(25, "что показывает /profile?")
+            system = provider.messages[0][0]["content"]
+            assert "ИНФОРМАЦИЯ О ПРОЕКТЕ" in system
+            assert "/profile" in system
+
+    asyncio.run(scenario())
+    print("  ok: знания проекта в промпте")

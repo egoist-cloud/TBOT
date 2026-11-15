@@ -38,6 +38,7 @@ from quantum.repositories import links as links_repo
 from quantum.repositories import players as players_repo
 from quantum.repositories import users as users_repo
 from quantum.repositories import stats as stats_repo
+from quantum.repositories import ai_dialog as ai_dialog_repo
 from quantum.repositories import moderation as moderation_repo
 from quantum.repositories import applications as applications_repo
 from quantum.repositories import audit as audit_repo
@@ -3824,8 +3825,9 @@ class MyBot(commands.Bot):
             n_providers = len(ai_service.providers)
             if n_providers == 0:
                 # Ключей нет — бот работает, но ИИ-команды сообщат о недоступности.
-                log("⚠️ AI провайдеры не настроены: задайте GEMINI_API_KEY, "
-                    "OPENROUTER_API_KEY или LLM7_API_KEY.")
+                log("⚠️ AI провайдеры не настроены: задайте хотя бы один ключ "
+                    "(GEMINI_API_KEY / GROQ_API_KEY / CEREBRAS_API_KEY / "
+                    "MISTRAL_API_KEY / OPENROUTER_API_KEY / LLM7_API_KEY).")
             else:
                 n_rules = ai_service.ensure_rules()
                 log(f"✅ AI-сервис готов (провайдеров: {n_providers}, "
@@ -8783,10 +8785,14 @@ async def ask(i, question: str):
     if ai_service is None:
         await safe_send(i.followup, "❌ ИИ-сервис ещё не готов.", ephemeral=False)
         return
-    res = await ai_service.ask(i.user.id, question)
+    history = await ai_dialog_repo.get_history(i.user.id)
+    res = await ai_service.ask(i.user.id, question, history=history)
     if not res.get("ok"):
         await safe_send(i.followup, _format_ai_error(res), ephemeral=False)
         return
+    # Запоминаем диалог: следующий вопрос поймёт контекст.
+    await ai_dialog_repo.add_message(i.user.id, "user", question)
+    await ai_dialog_repo.add_message(i.user.id, "assistant", res["response"])
     embed = _build_ai_embed(res, question)
     await safe_send(i.followup, embed=embed, ephemeral=False)
 
@@ -8822,10 +8828,13 @@ async def ask_legacy(ctx, *, question: str):
     if ai_service is None:
         await safe_send(ctx.channel, "❌ ИИ-сервис ещё не готов.")
         return
-    res = await ai_service.ask(ctx.author.id, question)
+    history = await ai_dialog_repo.get_history(ctx.author.id)
+    res = await ai_service.ask(ctx.author.id, question, history=history)
     if not res.get("ok"):
         await safe_send(ctx.channel, _format_ai_error(res))
         return
+    await ai_dialog_repo.add_message(ctx.author.id, "user", question)
+    await ai_dialog_repo.add_message(ctx.author.id, "assistant", res["response"])
     embed = _build_ai_embed(res, question)
     await safe_send(ctx.channel, embed=embed)
 
@@ -8865,13 +8874,18 @@ async def ai_clear_cache(i):
     await i.response.defer(ephemeral=True)
     try:
         removed = await clear_cache()
-        await safe_send(i.followup, "✅ Кэш ИИ успешно очищен.", title="🤖 Кэш ИИ",
-                        ephemeral=True)
-        if removed:
+        dialogs = await ai_dialog_repo.clear_all()
+        await safe_send(
+            i.followup,
+            f"✅ Кэш ИИ очищен (записей: {removed}), диалоги сброшены "
+            f"(реплик: {dialogs}).",
+            title="🤖 Кэш ИИ", ephemeral=True)
+        if removed or dialogs:
             await log_to_channel(i.client,
-                f"🗑 Кэш ИИ очищен командой {i.user.mention} (удалено: {removed})")
+                f"🗑 Кэш ИИ очищен командой {i.user.mention} "
+                f"(кэш: {removed}, реплик диалогов: {dialogs})")
             await audit_action(i.client, "Очистка кэша ИИ", actor=i.user,
-                               details=f"Удалено записей: {removed}")
+                               details=f"Кэш: {removed}, диалоги: {dialogs}")
     except Exception as e:
         await log_error(i.client, "/ai_clear_cache", e)
         await close_interaction(i, f"❌ Ошибка: {str(e)[:200]}")
@@ -9189,12 +9203,17 @@ def _ai_status() -> str:
     prov = ai_service.providers
     if not prov:
         return "Нет настроенных провайдеров"
-    p = prov[0]
+    active = [x for x in prov if getattr(x, "available", True)]
+    p = active[0] if active else prov[0]
     req = sum(getattr(x, "requests", 0) for x in prov)
     errs = sum(getattr(x, "failures", 0) for x in prov)
     model = getattr(p, "_model", "?")
-    return (f"{p.name} ({model})\nпровайдеров: {len(prov)}\n"
+    paused = len(prov) - len(active)
+    text = (f"{p.name} ({model})\nпровайдеров: {len(prov)}\n"
             f"запросов: {req}, ошибок: {errs}")
+    if paused:
+        text += f"\nв паузе после лимита: {paused}"
+    return text
 
 
 def _rules_status() -> str:

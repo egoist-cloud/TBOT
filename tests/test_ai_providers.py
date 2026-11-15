@@ -17,9 +17,18 @@ import aiohttp  # noqa: E402
 import pytest  # noqa: E402
 
 from quantum.ai.providers import (  # noqa: E402
+    CerebrasProvider,
+    CloudflareProvider,
+    CohereProvider,
     GeminiProvider,
+    GitHubModelsProvider,
+    GroqProvider,
+    HuggingFaceProvider,
     LLM7Provider,
+    MistralProvider,
+    NvidiaProvider,
     OpenRouterProvider,
+    SambaNovaProvider,
     _is_auth_error,
     make_providers,
 )
@@ -30,6 +39,15 @@ _ENV_KEYS = (
     "GEMINI_API_KEY", "GEMINI_MODEL", "GEMINI_API_URL",
     "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "OPENROUTER_BASE_URL",
     "LLM7_API_KEY", "LLM7_MODEL", "LLM7_BASE_URL",
+    "GROQ_API_KEY", "GROQ_MODEL", "GROQ_BASE_URL",
+    "CEREBRAS_API_KEY", "CEREBRAS_MODEL",
+    "MISTRAL_API_KEY", "MISTRAL_MODEL",
+    "GITHUB_MODELS_TOKEN", "GITHUB_MODELS_MODEL",
+    "NVIDIA_API_KEY", "NVIDIA_MODEL",
+    "SAMBANOVA_API_KEY", "SAMBANOVA_MODEL",
+    "COHERE_API_KEY", "COHERE_MODEL",
+    "HUGGINGFACE_API_KEY", "HUGGINGFACE_MODEL",
+    "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_AI_MODEL",
     "AI_MODEL", "AI_MAX_OUTPUT_TOKENS", "AI_REQUEST_TIMEOUT",
 )
 
@@ -44,8 +62,10 @@ def clean_env(monkeypatch):
 class _FakeResponse:
     """Ответ aiohttp: статус, тело и (опционально) JSON или ошибка разбора."""
 
-    def __init__(self, status=200, body="", payload=None, json_error=None):
+    def __init__(self, status=200, body="", payload=None, json_error=None,
+                 headers=None):
         self.status = status
+        self.headers = headers or {}
         self._body = body
         self._payload = payload
         self._json_error = json_error
@@ -535,3 +555,114 @@ def test_llm7_model_selector(monkeypatch):
 
     assert provider._base_url == "https://api.llm7.io/v1"
     print("  ok: селекторы моделей LLM7")
+
+
+# ============================================================
+# Новые провайдеры из списка free-llm-api-resources
+# ============================================================
+def _url_and_model(provider):
+    return provider._base_url, provider._model
+
+
+def test_new_providers_defaults(monkeypatch):
+    """У каждого нового провайдера — свой URL и модель по умолчанию."""
+    cases = [
+        (GroqProvider, "GROQ_API_KEY",
+         "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile"),
+        (CerebrasProvider, "CEREBRAS_API_KEY",
+         "https://api.cerebras.ai/v1", "gpt-oss-120b"),
+        (MistralProvider, "MISTRAL_API_KEY",
+         "https://api.mistral.ai/v1", "mistral-small-latest"),
+        (GitHubModelsProvider, "GITHUB_MODELS_TOKEN",
+         "https://models.github.ai/inference", "openai/gpt-4o-mini"),
+        (NvidiaProvider, "NVIDIA_API_KEY",
+         "https://integrate.api.nvidia.com/v1",
+         "meta/llama-3.3-70b-instruct"),
+        (SambaNovaProvider, "SAMBANOVA_API_KEY",
+         "https://api.sambanova.ai/v1", "Meta-Llama-3.3-70B-Instruct"),
+        (CohereProvider, "COHERE_API_KEY",
+         "https://api.cohere.ai/compatibility/v1", "command-a-03-2025"),
+        (HuggingFaceProvider, "HUGGINGFACE_API_KEY",
+         "https://router.huggingface.co/v1",
+         "meta-llama/Llama-3.1-8B-Instruct"),
+    ]
+    for cls, env_key, base, model in cases:
+        provider = cls(_FakeSession())
+        assert provider.enabled is False
+        monkeypatch.setenv(env_key, "k")
+        assert provider.enabled is True
+        assert _url_and_model(provider) == (base, model), cls.__name__
+        monkeypatch.delenv(env_key)
+
+
+def test_cloudflare_requires_account_id(monkeypatch):
+    """Cloudflare без account id выключен, с ним — собирает URL аккаунта."""
+    provider = CloudflareProvider(_FakeSession())
+    assert provider.enabled is False
+
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "t")
+    assert provider.enabled is False
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acc123")
+    assert provider.enabled is True
+    assert provider._base_url == \
+        "https://api.cloudflare.com/client/v4/accounts/acc123/ai/v1"
+
+
+def test_cascade_order_with_many_keys(monkeypatch):
+    """Порядок каскада: быстрые бесплатные тиры идут раньше LLM7."""
+    for key in ("GEMINI_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY",
+                "MISTRAL_API_KEY", "GITHUB_MODELS_TOKEN", "OPENROUTER_API_KEY",
+                "NVIDIA_API_KEY", "SAMBANOVA_API_KEY", "COHERE_API_KEY",
+                "HUGGINGFACE_API_KEY", "LLM7_API_KEY"):
+        monkeypatch.setenv(key, "k")
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "t")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acc")
+
+    names = [p.name for p in make_providers(_FakeSession())]
+    assert names == [
+        "gemini", "groq", "cerebras", "mistral", "github", "openrouter",
+        "nvidia", "sambanova", "cohere", "huggingface", "cloudflare", "llm7",
+    ], names
+    print("  ok: полный каскад провайдеров")
+
+
+# ============================================================
+# Пауза после исчерпанного лимита
+# ============================================================
+def test_429_sets_cooldown_and_availability(monkeypatch):
+    """429 уводит провайдера в паузу: его пропускают, пока она идёт."""
+    monkeypatch.setenv("GROQ_API_KEY", "k")
+    session = _FakeSession(_FakeResponse(429, body="rate limit"))
+    provider = GroqProvider(session)
+
+    assert provider.available is True
+    assert _complete(provider) is None
+    assert provider.available is False
+    assert provider.cooldown_left > 0
+    assert "пауза после лимита" in provider.status_line()
+    print("  ok: 429 ставит провайдера в паузу")
+
+
+def test_auth_error_sets_long_cooldown(monkeypatch):
+    """401/403 — ключ неверный: длинная пауза, а не дёрганье каждый раз."""
+    monkeypatch.setenv("CEREBRAS_API_KEY", "bad")
+    provider = CerebrasProvider(_FakeSession(_FakeResponse(401, body="bad key")))
+
+    assert _complete(provider) is None
+    assert provider.available is False
+    assert provider.cooldown_left > 600
+    print("  ok: неверный ключ — длинная пауза")
+
+
+def test_success_clears_cooldown(monkeypatch):
+    """Успешный ответ снимает паузу."""
+    monkeypatch.setenv("MISTRAL_API_KEY", "k")
+    provider = MistralProvider(
+        _FakeSession(_FakeResponse(200, payload=_openai_payload("привет"))))
+    provider._start_cooldown(429)
+
+    assert provider.available is False
+    assert _complete(provider) == "привет"
+    assert provider.available is True
+    assert provider.cooldown_left == 0
+    print("  ok: успех снимает паузу")
