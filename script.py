@@ -3615,7 +3615,7 @@ PUBLIC_COMMANDS = {"link", "unlink", "ping", "health", "lookup", "ask",
 ADMIN_ONLY_COMMANDS = {
     "give", "take", "admlink", "auto_link", "sync_all", "export_members",
     "link_all", "player_list", "player_note", "ai_clear_cache", "panel",
-    "activity_set", "activity_clear",
+    "activity_set", "activity_clear", "rolepanel",
 }
 
 # Команды, которые админ может выдать модератору. Порядок = порядок в меню.
@@ -3725,6 +3725,7 @@ class MyBot(commands.Bot):
             restored = await self._restore_application_views()
             log(f"✅ Кнопки открытых заявок восстановлены: {restored}")
             self.add_view(PanelView())
+            self.add_view(RoleClaimView())
             log("✅ PanelView добавлен")
 
             if GUILD_ID:
@@ -3844,6 +3845,10 @@ async def on_ready():
     log(f"🆔 GUILD_ID: {GUILD_ID}")
     log(f"🍪 CS2RED cookies: {len(CS2RED_COOKIES)} шт.")
     log(f"📡 Guilds: {[g.name for g in bot.guilds]}")
+    try:
+        log(f"🎭 Панель ролей: {await ensure_role_panel(bot)}")
+    except Exception as e:
+        log(f"⚠️ панель ролей: {e}")
 
 
 @bot.event
@@ -5954,6 +5959,7 @@ HELP_DESCRIPTIONS = {
     "take": "забрать доступ модератора",
     "give": "выдать доступ модератора",
     "panel": "панель управления ботом",
+    "rolepanel": "опубликовать панель «Получить роль»",
     "sync_all": "синхронизировать роли всех привязанных",
     "auto_link": "авто-привязка по никам",
     "link_all": "массовая привязка из базы",
@@ -8754,6 +8760,157 @@ async def _panel_guard(interaction) -> bool:
     except Exception:
         pass
     return False
+
+
+# ============================================================
+# КАНАЛ «ПОЛУЧИТЬ РОЛЬ»: АВТО-ПРИВЯЗКА И СИНХРОНИЗАЦИЯ
+# ============================================================
+ROLE_PANEL_CHANNEL_ID = env_int("ROLE_PANEL_CHANNEL_ID", 1556232762586046535)
+ROLE_PANEL_FLAG = "role_panel_message"
+ROLE_CLAIM_COOLDOWN_SECONDS = 60
+_ROLE_CLAIM_LAST: dict = {}
+
+
+def _role_panel_embed() -> discord.Embed:
+    e = discord.Embed(
+        title="🎭 Получить роль",
+        color=0x000000,
+        description=("Нажми кнопку — бот найдёт тебя на cs2red по нику, "
+                     "привяжет SteamID и выдаст роль сайта и роль клана."),
+    )
+    e.add_field(name="Уже привязан?",
+                value="Кнопка просто обновит роли.", inline=False)
+    e.add_field(name="Не находит?",
+                value="Привяжи вручную через `/link` или напиши модератору.",
+                inline=False)
+    e.set_footer(text="Quantum • роли с cs2red")
+    return e
+
+
+async def _auto_link_member(member):
+    """Привязывает участника по нику. Возвращает (steam_id, текст ошибки)."""
+    nick = (getattr(member, "display_name", "") or "").strip()
+    if not nick:
+        return None, "❌ Не вижу твой ник — привяжи SteamID через `/link`."
+    users = await api.cs2red_search_by_nick(nick)
+    if users is None:
+        reason = getattr(api, "blocked_reason", "")
+        if reason == "403":
+            return None, "❌ Ошибка авторизации на cs2red — сообщи админу."
+        if reason == "429":
+            return None, ("⏳ cs2red временно ограничил запросы — "
+                          "попробуй через 5 минут.")
+        return None, "❌ cs2red не ответил. Попробуй позже."
+    if len(users) != 1:
+        return None, (f"⚠️ Нашёл профилей: {len(users)}. "
+                      "Привяжи точно через `/link`.")
+    steam = api.extract_steam64(users[0])
+    if not steam:
+        return None, "⚠️ Не смог определить SteamID — привяжи через `/link`."
+    owner = await links_repo.get_owner_of(steam)
+    if owner and str(owner) != str(member.id):
+        return None, "❌ Этот SteamID уже привязан к другому Discord."
+    await links_repo.add_link(member.id, steam)
+    await log_to_channel(
+        bot, f"🎭 Роль: {member.mention} привязан по нику → `{steam}`")
+    return steam, None
+
+
+class RoleClaimView(discord.ui.View):
+    """Постоянная кнопка «Получить роль»: авто-привязка + синхронизация."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🎭 Получить роль",
+                       style=discord.ButtonStyle.success,
+                       custom_id="role_claim_btn")
+    async def claim(self, i, _button):
+        await i.response.defer(ephemeral=True)
+        guild = i.guild
+        if guild is None:
+            await safe_send(i.followup, "❌ Кнопка работает только на сервере.",
+                            ephemeral=True)
+            return
+        now = time.time()
+        last = _ROLE_CLAIM_LAST.get(i.user.id, 0.0)
+        if now - last < ROLE_CLAIM_COOLDOWN_SECONDS:
+            await safe_send(i.followup, "⏳ Подожди минуту и попробуй снова.",
+                            ephemeral=True)
+            return
+        _ROLE_CLAIM_LAST[i.user.id] = now
+        if len(_ROLE_CLAIM_LAST) > 1000:
+            cutoff = now - ROLE_CLAIM_COOLDOWN_SECONDS
+            for uid in [u for u, ts in _ROLE_CLAIM_LAST.items() if ts < cutoff]:
+                _ROLE_CLAIM_LAST.pop(uid, None)
+        try:
+            member = guild.get_member(i.user.id) or i.user
+            steam = await links_repo.get_link(member.id)
+            linked_now = False
+            if steam is None:
+                steam, err = await _auto_link_member(member)
+                if err:
+                    await safe_send(i.followup, err, ephemeral=True)
+                    return
+                linked_now = True
+            user = await api.cs2red_user(steam)
+            if user is None:
+                await safe_send(i.followup,
+                                "❌ cs2red не ответил. Попробуй позже.",
+                                ephemeral=True)
+                return
+            if user.get("_not_found"):
+                await safe_send(i.followup,
+                                "⚠️ Профиль не найден на cs2red, роли не тронуты.",
+                                ephemeral=True)
+                return
+            lines = []
+            if linked_now:
+                lines.append(f"🔗 Привязан SteamID `{steam}`")
+            lines.append(await sync_role_by_id(guild, member, steam, user=user))
+            lines.append(await sync_clan_role_by_id(guild, member, steam, user=user))
+            text = "\n".join(x for x in lines if x)
+            await safe_send(i.followup, text, ephemeral=True)
+            await audit_action(i.client, "Получение роли", actor=i.user,
+                               target=member, details=text[:500])
+        except Exception as e:
+            await log_error(bot, "role_claim_btn", e)
+            await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}",
+                            ephemeral=True)
+
+
+async def ensure_role_panel(client) -> str:
+    """Публикует панель «Получить роль», если её ещё нет в канале."""
+    channel = (client.get_channel(ROLE_PANEL_CHANNEL_ID)
+               if ROLE_PANEL_CHANNEL_ID else None)
+    if channel is None:
+        return "канал не найден"
+    old_id = await seen_repo.get_flag(ROLE_PANEL_FLAG)
+    if old_id:
+        try:
+            await channel.fetch_message(int(old_id))
+            return "панель уже на месте"
+        except discord.NotFound:
+            pass
+        except Exception as e:
+            log(f"⚠️ панель ролей: {e}")
+    msg = await safe_send(channel, embed=_role_panel_embed(),
+                          view=RoleClaimView())
+    if msg is None:
+        return "не удалось отправить"
+    await seen_repo.set_flag(ROLE_PANEL_FLAG, str(msg.id))
+    return "панель опубликована"
+
+
+@bot.tree.command(name="rolepanel",
+                  description="Опубликовать панель «Получить роль» (админ)")
+@app_commands.default_permissions(administrator=True)
+async def rolepanel(i):
+    await i.response.defer(ephemeral=True)
+    if not await _admin_guard(i):
+        return
+    status = await ensure_role_panel(bot)
+    await safe_send(i.followup, f"🎭 {status}", ephemeral=True)
 
 
 class PanelView(discord.ui.View):
