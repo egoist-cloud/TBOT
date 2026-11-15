@@ -43,6 +43,7 @@ from quantum.repositories import moderation as moderation_repo
 from quantum.repositories import applications as applications_repo
 from quantum.repositories import audit as audit_repo
 from quantum.ai import AIService
+from quantum.ai.providers import provider_catalog
 from github_sync import GitHubSync
 from quantum.ai.cache import count_cache, clear_cache
 
@@ -3754,6 +3755,7 @@ ADMIN_ONLY_COMMANDS = {
     "give", "take", "admlink", "auto_link", "sync_all", "export_members",
     "link_all", "player_list", "player_note", "ai_clear_cache", "panel",
     "activity_set", "activity_clear", "rolepanel", "agent_idea",
+    "ai_status",
 }
 
 # Команды, которые админ может выдать модератору. Порядок = порядок в меню.
@@ -3840,8 +3842,9 @@ class MyBot(commands.Bot):
                     "MISTRAL_API_KEY / OPENROUTER_API_KEY / LLM7_API_KEY).")
             else:
                 n_rules = ai_service.ensure_rules()
-                log(f"✅ AI-сервис готов (провайдеров: {n_providers}, "
-                    f"правил: {n_rules})")
+                names = ", ".join(p.name for p in ai_service.providers)
+                log(f"✅ AI-сервис готов (провайдеров: {n_providers}: "
+                    f"{names}; правил: {n_rules})")
 
             # Persistent-view и фоновые задачи нужны ВСЕГДА, даже если
             # GUILD_ID не задан: иначе бот поднимается «живым», но кнопки
@@ -6129,6 +6132,7 @@ HELP_DESCRIPTIONS = {
     "panel": "панель управления ботом",
     "rolepanel": "опубликовать панель «Получить роль»",
     "agent_idea": "идея по улучшению кода прямо сейчас",
+    "ai_status": "какие ИИ-провайдеры настроены и что с лимитами",
     "sync_all": "синхронизировать роли всех привязанных",
     "auto_link": "авто-привязка по никам",
     "link_all": "массовая привязка из базы",
@@ -6568,13 +6572,12 @@ async def health(i: discord.Interaction):
         # Это НЕ проблема, если хотя бы один провайдер настроен и работает:
         # каскад просто использует доступный. Красный флаг ставим только
         # когда ИИ не настроен вообще.
-        configured = {p.name for p in providers}
-        missing = [n for n in ("gemini", "openrouter", "llm7")
-                   if n not in configured]
+        missing = [f"{item['name']} ({item['env']})"
+                   for item in provider_catalog() if not item["enabled"]]
         if missing:
-            names = ", ".join(n.title() for n in missing)
+            names = ", ".join(missing)
             add("🤖", "AI (резерв)",
-                f"ℹ️ не настроены: {names} (нужны ключи в .env)",
+                f"ℹ️ нет ключа: {names[:900]}",
                 any_ai_ok)
         if not providers:
             add("🤖", "AI-каскад", "❌ ни один ИИ-провайдер не настроен", False)
@@ -8691,6 +8694,65 @@ async def agent_idea(i):
         await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}", ephemeral=True)
 
 
+def _cooldown_reason(status) -> str:
+    """Почему провайдер в паузе — по последнему HTTP-статусу."""
+    return {
+        429: "лимит/квота исчерпаны",
+        401: "ключ не принят",
+        403: "нет доступа к модели",
+        400: "неверный запрос/модель",
+        404: "модель не найдена",
+    }.get(status, "сбой сети или сервера")
+
+
+@bot.tree.command(name="ai_status",
+                  description="ИИ-провайдеры: ключи, лимиты, паузы (админ)")
+@app_commands.default_permissions(administrator=True)
+async def ai_status(i):
+    """Показать, какие ключи реально заданы и кто сейчас в паузе."""
+    await i.response.defer(ephemeral=True)
+    if not await _admin_guard(i):
+        return
+    catalog = provider_catalog()
+    running = {p.name: p for p in (ai_service.providers if ai_service else [])}
+    active, paused, missing = [], [], []
+    for item in catalog:
+        prov = running.get(item["name"])
+        line = f"`{item['name']}` — {item['model']}"
+        if not item["enabled"]:
+            missing.append(f"`{item['name']}` — {item['env']}")
+        elif prov is not None and prov.cooldown_left:
+            minutes = max(1, prov.cooldown_left // 60)
+            paused.append(f"{line}: {_cooldown_reason(prov.last_status)}, "
+                          f"ещё ~{minutes} мин")
+        else:
+            active.append(line)
+
+    embed = discord.Embed(title="🤖 ИИ-провайдеры", color=0x000000,
+                          timestamp=discord.utils.utcnow())
+    embed.add_field(name=f"✅ Готовы отвечать ({len(active)})",
+                    value="\n".join(active) or "—", inline=False)
+    if paused:
+        embed.add_field(name=f"⏸ В паузе после ошибки ({len(paused)})",
+                        value="\n".join(paused), inline=False)
+    embed.add_field(name=f"🔑 Нет ключа ({len(missing)})",
+                    value="\n".join(missing)[:1000] or "—", inline=False)
+    embed.add_field(
+        name="Что делать с лимитом",
+        value=("Пауза ставится автоматически, каскад в это время идёт к "
+               "следующему провайдеру — панель/ответы не падают.\n"
+               "• 429: подождать (10 мин, `AI_PROVIDER_COOLDOWN_SECONDS`) "
+               "или сменить ключ на новый аккаунт.\n"
+               "• 401/403: ключ неверный или просрочен — заменить в ",
+               "секретах хостинга (пауза 1 ч).\n"
+               "• 400/404: неверная модель — поправить `*_MODEL` (пауза 30 мин).\n"
+               "Если в паузе все — бот честно скажет, что ИИ занят, и "
+               "вернёт лимит запроса."),
+        inline=False)
+    embed.set_footer(text="Ключи не показываются — только имена переменных")
+    await safe_send(i.followup, embed=embed, ephemeral=True)
+
+
 @agent_watch.before_loop
 async def before_agent_watch():
     await bot.wait_until_ready()
@@ -8720,11 +8782,27 @@ async def _health_probe_cs2red() -> bool:
 
 
 def _health_probe_ai() -> bool:
-    """ИИ считается живым, если задан хотя бы один провайдер."""
+    """ИИ жив, если есть настроенный провайдер ВНЕ паузы.
+
+    Настроенный, но сидящий в cooldown после 429 провайдер не отвечает —
+    раньше такой бот считался здоровым и алерт о лимитах не приходил.
+    """
     try:
-        return bool(ai_service and ai_service.providers)
+        providers = ai_service.providers if ai_service else []
+        return any(getattr(p, "available", True) for p in providers)
     except Exception:
         return False
+
+
+def _ai_pause_note() -> str:
+    """Почему ИИ недоступен: нет ключей или все в паузе и на сколько."""
+    providers = ai_service.providers if ai_service else []
+    if not providers:
+        return "ни один ИИ-провайдер не настроен (нужны ключи)"
+    nearest = min((p.cooldown_left for p in providers), default=0)
+    minutes = max(1, nearest // 60)
+    return (f"все ИИ-провайдеры в паузе после лимита/ошибки, "
+            f"ближайший через ~{minutes} мин")
 
 
 async def _health_alert(problems: list):
@@ -8773,7 +8851,7 @@ async def health_watch():
             _health_state["ai_fails"] += 1
             if (_health_state["ai_ok"]
                     and _health_state["ai_fails"] >= HEALTH_FAILS_BEFORE_ALERT):
-                problems.append("нет доступных ИИ-провайдеров")
+                problems.append(f"нет доступных ИИ-провайдеров: {_ai_pause_note()}")
         _health_state["ai_ok"] = ai_ok
 
         ws_ok = bot.latency * 1000 < 1000 and not bot.is_closed()

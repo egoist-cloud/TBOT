@@ -534,6 +534,30 @@ _PROVIDER_CLASSES = (
 )
 
 
+def provider_catalog(session=None) -> list[dict]:
+    """Все провайдеры каскада: имя, переменные ключа, модель, наличие ключа.
+
+    В отличие от make_providers() возвращает и выключенные провайдеры —
+    чтобы /ai_status мог показать, каких ключей не хватает.
+    """
+    result: list[dict] = []
+    for cls in _PROVIDER_CLASSES:
+        inst = cls(session)
+        if isinstance(inst, CloudflareProvider):
+            env_names = "CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID"
+        elif isinstance(inst, GitHubModelsProvider):
+            env_names = "GITHUB_MODELS_TOKEN (или GITHUB_TOKEN)"
+        else:
+            env_names = inst.env_key
+        result.append({
+            "name": inst.name,
+            "env": env_names,
+            "model": getattr(inst, "_model", "?"),
+            "enabled": inst.enabled,
+        })
+    return result
+
+
 def make_providers(
     session: aiohttp.ClientSession,
     timeout: float = DEFAULT_TIMEOUT,

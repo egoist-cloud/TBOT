@@ -68,3 +68,36 @@ def test_root_uses_same_check(monkeypatch):
 
     _patch_bot(monkeypatch, ready=True, closed=False)
     assert _get("/").status_code == 200
+
+
+def _fake_ai(*providers):
+    from types import SimpleNamespace
+    return SimpleNamespace(providers=list(providers))
+
+
+def test_ai_probe_ignores_providers_in_cooldown(monkeypatch):
+    """Провайдер с исчерпанным лимитом не считается живым ИИ."""
+    from types import SimpleNamespace
+    monkeypatch.setattr(botmod, "ai_service", _fake_ai(
+        SimpleNamespace(available=False, cooldown_left=300)))
+
+    assert botmod._health_probe_ai() is False
+    assert "через ~5 мин" in botmod._ai_pause_note()
+
+
+def test_ai_probe_ok_with_available_provider(monkeypatch):
+    """Хотя бы один провайдер вне паузы — ИИ работает."""
+    from types import SimpleNamespace
+    monkeypatch.setattr(botmod, "ai_service", _fake_ai(
+        SimpleNamespace(available=False, cooldown_left=300),
+        SimpleNamespace(available=True, cooldown_left=0)))
+
+    assert botmod._health_probe_ai() is True
+
+
+def test_ai_probe_without_keys(monkeypatch):
+    """Нет ни одного ключа — понятная причина, а не «пауза»."""
+    monkeypatch.setattr(botmod, "ai_service", _fake_ai())
+
+    assert botmod._health_probe_ai() is False
+    assert "не настроен" in botmod._ai_pause_note()

@@ -31,6 +31,7 @@ from quantum.ai.providers import (  # noqa: E402
     SambaNovaProvider,
     _is_auth_error,
     make_providers,
+    provider_catalog,
 )
 
 # Переменные, которые влияют на провайдеров: перед каждым тестом чистим,
@@ -666,3 +667,52 @@ def test_success_clears_cooldown(monkeypatch):
     assert provider.available is True
     assert provider.cooldown_left == 0
     print("  ok: успех снимает паузу")
+
+
+AI_ENV_KEYS = ("GEMINI_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY",
+               "MISTRAL_API_KEY", "GITHUB_MODELS_TOKEN", "GITHUB_TOKEN",
+               "OPENROUTER_API_KEY", "NVIDIA_API_KEY", "SAMBANOVA_API_KEY",
+               "COHERE_API_KEY", "HUGGINGFACE_API_KEY",
+               "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID",
+               "LLM7_API_KEY")
+
+
+def test_provider_catalog_lists_every_provider(monkeypatch):
+    """/ai_status видит все 12 провайдеров, включая выключенные."""
+    for key in AI_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+    catalog = provider_catalog()
+
+    assert len(catalog) == 12
+    assert all(item["enabled"] is False for item in catalog)
+    names = [item["name"] for item in catalog]
+    assert names[0] == "gemini" and names[-1] == "llm7"
+    # У каждого есть переменная ключа, которую можно показать админу.
+    assert all(item["env"] for item in catalog)
+
+
+def test_provider_catalog_marks_only_configured(monkeypatch):
+    """Ключ есть только у Groq — активен только он."""
+    for key in AI_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+
+    enabled = [item["name"] for item in provider_catalog()
+               if item["enabled"]]
+
+    assert enabled == ["groq"]
+
+
+def test_provider_catalog_cloudflare_needs_account_id(monkeypatch):
+    """Cloudflare без account id — не активен, хотя токен есть."""
+    for key in AI_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "token")
+    catalog = {item["name"]: item for item in provider_catalog()}
+    assert catalog["cloudflare"]["enabled"] is False
+
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "account")
+    catalog = {item["name"]: item for item in provider_catalog()}
+    assert catalog["cloudflare"]["enabled"] is True
+    assert "CLOUDFLARE_ACCOUNT_ID" in catalog["cloudflare"]["env"]
