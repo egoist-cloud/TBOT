@@ -3065,6 +3065,30 @@ def _app_id_of(button) -> str:
     return cid.split(":", 1)[1] if ":" in cid else ""
 
 
+def _rejection_cooldown_text(cooldown: dict) -> str:
+    """Объяснение, почему повторная заявка пока недоступна."""
+    reason = (cooldown.get("reason") or "").strip() or "причина не указана"
+    return ("⏳ Повторная заявка пока недоступна.\n"
+            f"Причина отказа: **{reason}**\n"
+            f"Следующая попытка: **{_fmt_dt(cooldown.get('until'))}**")
+
+
+def _next_attempt_line() -> str:
+    """Строка о следующей попытке с учётом текущего кулдауна."""
+    days = max(0, int(APPLICATION_REJECT_COOLDOWN_DAYS))
+    if not days:
+        return "Можно подать новую заявку сразу."
+    until = now_utc() + datetime.timedelta(days=days)
+    return f"Следующая попытка: {_fmt_dt(until.isoformat())}."
+
+
+def _rejection_dm_text(reason: str) -> str:
+    """ЛС игроку после отказа: причина и когда можно попробовать снова."""
+    reason = (reason or "").strip() or "причина не указана"
+    return (f"❌ Ваша заявка в клан {CLAN_NAME} отклонена.\n"
+            f"Причина: {reason}\n{_next_attempt_line()}")
+
+
 def _app_id_for(interaction, button=None) -> str:
     """app_id заявки из кнопки; fallback — id сообщения (старые сообщения)."""
     app_id = _app_id_of(button) if button is not None else ""
@@ -3127,6 +3151,11 @@ async def _apply_vote(interaction, kind, app_id, tid, show_take,
             if kind == "deny" and reason:
                 embed.add_field(name="Причина отказа", value=reason[:1024],
                                 inline=False)
+            if kind == "deny" and APPLICATION_REJECT_COOLDOWN_DAYS > 0:
+                until = now_utc() + datetime.timedelta(
+                    days=APPLICATION_REJECT_COOLDOWN_DAYS)
+                embed.add_field(name="Следующая попытка",
+                                value=_fmt_dt(until.isoformat()), inline=False)
         for c in view.children:
             c.disabled = True
         try:
@@ -3149,6 +3178,11 @@ async def _apply_vote(interaction, kind, app_id, tid, show_take,
         if member:
             await log_to_channel(interaction.client,
                 f"{'✅' if kind == 'accept' else '❌'} {member.mention}")
+        if kind == "deny" and member is not None:
+            try:
+                await member.send(_rejection_dm_text(reason))
+            except Exception as e:  # noqa: BLE001 - ЛС могут быть закрыты
+                log(f"⚠️ отказ заявки: не отправил ЛС {member.id}: {e}")
         # Аудит: решение по заявке с причиной отказа.
         try:
             await audit_action(
@@ -3460,6 +3494,13 @@ class QuestionnaireModal(discord.ui.Modal, title="Заявка в клан"):
             )
             return
 
+        cooldown = await applications_repo.get_rejection_cooldown(
+            i.user.id, APPLICATION_REJECT_COOLDOWN_DAYS)
+        if cooldown:
+            await safe_send(i.followup, _rejection_cooldown_text(cooldown),
+                            ephemeral=True)
+            return
+
         m = re.search(r"\d{17}", self.steam_input.value.strip())
         sid = m.group(0) if m else None
         if sid:
@@ -3622,7 +3663,7 @@ async def expire_stale_applications(days=None) -> list:
             try:
                 await user.send(
                     f"⌛ Ваша заявка в клан {CLAN_NAME} отклонена автоматически: "
-                    f"решение не принято за {days} дн. Можно подать новую.")
+                    f"решение не принято за {days} дн. {_next_attempt_line()}")
             except Exception:
                 pass
     return closed
@@ -7982,12 +8023,12 @@ def _build_clan_conditions_embed() -> discord.Embed:
         value="• Steam-профиль (ссылка или SteamID64)",
         inline=False,
     )
-    embed.add_field(
-        name="⚠️ Важно!",
-        value=("Если вам не напишут в течение 7 дней — заявка отклоняется.\n"
-               "После принятия есть 2 дня на вступление."),
-        inline=False,
-    )
+    important = ("Если вам не напишут в течение 7 дней — заявка отклоняется.\n"
+                 "После принятия есть 2 дня на вступление.")
+    if APPLICATION_REJECT_COOLDOWN_DAYS > 0:
+        important += ("\nПосле отказа повторная заявка — через "
+                      f"{APPLICATION_REJECT_COOLDOWN_DAYS} дн.")
+    embed.add_field(name="⚠️ Важно!", value=important, inline=False)
     if CLAN_QUESTIONS_ROLE_ID:
         questions = f"Обратитесь к <@&{CLAN_QUESTIONS_ROLE_ID}>."
     else:
@@ -8028,6 +8069,8 @@ CLAN_PANEL_SPEC = PanelSpec("clan_panel", CLAN_PANEL_CHANNEL_ID,
 # Заявка без решения дольше этого срока закрывается автоматически — иначе
 # она навсегда блокирует игроку новую подачу (анти-дубликат в on_submit).
 APPLICATION_TTL_DAYS = env_int("APPLICATION_TTL_DAYS", 7)
+# После отказа повторная заявка недоступна N дней (0 — выключить).
+APPLICATION_REJECT_COOLDOWN_DAYS = env_int("APPLICATION_REJECT_COOLDOWN_DAYS", 3)
 
 _PANEL_CHANNEL_FLAG = "clan_panel_channel"
 _PANEL_MESSAGE_FLAG = "clan_panel_message"
@@ -8819,7 +8862,7 @@ def _code_overview() -> str:
 
 
 def _agent_extra() -> dict:
-    """Контекст для отчётов и идей агента."""
+    """Контекст для дайджеста и идей агента."""
     return {
         "uptime": _uptime_str(),
         "ping": f"{bot.latency * 1000:.0f} мс",
@@ -8833,11 +8876,11 @@ def _agent_extra() -> dict:
 
 @tasks.loop(minutes=AGENT_CHECK_MINUTES)
 async def agent_watch():
-    """Цикл ИИ-агента: следит за системой, шлёт отчёты и идеи.
+    """Цикл ИИ-агента: утренний дайджест и идеи.
 
-    Отчёт (раз в AGENT_HEALTH_INTERVAL_MINUTES) и идея по улучшению кода
-    (раз в AGENT_IDEA_INTERVAL_MINUTES, по умолчанию 6 ч) публикуются
-    в AGENT_CHANNEL_ID. На идею тратится один запрос к ИИ.
+    Периодических отчётов о состоянии больше нет: дайджест публикуется
+    один раз в день после AGENT_DIGEST_HOUR, идея — раз в
+    AGENT_IDEA_INTERVAL_MINUTES. Ошибки по-прежнему уходят сразу.
     """
     try:
         providers = ai_service.providers if ai_service else []

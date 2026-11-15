@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Тесты ИИ-агента: ошибки, отчёты, идеи."""
 import asyncio
+import datetime
 import sys
 from pathlib import Path
 
@@ -86,22 +87,34 @@ def test_error_counter_groups_by_command():
     print("  ok: счётчик ошибок работает")
 
 
-def test_health_embed_contains_metrics():
-    """Отчёт о состоянии содержит основные метрики."""
+def test_digest_embed_contains_metrics_and_events(monkeypatch):
+    """Утренний дайджест содержит метрики и события за сутки."""
     async def scenario():
-        agent = _agent()
-        embed = await agent.build_health_embed(
-            {"uptime": "1 ч 2 мин", "ping": "42 мс", "ai": "Gemini",
-             "rules": "Пунктов: 10", "github": "ок", "cs2red": "200"})
-        fields = {f.name: f.value for f in embed.fields}
-        assert embed.title == "🩺 Наблюдение за системой"
-        assert fields["⏱️ Аптайм"] == "1 ч 2 мин"
-        assert fields["📡 Пинг"] == "42 мс"
-        assert fields["🤖 ИИ"] == "Gemini"
-        assert fields["🌐 cs2red"] == "200"
+        await init_db()
+        try:
+            agent = _agent()
+
+            async def fake_entries(limit=20):
+                return [{"ts": datetime.datetime.now(datetime.UTC).isoformat(),
+                         "action": "Заявка отклонена", "target_name": "Игрок"}]
+
+            monkeypatch.setattr(agentmod.audit_repo, "list_entries", fake_entries)
+            embed = await agent.build_digest_embed(
+                {"uptime": "1 ч 2 мин", "ping": "42 мс", "ai": "Gemini",
+                 "rules": "Пунктов: 10", "github": "ок", "cs2red": "200"})
+            fields = {f.name: f.value for f in embed.fields}
+            assert embed.title == "☀️ Утренний дайджест"
+            assert fields["⏱️ Аптайм"] == "1 ч 2 мин"
+            assert fields["📡 Пинг"] == "42 мс"
+            assert fields["🤖 ИИ"] == "Gemini"
+            assert fields["🌐 cs2red"] == "200"
+            assert "Заявка отклонена" in fields["📋 События за сутки"]
+            assert "Событий в аудите: **1**" in embed.description
+        finally:
+            await close_db()
 
     asyncio.run(scenario())
-    print("  ok: embed отчёта собран")
+    print("  ok: утренний дайджест собран")
 
 
 def test_idea_embed_from_provider():
@@ -270,7 +283,7 @@ class _SplitBot:
 
 
 async def _reset_agent_flags():
-    for flag in ("agent_last_health", "agent_last_idea"):
+    for flag in ("agent_last_digest", "agent_last_idea"):
         await seen_repo.set_flag(flag, "0")
     await seen_repo.set_flag("agent_ideas", "[]")
 
@@ -281,12 +294,15 @@ def test_idea_channel_defaults_to_agent_channel():
     print("  ok: канал идей по умолчанию — канал агента")
 
 
-def test_reports_and_ideas_use_separate_channels():
-    """Отчёт уходит в AGENT_CHANNEL_ID, идея — в AGENT_IDEA_CHANNEL_ID."""
+def test_digest_and_ideas_use_separate_channels(monkeypatch):
+    """Дайджест уходит в AGENT_CHANNEL_ID, идея — в AGENT_IDEA_CHANNEL_ID."""
     async def scenario():
         await init_db()
         try:
             await _reset_agent_flags()
+            monkeypatch.setattr(agentmod, "_now",
+                                lambda: datetime.datetime(2026, 11, 15, 9, 5,
+                                                          tzinfo=datetime.UTC))
             reports, ideas = _FakeChannel(), _FakeChannel()
             agent = Agent(_SplitBot({111: reports, 222: ideas}), 111,
                           idea_channel_id=222)
@@ -294,7 +310,7 @@ def test_reports_and_ideas_use_separate_channels():
             await agent.run_cycle([_FakeProvider()], {})
 
             assert len(reports.sent) == 1
-            assert reports.sent[0].title == "🩺 Наблюдение за системой"
+            assert reports.sent[0].title == "☀️ Утренний дайджест"
             assert len(ideas.sent) == 1
             assert ideas.sent[0].title == "💡 Идея от ИИ-агента"
         finally:
@@ -302,30 +318,39 @@ def test_reports_and_ideas_use_separate_channels():
             await close_db()
 
     asyncio.run(scenario())
-    print("  ok: отчёт и идея разошлись по разным каналам")
+    print("  ok: дайджест и идея разошлись по разным каналам")
 
 
-def test_health_reports_can_be_disabled(monkeypatch):
-    """AGENT_HEALTH_INTERVAL_MINUTES=0 — отчёты не публикуются, идеи остаются."""
+def test_digest_posts_once_per_day_and_after_hour(monkeypatch):
+    """Дайджест один раз в день, и не раньше AGENT_DIGEST_HOUR."""
     async def scenario():
         await init_db()
         try:
             await _reset_agent_flags()
-            monkeypatch.setattr(agentmod, "AGENT_HEALTH_INTERVAL_MINUTES", 0)
             reports, ideas = _FakeChannel(), _FakeChannel()
             agent = Agent(_SplitBot({111: reports, 222: ideas}), 111,
                           idea_channel_id=222)
+            monkeypatch.setattr(agentmod, "AGENT_DIGEST_HOUR", 9)
+            monkeypatch.setattr(agentmod, "AGENT_IDEA_INTERVAL_MINUTES", 0)
 
-            await agent.run_cycle([_FakeProvider()], {})
+            monkeypatch.setattr(agentmod, "_now",
+                                lambda: datetime.datetime(2026, 11, 15, 8, 0,
+                                                          tzinfo=datetime.UTC))
+            await agent.run_cycle([], {})
+            assert reports.sent == [], "до утреннего часа дайджеста нет"
 
-            assert reports.sent == [], "отчёты отключены"
-            assert len(ideas.sent) == 1, "идеи продолжают приходить"
+            monkeypatch.setattr(agentmod, "_now",
+                                lambda: datetime.datetime(2026, 11, 15, 9, 5,
+                                                          tzinfo=datetime.UTC))
+            await agent.run_cycle([], {})
+            await agent.run_cycle([], {})
+            assert len(reports.sent) == 1, "дайджест должен быть один за день"
         finally:
             await _reset_agent_flags()
             await close_db()
 
     asyncio.run(scenario())
-    print("  ok: отчёты можно отключить, идеи остаются")
+    print("  ok: дайджест приходит раз в день утром")
 
 
 def test_force_idea_goes_to_idea_channel():

@@ -4,12 +4,15 @@
 Агент не вмешивается в работу бота — он только наблюдает:
 
   * ошибки команд уходят в служебный канал сразу, стилизованным Embed;
-  * отчёт о состоянии систем — раз в AGENT_HEALTH_INTERVAL_MINUTES;
+  * утренний дайджест — один раз в день после AGENT_DIGEST_HOUR (UTC):
+    состояние систем и события за последние сутки;
   * идея по улучшению бота — раз в AGENT_IDEA_INTERVAL_MINUTES (ИИ
     спрашивается напрямую, минуя RAG по правилам клана и лимитер).
 
-Расписание хранится в таблице meta, поэтому после перезапуска на Render
-агент не публикует отчёты и идеи «пачкой».
+Периодических отчётов о состоянии больше нет: канал не забивается
+одинаковыми сообщениями, а важные события (ошибки, деградация health)
+по-прежнему приходят сразу. Расписание хранится в таблице meta, поэтому
+после перезапуска агент не публикует дайджест/идеи «пачкой».
 """
 from __future__ import annotations
 
@@ -22,6 +25,7 @@ import discord
 
 from .env import env_int
 from .repositories import applications as applications_repo
+from .repositories import audit as audit_repo
 from .repositories import links as links_repo
 from .repositories import moderation as moderation_repo
 from .repositories import players as players_repo
@@ -31,15 +35,16 @@ from .repositories import votes as votes_repo
 
 log = logging.getLogger("quantum.agent")
 
-# Канал агента и расписание (в минутах).
-AGENT_HEALTH_INTERVAL_MINUTES = env_int("AGENT_HEALTH_INTERVAL_MINUTES", 120)
+# Час утреннего дайджеста (UTC). -1 отключает дайджест.
+AGENT_DIGEST_HOUR = env_int("AGENT_DIGEST_HOUR", 9)
+# Периодические идеи по улучшению кода (минуты; 0 — выключить).
 AGENT_IDEA_INTERVAL_MINUTES = env_int("AGENT_IDEA_INTERVAL_MINUTES", 360)
 
 # Сколько последних идей помним, чтобы не повторяться.
 MAX_IDEAS = 12
 
 # Флаги расписания в таблице meta.
-_FLAG_HEALTH = "agent_last_health"
+_FLAG_DIGEST = "agent_last_digest"
 _FLAG_IDEA = "agent_last_idea"
 _FLAG_IDEAS = "agent_ideas"
 
@@ -166,27 +171,63 @@ class Agent:
         data["errors"] = sum(self.error_stats.values())
         return data
 
-    async def build_health_embed(self, extra: dict | None = None) -> discord.Embed:
-        """Embed со сводным состоянием систем."""
+    async def _recent_events(self, limit: int = 6) -> tuple[int, str]:
+        """События аудита за последние 24 часа: (сколько, строки для embed)."""
+        cutoff = _now() - datetime.timedelta(hours=24)
+        try:
+            rows = await audit_repo.list_entries(limit=100)
+        except Exception as e:
+            log.warning("agent: не прочитал аудит: %s", e)
+            return 0, "—"
+        count, lines = 0, []
+        for row in rows:
+            try:
+                ts = datetime.datetime.fromisoformat(str(row.get("ts") or ""))
+            except (TypeError, ValueError):
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=datetime.UTC)
+            if ts < cutoff:
+                continue
+            count += 1
+            if len(lines) < limit:
+                action = str(row.get("action") or "—")
+                target = str(row.get("target_name") or "").strip()
+                if not target and row.get("target_id"):
+                    target = f"<@{row['target_id']}>"
+                lines.append(f"• {action}" + (f" — {target}" if target else ""))
+        return count, "\n".join(lines) or "—"
+
+    async def build_digest_embed(self, extra: dict | None = None) -> discord.Embed:
+        """Утренний дайджест: состояние систем и события за сутки."""
         s = await self.snapshot(extra)
+        events_count, events_text = await self._recent_events()
         embed = discord.Embed(
-            title="🩺 Наблюдение за системой",
+            title="☀️ Утренний дайджест",
             color=0x000000,
             timestamp=_now(),
         )
+        embed.description = (f"Сводка за сутки · {_now().strftime('%d.%m.%Y')}\n"
+                             f"Событий в аудите: **{events_count}**")
         embed.add_field(name="⏱️ Аптайм", value=str(s.get("uptime", "—")), inline=True)
         embed.add_field(name="📡 Пинг", value=str(s.get("ping", "—")), inline=True)
-        embed.add_field(name="🔥 Ошибок", value=str(s.get("errors", 0)), inline=True)
-        embed.add_field(name="🔗 Привязок", value=str(s.get("links", "?")), inline=True)
-        embed.add_field(name="🗂 Заявок",
+        embed.add_field(name="🔥 Ошибок за сессию", value=str(s.get("errors", 0)),
+                        inline=True)
+        embed.add_field(name="📨 Заявок",
                         value=f"{s.get('apps', '?')} (в работе: {s.get('apps_pending', '?')})",
                         inline=True)
-        embed.add_field(name="🗳 Голосов", value=str(s.get("votes", "?")), inline=True)
+        embed.add_field(name="🔗 Привязок", value=str(s.get("links", "?")), inline=True)
         embed.add_field(name="🛡 Модераторов", value=str(s.get("mods", "?")), inline=True)
+        embed.add_field(name="🗳 Голосов", value=str(s.get("votes", "?")), inline=True)
         embed.add_field(name="🤖 ИИ", value=str(s.get("ai", "—")), inline=False)
         embed.add_field(name="📖 Правила", value=str(s.get("rules", "—")), inline=False)
         embed.add_field(name="🐙 GitHub", value=str(s.get("github", "—")), inline=True)
         embed.add_field(name="🌐 cs2red", value=str(s.get("cs2red", "—")), inline=True)
+        if self.error_stats:
+            embed.add_field(name="🐞 Топ ошибок", value=self.top_errors(),
+                            inline=False)
+        embed.add_field(name="📋 События за сутки", value=events_text[:1024],
+                        inline=False)
         embed.set_footer(text="Quantum • ИИ-агент")
         return embed
 
@@ -298,16 +339,17 @@ class Agent:
             return 0.0
 
     async def run_cycle(self, providers=None, extra: dict | None = None) -> None:
-        """Один цикл: отчёт по расписанию, затем идея по расписанию."""
+        """Один цикл: утренний дайджест (раз в день), затем идея по расписанию."""
         now = time.time()
-
-        # 0 — отключить рассылку совсем (например, идеи есть, отчёты не нужны).
-        if (AGENT_HEALTH_INTERVAL_MINUTES > 0
-                and now - await self._flag_time(_FLAG_HEALTH) >=
-                AGENT_HEALTH_INTERVAL_MINUTES * 60):
-            embed = await self.build_health_embed(extra)
-            await self.post(embed)
-            await seen_repo.set_flag(_FLAG_HEALTH, str(now))
+        today = _now()
+        if (0 <= AGENT_DIGEST_HOUR <= 23
+                and today.hour >= AGENT_DIGEST_HOUR
+                and await seen_repo.get_flag(_FLAG_DIGEST) != today.date().isoformat()):
+            embed = await self.build_digest_embed(extra)
+            if await self.post(embed):
+                # Флаг ставим только после успешной отправки: если канал
+                # недоступен, следующая попытка будет через цикл, а не завтра.
+                await seen_repo.set_flag(_FLAG_DIGEST, today.date().isoformat())
 
         if (AGENT_IDEA_INTERVAL_MINUTES > 0
                 and now - await self._flag_time(_FLAG_IDEA) >=

@@ -35,6 +35,40 @@ async def get_active_application(user_id) -> dict | None:
     return dict(row)
 
 
+async def get_rejection_cooldown(user_id, days: int) -> dict | None:
+    """Кулдаун после отказа по заявке.
+
+    Возвращает ``{"reason", "rejected_at", "until"}``, пока повторная
+    заявка запрещена, иначе None. Правило одно для любого отказа, включая
+    автоотклонение по TTL: причина и дата следующей попытки сохраняются.
+    """
+    days = int(days or 0)
+    if days <= 0:
+        return None
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT status, decision_reason, updated_at "
+        "FROM applications WHERE user_id = ?", (str(user_id),))
+    row = await cursor.fetchone()
+    await cursor.close()
+    if row is None or row["status"] != "rejected":
+        return None
+    try:
+        rejected_at = datetime.datetime.fromisoformat(str(row["updated_at"]))
+    except (TypeError, ValueError):
+        return None
+    if rejected_at.tzinfo is None:
+        rejected_at = rejected_at.replace(tzinfo=datetime.UTC)
+    until = rejected_at + datetime.timedelta(days=days)
+    if until <= datetime.datetime.now(datetime.UTC):
+        return None
+    return {
+        "reason": (row["decision_reason"] or "").strip(),
+        "rejected_at": rejected_at.isoformat(),
+        "until": until.isoformat(),
+    }
+
+
 async def upsert_application(user_id, *, clan_name="", status="pending",
                              message_id="", channel_id="", app_id="") -> None:
     """Сохраняет/обновляет заявку пользователя (по user_id).
