@@ -7645,7 +7645,7 @@ def _build_clan_conditions_embed() -> discord.Embed:
     всегда был единым и не расходился с требованиями клана.
     """
     embed = discord.Embed(
-        title="Официальные условия вступления в клан.",
+        title=CLAN_PANEL_TITLE,
         color=0x000000,
     )
     embed.description = (
@@ -7687,9 +7687,14 @@ def _build_clan_conditions_embed() -> discord.Embed:
 
 # ---------- панель условий: публикация и автообновление ----------
 # Discord со временем перестаёт принимать нажатия на компоненты старых
-# сообщений, поэтому панель периодически пересоздаётся: старое сообщение
+# сообщений, поэтому панель пересоздаётся раз в сутки: старое сообщение
 # удаляется, новое публикуется с чистым view.
-CLAN_PANEL_REFRESH_HOURS = env_int("CLAN_PANEL_REFRESH_HOURS", 72)
+CLAN_PANEL_TITLE = "Официальные условия вступления в клан."
+# Канал панели заявки. Можно переопределить в любой момент без !setup_clan:
+# если в meta нет канала (или он недоступен), берём этот id.
+CLAN_PANEL_CHANNEL_ID = env_int("CLAN_PANEL_CHANNEL_ID", 1236678127778795660)
+# Раз в сколько часов пересоздавать панель (по умолчанию — сутки).
+CLAN_PANEL_REFRESH_HOURS = env_int("CLAN_PANEL_REFRESH_HOURS", 24)
 # Заявка без решения дольше этого срока закрывается автоматически — иначе
 # она навсегда блокирует игроку новую подачу (анти-дубликат в on_submit).
 APPLICATION_TTL_DAYS = env_int("APPLICATION_TTL_DAYS", 7)
@@ -7763,25 +7768,99 @@ async def _delete_clan_panel_message(channel, message_id) -> tuple[str, str]:
         return "error", f"{type(e).__name__}: {e}"
 
 
+async def _resolve_clan_panel_channel(bot):
+    """Канал панели: сначала из meta (!setup_clan), затем CLAN_PANEL_CHANNEL_ID.
+
+    Возвращает (channel, ошибка). Благодаря фолбэку панель работает сразу
+    после деплоя, без ручной команды !setup_clan.
+    """
+    candidates = []
+    raw_channel = await seen_repo.get_flag(_PANEL_CHANNEL_FLAG)
+    if raw_channel:
+        try:
+            candidates.append(int(raw_channel))
+        except (TypeError, ValueError):
+            log(f"⚠️ панель: битый id канала в meta: {raw_channel!r}")
+    if CLAN_PANEL_CHANNEL_ID and CLAN_PANEL_CHANNEL_ID not in candidates:
+        candidates.append(CLAN_PANEL_CHANNEL_ID)
+    if not candidates:
+        return None, "канал панели не задан (CLAN_PANEL_CHANNEL_ID)"
+
+    for channel_id in candidates:
+        channel = bot.get_channel(channel_id)
+        if channel is not None:
+            return channel, ""
+    return None, (f"канал {candidates[0]} недоступен: удалён или бот его "
+                  f"не видит (проверьте права и CLAN_PANEL_CHANNEL_ID)")
+
+
+def _message_is_clan_panel(message) -> bool:
+    """Это наша панель заявки? Старые — Embed, новые — Components V2."""
+    for embed in getattr(message, "embeds", []) or []:
+        if CLAN_PANEL_TITLE in (getattr(embed, "title", "") or ""):
+            return True
+    stack = list(getattr(message, "components", None) or [])
+    while stack:
+        component = stack.pop()
+        content = getattr(component, "content", None)
+        if isinstance(content, str) and CLAN_PANEL_TITLE in content:
+            return True
+        stack.extend(getattr(component, "children", None) or [])
+    return False
+
+
+async def _delete_untracked_clan_panels(channel, limit: int = 50) -> int:
+    """Удаляет старые панели (включая неучтённые) — остаётся только одна."""
+    deleted = 0
+    try:
+        async for message in channel.history(limit=limit):
+            author = getattr(message, "author", None)
+            if getattr(author, "bot", False) is not True:
+                continue
+            if not _message_is_clan_panel(message):
+                continue
+            try:
+                await message.delete()
+                deleted += 1
+            except discord.NotFound:
+                continue
+            except discord.HTTPException as e:
+                log(f"⚠️ панель: не удалил старое сообщение: {e}")
+    except discord.Forbidden:
+        log("⚠️ панель: нет права читать историю канала")
+    except Exception as e:  # noqa: BLE001 - очистка best-effort
+        log(f"⚠️ панель: очистка истории: {type(e).__name__}: {e}")
+    return deleted
+
+
+async def _clan_panel_message_exists(channel, raw_message) -> bool:
+    """Лежит ли в канале текущее сообщение панели.
+
+    Если проверить нельзя (нет доступа к истории) — считаем, что лежит:
+    лучше пропустить лишнее обновление, чем плодить дубли.
+    """
+    if not raw_message:
+        return False
+    try:
+        await channel.fetch_message(int(raw_message))
+        return True
+    except discord.NotFound:
+        return False
+    except Exception:  # noqa: BLE001 - Forbidden и прочие сбои
+        return True
+
+
 async def refresh_clan_panel(bot) -> str:
-    """Пересоздаёт панель заявки: удаляет старое сообщение, пишет новое.
+    """Пересоздаёт панель заявки: удаляет старую, публикует новую.
 
     Возвращает человекочитаемый статус — его пишет вызывающая задача.
     Канал ищется по id (переименование не ломает обновление), а вот
     удалённый канал или отсутствие прав не считаются успехом.
     """
-    raw_channel = await seen_repo.get_flag(_PANEL_CHANNEL_FLAG)
-    if not raw_channel:
-        return ("панель не настроена: выполните !setup_clan в канале "
-                "с условиями")
-    try:
-        channel_id = int(raw_channel)
-    except (TypeError, ValueError):
-        return f"битый id канала панели в meta: {raw_channel!r}"
-    channel = bot.get_channel(channel_id)
+    channel, channel_err = await _resolve_clan_panel_channel(bot)
     if channel is None:
-        return (f"канал {channel_id} недоступен: удалён или бот его не видит "
-                f"(проверьте права и что канал не удалили)")
+        return channel_err
+    channel_id = channel.id
 
     delete_status, delete_detail = "missing", ""
     raw_message = await seen_repo.get_flag(_PANEL_MESSAGE_FLAG)
@@ -7791,6 +7870,9 @@ async def refresh_clan_panel(bot) -> str:
                 channel, int(raw_message))
         except Exception as e:  # noqa: BLE001 - удаление не должно мешать публикации
             delete_status, delete_detail = "error", f"{type(e).__name__}: {e}"
+    # Даже если id потерялся (или старая панель от прошлой версии бота) —
+    # вычищаем все панели в канале, чтобы осталась ровно одна.
+    await _delete_untracked_clan_panels(channel)
 
     try:
         msg = await safe_send(channel, embed=_build_clan_conditions_embed(),
@@ -7811,18 +7893,18 @@ async def refresh_clan_panel(bot) -> str:
     return "панель обновлена"
 
 
-@tasks.loop(hours=6)
+@tasks.loop(hours=1)
 async def clan_panel_refresh():
-    """Раз в CLAN_PANEL_REFRESH_HOURS перепубликует панель заявки."""
+    """Раз в CLAN_PANEL_REFRESH_HOURS (сутки) перепубликует панель заявки.
+
+    Проверка раз в час нужна, чтобы удалённая вручную панель вернулась
+    быстро, а не ждала сутки. Свежую и целую панель не трогаем.
+    """
     try:
-        raw_channel = await seen_repo.get_flag(_PANEL_CHANNEL_FLAG)
-        if not raw_channel:
-            # Первый деплой без !setup_clan: раньше здесь был тихий return.
-            if _panel_alert_once(
-                    "not-configured",
-                    "не настроена — выполните !setup_clan в канале с условиями"):
-                await _notify_panel_problem(
-                    "Панель заявки не настроена: выполните !setup_clan")
+        channel, channel_err = await _resolve_clan_panel_channel(bot)
+        if channel is None:
+            if _panel_alert_once("no-channel", channel_err):
+                await _notify_panel_problem(f"не обновлена — {channel_err}")
             return
 
         raw_at = await seen_repo.get_flag(_PANEL_AT_FLAG)
@@ -7830,9 +7912,13 @@ async def clan_panel_refresh():
             posted_at = float(raw_at or 0)
         except (TypeError, ValueError):
             posted_at = 0.0
-        if posted_at and time.time() - posted_at < \
-                CLAN_PANEL_REFRESH_HOURS * 3600:
-            return
+        fresh = (posted_at and time.time() - posted_at <
+                 CLAN_PANEL_REFRESH_HOURS * 3600)
+        if fresh:
+            raw_message = await seen_repo.get_flag(_PANEL_MESSAGE_FLAG)
+            if await _clan_panel_message_exists(channel, raw_message):
+                return
+            log("🔄 Панель заявки пропала из канала — публикую заново")
 
         status = await refresh_clan_panel(bot)
         if status == "панель обновлена":

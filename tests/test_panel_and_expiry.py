@@ -114,23 +114,27 @@ async def _set_created_at(user_id, when):
 # ============================================================
 # Панель: публикация и пересоздание
 # ============================================================
-def test_refresh_panel_without_publication():
-    """Если панель ни разу не публиковали — ничего не делаем."""
+def test_refresh_panel_autoposts_to_default_channel():
+    """Без !setup_clan панель публикуется в CLAN_PANEL_CHANNEL_ID сама."""
     async def scenario():
         await init_db()
         try:
-            await seen_repo.set_flag("clan_panel_channel", "")
-            bot = _FakeBot(_FakeChannel(555))
+            await _reset_panel_flags()
+            channel = _FakeChannel(botmod.CLAN_PANEL_CHANNEL_ID)
+            bot = _FakeBot(channel)
+
             status = await botmod.refresh_clan_panel(bot)
-            assert "не настроена" in status, status
-            assert "!setup_clan" in status, status
-            assert bot.channel.sent == []
+
+            assert status == "панель обновлена", status
+            assert len(channel.sent) == 1
+            assert await seen_repo.get_flag("clan_panel_channel") ==                 str(channel.id)
+            assert await seen_repo.get_flag("clan_panel_message")
         finally:
             await _reset_panel_flags()
             await close_db()
 
     asyncio.run(scenario())
-    print("  ok: панель без публикации не трогается")
+    print("  ok: панель сама публикуется в канал по умолчанию")
 
 
 def test_refresh_panel_replaces_message():
@@ -378,29 +382,27 @@ def test_refresh_panel_without_send_permission():
     print("  ok: без прав на отправку — понятный статус и без потери флагов")
 
 
-def test_panel_task_warns_when_not_configured(monkeypatch):
-    """Первый деплой без !setup_clan: предупреждение в лог, не чаще раза в 6 ч."""
+def test_panel_task_autoposts_without_setup(monkeypatch):
+    """Задача сама публикует панель, без ручного !setup_clan."""
     async def scenario():
         await init_db()
         try:
             await _reset_panel_flags()
             botmod._panel_alert_at.clear()
-            messages = []
-            monkeypatch.setattr(botmod, "log", messages.append)
+            channel = _FakeChannel(botmod.CLAN_PANEL_CHANNEL_ID)
+            monkeypatch.setattr(botmod, "bot", _FakeBot(channel))
 
             await botmod.clan_panel_refresh.coro()
-            assert any("!setup_clan" in m for m in messages), messages
 
-            count = len(messages)
-            await botmod.clan_panel_refresh.coro()
-            assert len(messages) == count, "повтор не должен спамить лог"
+            assert len(channel.sent) == 1
+            assert await seen_repo.get_flag("clan_panel_channel") ==                 str(channel.id)
         finally:
             botmod._panel_alert_at.clear()
             await _reset_panel_flags()
             await close_db()
 
     asyncio.run(scenario())
-    print("  ok: отсутствие настройки панели пишется в лог")
+    print("  ok: панель публикуется без настройки")
 
 
 def test_panel_task_reports_missing_channel(monkeypatch):
@@ -435,3 +437,111 @@ def test_parse_iso_utc():
     assert botmod._parse_iso_utc("") is None
     assert botmod._parse_iso_utc("вчера") is None
     print("  ok: разбор created_at")
+
+
+# ============================================================
+# Как в канале остаётся ровно одна панель
+# ============================================================
+class _Author:
+    def __init__(self, bot=True):
+        self.bot = bot
+
+
+class _OldPanelMessage:
+    def __init__(self, message_id, title=botmod.CLAN_PANEL_TITLE, bot=True):
+        self.id = message_id
+        self.author = _Author(bot)
+        self.embeds = [discord.Embed(title=title)]
+        self.components = []
+        self.deleted = False
+
+    async def delete(self):
+        self.deleted = True
+
+
+class _HistoryChannel(_FakeChannel):
+    def __init__(self, channel_id, messages=(), old_message=None):
+        super().__init__(channel_id, old_message=old_message)
+        self._history = list(messages)
+
+    def history(self, limit=50):
+        async def gen():
+            for message in self._history[:limit]:
+                yield message
+
+        return gen()
+
+
+def test_refresh_deletes_untracked_old_panels():
+    """Старая панель без записи в meta удаляется, остаётся одна новая."""
+    async def scenario():
+        await init_db()
+        try:
+            await _reset_panel_flags()
+            stale = _OldPanelMessage(404)
+            foreign = _OldPanelMessage(405, title="Другое сообщение")
+            channel = _HistoryChannel(botmod.CLAN_PANEL_CHANNEL_ID,
+                                      messages=[stale, foreign])
+            bot = _FakeBot(channel)
+
+            status = await botmod.refresh_clan_panel(bot)
+
+            assert status == "панель обновлена"
+            assert stale.deleted is True, "старая панель должна быть удалена"
+            assert foreign.deleted is False, "чужие сообщения не трогаем"
+            assert len(channel.sent) == 1
+        finally:
+            await _reset_panel_flags()
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: старые панели удаляются, чужие сообщения — нет")
+
+
+def test_panel_task_skips_fresh_panel(monkeypatch):
+    """Свежую панель на месте ежечасная задача не пересоздаёт."""
+    async def scenario():
+        await init_db()
+        try:
+            alive = _FakeMessage(777)
+            channel = _FakeChannel(botmod.CLAN_PANEL_CHANNEL_ID,
+                                   old_message=alive)
+            monkeypatch.setattr(botmod, "bot", _FakeBot(channel))
+            await _reset_panel_flags()
+            await seen_repo.set_flag("clan_panel_channel", str(channel.id))
+            await seen_repo.set_flag("clan_panel_message", "777")
+            await seen_repo.set_flag("clan_panel_at", str(botmod.time.time()))
+
+            await botmod.clan_panel_refresh.coro()
+
+            assert channel.sent == [], "свежую панель не трогаем"
+        finally:
+            await _reset_panel_flags()
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: свежая панель не пересоздаётся")
+
+
+def test_panel_task_republishes_missing_panel(monkeypatch):
+    """Свежая запись есть, а сообщение удалили — публикуем заново."""
+    async def scenario():
+        await init_db()
+        try:
+            channel = _FakeChannel(botmod.CLAN_PANEL_CHANNEL_ID,
+                                   old_message=None)  # fetch -> NotFound
+            monkeypatch.setattr(botmod, "bot", _FakeBot(channel))
+            await _reset_panel_flags()
+            await seen_repo.set_flag("clan_panel_channel", str(channel.id))
+            await seen_repo.set_flag("clan_panel_message", "888")
+            await seen_repo.set_flag("clan_panel_at", str(botmod.time.time()))
+
+            await botmod.clan_panel_refresh.coro()
+
+            assert len(channel.sent) == 1, "пропавшая панель возвращается"
+        finally:
+            await _reset_panel_flags()
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: пропавшая панель возвращается сразу")
