@@ -145,7 +145,7 @@ def test_only_expected_commands_are_public():
     и только потом добавьте её в ожидаемый набор.
     """
     expected = {"link", "unlink", "ping", "health", "lookup", "ask",
-                "rules", "search"}
+                "rules", "search", "help"}
     assert set(botmod.PUBLIC_COMMANDS) == expected
 
 

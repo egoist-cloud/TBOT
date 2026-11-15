@@ -3515,7 +3515,7 @@ class ClanView(discord.ui.View):
 # /check и /status остаются модераторскими: это статистика по заявкам,
 # которые модератор брал/решал, и она выдаётся через /give.
 PUBLIC_COMMANDS = {"link", "unlink", "ping", "health", "lookup", "ask",
-                   "rules", "search"}
+                   "rules", "search", "help"}
 
 # Команды, которые нельзя делегировать через /give: они управляют доступом
 # или меняют данные опаснее, чем обычная модерация. Проверка прав внутри
@@ -5798,6 +5798,120 @@ async def clan_info(i):
 # ============================================================
 # /ping
 # ============================================================
+# --- /help: короткие описания и разделы по реальным правам ---
+HELP_DESCRIPTIONS = {
+    "link": "привязать свой SteamID",
+    "unlink": "отвязать SteamID",
+    "lookup": "информация об игроке: SteamID, клан, активность",
+    "clan_info": "состав клана, роли и привязки",
+    "activity": "активность игрока на cs2red",
+    "rules": "правила клана",
+    "ask": "вопрос по правилам (ИИ)",
+    "ping": "проверить, что бот жив",
+    "help": "эта справка",
+    "search": "история заявок игрока в клан",
+    "check": "заявки, которые взял модератор",
+    "status": "статистика модератора по заявкам",
+    "check_bans": "баны и муты игрока",
+    "check_mutes": "муты игрока",
+    "check_all": "баны и муты у всех с ролью TALENT",
+    "check_onlineall": "недельный онлайн клана TALENT",
+    "check_clan": "роли клана у всех привязанных через /link",
+    "moders": "панель модераторов: права и приоритет",
+    "admins": "администраторы и модераторы клана",
+    "health": "состояние всех систем бота",
+    "player_info": "карточка игрока из базы",
+    "activity_show": "показать активность игрока",
+    "activity_all": "активность по роли",
+    "take": "забрать доступ модератора",
+    "give": "выдать доступ модератора",
+    "panel": "панель управления ботом",
+    "sync_all": "синхронизировать роли всех привязанных",
+    "auto_link": "авто-привязка по никам",
+    "link_all": "массовая привязка из базы",
+    "export_members": "выгрузить привязки в mass_links.json",
+    "admlink": "привязать SteamID другому игроку",
+    "clan_roleclear": "удалить роли кланов без участников",
+    "player_list": "вся база игроков",
+    "player_note": "заметка к профилю игрока",
+    "audit": "журнал админских действий",
+    "activity_set": "установить часы активности",
+    "activity_clear": "сбросить активность",
+    "ai_clear_cache": "очистить кэш ответов ИИ",
+}
+
+HELP_SECTION_TITLES = {
+    "player": "👤 Игроку",
+    "mod": "🛡 Модератору",
+    "admin": "⚙️ Админу",
+}
+
+
+def _help_command_section(cmd) -> str:
+    """Раздел справки по фактическим правам команды."""
+    if cmd.name in PUBLIC_COMMANDS:
+        return "player"
+    perms = getattr(cmd, "default_permissions", None)
+    if cmd.name in ADMIN_ONLY_COMMANDS or getattr(perms, "administrator", False):
+        return "admin"
+    return "mod"
+
+
+def _help_lines() -> dict:
+    """Строки справки по разделам (все команды дерева + текстовые)."""
+    out = {"player": [], "mod": [], "admin": []}
+    for cmd in sorted(bot.tree.get_commands(), key=lambda c: c.name):
+        desc = HELP_DESCRIPTIONS.get(cmd.name) or (cmd.description or "").strip()
+        out[_help_command_section(cmd)].append(f"`/{cmd.name}` — {desc}")
+    out["admin"].append("`!setup_clan` — первичная настройка клана (текст)")
+    return out
+
+
+def _split_field(lines: list, limit: int = 1000) -> list:
+    """Режет список строк на части под лимит поля Embed (1024)."""
+    chunks: list = []
+    cur = ""
+    for line in lines:
+        piece = line if not cur else "\n" + line
+        if cur and len(cur) + len(piece) > limit:
+            chunks.append(cur)
+            cur = line
+        else:
+            cur += piece
+    if cur:
+        chunks.append(cur)
+    return chunks or ["—"]
+
+
+def _build_help_embed() -> discord.Embed:
+    e = discord.Embed(
+        title="📖 Команды TBOT",
+        color=0x000000,
+        timestamp=now_utc(),
+        description=("Справка по разделам: что доступно игроку, модератору и админу.\n"
+                     "Модераторам доступны и команды игрока."),
+    )
+    lines = _help_lines()
+    for key in ("player", "mod", "admin"):
+        title = HELP_SECTION_TITLES[key]
+        for idx, chunk in enumerate(_split_field(lines[key])):
+            e.add_field(name=title if idx == 0 else f"{title} ({idx + 1})",
+                        value=chunk, inline=False)
+    e.add_field(
+        name="⌨️ Текстовые команды",
+        value=("`!setup_clan` — настройка клана (админ)\n"
+               "`!ask`, `!rules`, `!ai_clear_cache` — те же, что слэш-команды"),
+        inline=False,
+    )
+    e.set_footer(text="Quantum • /help")
+    return e
+
+
+@bot.tree.command(name="help", description="Список всех команд бота по разделам")
+async def help_command(i):
+    await i.response.send_message(embed=_build_help_embed(), ephemeral=True)
+
+
 @bot.tree.command(name="ping", description="Проверить, жив ли бот")
 async def ping(i):
     await i.response.defer(ephemeral=False)
