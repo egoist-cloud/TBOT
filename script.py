@@ -616,7 +616,8 @@ def _batch_embeds(embeds, limit: int = EMBED_MSG_LIMIT,
 # превращается в Container: заголовок, секции через Separator и строки
 # кнопок снизу. Карточки заявок остаются Embed'ами: они читают данные
 # из message.embeds при голосовании.
-V2_PANEL_ACCENT = 0x5865F2
+# Полоска слева у Components V2-контейнера: чёрная, как и остальные embed'ы.
+V2_PANEL_ACCENT = 0x000000
 V2_TEXT_LIMIT = 3900
 
 
@@ -7771,13 +7772,26 @@ def _build_clan_conditions_embed() -> discord.Embed:
                "После принятия есть 2 дня на вступление."),
         inline=False,
     )
+    if CLAN_QUESTIONS_ROLE_ID:
+        questions = f"Обратитесь к <@&{CLAN_QUESTIONS_ROLE_ID}>."
+    else:
+        questions = "Обратитесь к администрации."
     embed.add_field(
         name="💬 По вопросам вступления",
-        value="Обратитесь к администрации.",
+        value=questions,
         inline=False,
     )
     embed.set_footer(text=f"Quantum • {now_utc().strftime('%d.%m.%Y %H:%M')}")
     return embed
+
+
+def _clan_panel_mentions() -> discord.AllowedMentions | None:
+    """Разрешает пинг только роли вопросов, без @everyone и @here."""
+    if not CLAN_QUESTIONS_ROLE_ID:
+        return None
+    return discord.AllowedMentions(
+        everyone=False, users=False,
+        roles=[discord.Object(id=CLAN_QUESTIONS_ROLE_ID)])
 
 
 # ---------- панель условий: публикация и автообновление ----------
@@ -7790,6 +7804,8 @@ CLAN_PANEL_TITLE = "Официальные условия вступления �
 CLAN_PANEL_CHANNEL_ID = env_int("CLAN_PANEL_CHANNEL_ID", 1236678127778795660)
 # Раз в сколько часов пересоздавать панель (по умолчанию — сутки).
 CLAN_PANEL_REFRESH_HOURS = env_int("CLAN_PANEL_REFRESH_HOURS", 24)
+# Роль, которую тегаем в блоке «По вопросам вступления».
+CLAN_QUESTIONS_ROLE_ID = env_int("CLAN_QUESTIONS_ROLE_ID", 1113899288192356402)
 # Заявка без решения дольше этого срока закрывается автоматически — иначе
 # она навсегда блокирует игроку новую подачу (анти-дубликат в on_submit).
 APPLICATION_TTL_DAYS = env_int("APPLICATION_TTL_DAYS", 7)
@@ -7971,7 +7987,8 @@ async def refresh_clan_panel(bot) -> str:
 
     try:
         msg = await safe_send(channel, embed=_build_clan_conditions_embed(),
-                              view=ClanView())
+                              view=ClanView(),
+                              allowed_mentions=_clan_panel_mentions())
     except discord.Forbidden:
         return (f"нет прав на публикацию в канале {channel_id}: нужны "
                 f"Send Messages и Embed Links")
@@ -8079,7 +8096,8 @@ async def setup_clan(ctx):
                 log(f"⚠️ панель: не удалил прежнее сообщение: {e}")
         embed = _build_clan_conditions_embed()
         view = ClanView()
-        msg = await safe_send(ctx.channel, embed=embed, view=view)
+        msg = await safe_send(ctx.channel, embed=embed, view=view,
+                              allowed_mentions=_clan_panel_mentions())
         if msg is not None:
             await _save_clan_panel(ctx.channel.id, msg.id)
     except Exception as e:

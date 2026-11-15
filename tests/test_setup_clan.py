@@ -12,6 +12,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import script as botmod  # noqa: E402
+from quantum.db import close_db, init_db  # noqa: E402
 
 
 class _FakeMessage:
@@ -99,7 +100,9 @@ def test_conditions_embed_content():
     assert "в течение 7 дней" in important
     assert "2 дня на вступление" in important
 
-    assert fields["💬 По вопросам вступления"] == "Обратитесь к администрации."
+    questions = fields["💬 По вопросам вступления"]
+    assert f"<@&{botmod.CLAN_QUESTIONS_ROLE_ID}>" in questions, questions
+    assert "администрации" not in questions
     assert "Перед подачей заявки" in embed.description
     assert embed.footer.text.startswith("Quantum •"), embed.footer.text
     print("  ok: embed содержит все условия вступления")
@@ -121,9 +124,13 @@ def test_clan_view_has_select():
 def test_setup_clan_posts_message_with_view(monkeypatch):
     """Команда отправляет в канал embed + выпадающий список."""
     async def scenario():
-        ctx = _FakeCtx()
-        _patch_send(monkeypatch, ctx)
-        await botmod.setup_clan.callback(ctx)
+        await init_db()  # команда сохраняет id панели в meta
+        try:
+            ctx = _FakeCtx()
+            _patch_send(monkeypatch, ctx)
+            await botmod.setup_clan.callback(ctx)
+        finally:
+            await close_db()
         assert ctx.message.deleted, "команда должна удалять своё сообщение"
         assert ctx.channel.sent, "сообщение не отправлено"
         kwargs = ctx.channel.sent[0]
@@ -161,3 +168,21 @@ def test_setup_clan_only_in_guild(monkeypatch):
         print("  ok: вне сервера команда ничего не публикует")
 
     asyncio.run(scenario())
+
+
+def test_clan_panel_accent_is_black():
+    """Полоска у V2-панели чёрная, а не синяя."""
+    layout = botmod._v2_layout_from_embed(
+        botmod._build_clan_conditions_embed(), botmod.ClanView())
+    container = layout.children[0]
+
+    assert int(container.accent_colour) == 0x000000, container.accent_colour
+
+
+def test_clan_panel_allowed_mentions_only_role():
+    """Пинг разрешён только роли вопросов, не @everyone/@here."""
+    mentions = botmod._clan_panel_mentions()
+
+    assert mentions is not None
+    assert [r.id for r in mentions.roles] == [botmod.CLAN_QUESTIONS_ROLE_ID]
+    assert mentions.everyone is False
