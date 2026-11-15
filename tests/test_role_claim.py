@@ -227,3 +227,107 @@ def test_ensure_role_panel_publishes_once(monkeypatch):
     assert status == "панель уже на месте"
     assert len(channel.sent) == 1
     print("  ok: панель публикуется один раз")
+
+
+# ============================================================
+# Ровно одна панель в канале
+# ============================================================
+import discord  # noqa: E402
+
+
+class _PanelMessage:
+    def __init__(self, mid, title=botmod.ROLE_PANEL_TITLE):
+        self.id = mid
+        self.author = SimpleNamespace(bot=True)
+        self.embeds = [discord.Embed(title=title)]
+        self.components = []
+        self.deleted = False
+
+    async def delete(self):
+        self.deleted = True
+
+
+class _PanelChannel(_Channel):
+    def __init__(self, messages=()):
+        super().__init__()
+        self.messages = list(messages)
+
+    def history(self, limit=100):
+        async def gen():
+            for message in self.messages[:limit]:
+                yield message
+
+        return gen()
+
+    async def fetch_message(self, mid):
+        for message in self.messages:
+            if str(message.id) == str(mid):
+                return message
+        raise RuntimeError(f"unknown message {mid}")
+
+
+def _patch_flags(monkeypatch, flags):
+    async def get_flag(name):
+        return flags.get(name)
+
+    async def set_flag(name, value):
+        flags[name] = value
+
+    monkeypatch.setattr(botmod.seen_repo, "get_flag", get_flag)
+    monkeypatch.setattr(botmod.seen_repo, "set_flag", set_flag)
+
+
+def test_ensure_role_panel_removes_duplicates(monkeypatch):
+    """Три панели в канале — остаётся одна, лишние удаляются."""
+    panels = [_PanelMessage(mid) for mid in (101, 102, 103)]
+    channel = _PanelChannel(panels)
+    flags = {botmod.ROLE_PANEL_FLAG: "101"}
+    _patch_flags(monkeypatch, flags)
+    client = SimpleNamespace(get_channel=lambda _cid: channel)
+
+    status = asyncio.run(botmod.ensure_role_panel(client))
+
+    assert status == "панель уже на месте, удалено дублей: 2", status
+    assert panels[0].deleted is False
+    assert panels[1].deleted is True and panels[2].deleted is True
+    assert channel.sent == [], "новую панель не публикуем"
+    print("  ok: дубли панели ролей удаляются")
+
+
+def test_ensure_role_panel_adopts_existing_without_flag(monkeypatch):
+    """Флаг потерян, но панель в канале есть — усыновляем, не дублируем."""
+    panels = [_PanelMessage(mid) for mid in (201, 202)]
+    channel = _PanelChannel(panels)
+    flags = {}
+    _patch_flags(monkeypatch, flags)
+    client = SimpleNamespace(get_channel=lambda _cid: channel)
+
+    status = asyncio.run(botmod.ensure_role_panel(client))
+
+    assert status == "панель уже на месте, удалено дублей: 1", status
+    assert flags[botmod.ROLE_PANEL_FLAG] == "201"
+    assert channel.sent == []
+    assert panels[0].deleted is False and panels[1].deleted is True
+    print("  ok: потерянный флаг не создаёт вторую панель")
+
+
+def test_ensure_role_panel_skips_when_history_unreadable(monkeypatch):
+    """История недоступна и флага нет — лучше не публиковать, чем дублировать."""
+    class _NoHistory(_Channel):
+        def history(self, limit=100):
+            async def gen():
+                raise RuntimeError("missing access")
+                yield  # pragma: no cover
+
+            return gen()
+
+    channel = _NoHistory()
+    flags = {}
+    _patch_flags(monkeypatch, flags)
+    client = SimpleNamespace(get_channel=lambda _cid: channel)
+
+    status = asyncio.run(botmod.ensure_role_panel(client))
+
+    assert "нет доступа к истории" in status, status
+    assert channel.sent == []
+    print("  ok: без истории канала панель не дублируется")

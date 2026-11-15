@@ -9199,13 +9199,15 @@ async def _panel_guard(interaction) -> bool:
 # ============================================================
 ROLE_PANEL_CHANNEL_ID = env_int("ROLE_PANEL_CHANNEL_ID", 1556232762586046535)
 ROLE_PANEL_FLAG = "role_panel_message"
+ROLE_PANEL_TITLE = "🎭 Получить роль"
+ROLE_CLAIM_CUSTOM_ID = "role_claim_btn"
 ROLE_CLAIM_COOLDOWN_SECONDS = 60
 _ROLE_CLAIM_LAST: dict = {}
 
 
 def _role_panel_embed() -> discord.Embed:
     e = discord.Embed(
-        title="🎭 Получить роль",
+        title=ROLE_PANEL_TITLE,
         color=0x000000,
         description=("Нажми кнопку — бот найдёт тебя на cs2red по нику, "
                      "привяжет SteamID и выдаст роль сайта и роль клана."),
@@ -9256,7 +9258,7 @@ class RoleClaimView(discord.ui.View):
 
     @discord.ui.button(label="🎭 Получить роль",
                        style=discord.ButtonStyle.success,
-                       custom_id="role_claim_btn")
+                       custom_id=ROLE_CLAIM_CUSTOM_ID)
     async def claim(self, i, _button):
         await i.response.defer(ephemeral=True)
         guild = i.guild
@@ -9311,21 +9313,87 @@ class RoleClaimView(discord.ui.View):
                             ephemeral=True)
 
 
+def _has_role_claim_button(components) -> bool:
+    """Есть ли в компонентах кнопка «Получить роль» (в т.ч. внутри V2)."""
+    for comp in components or []:
+        if getattr(comp, "custom_id", None) == ROLE_CLAIM_CUSTOM_ID:
+            return True
+        if _has_role_claim_button(getattr(comp, "children", None)):
+            return True
+    return False
+
+
+def _is_role_panel(message) -> bool:
+    """Старая/новая панель ролей: Embed с заголовком или кнопка role_claim_btn."""
+    if not getattr(getattr(message, "author", None), "bot", False):
+        return False
+    for embed in getattr(message, "embeds", None) or []:
+        if (getattr(embed, "title", "") or "").strip() == ROLE_PANEL_TITLE:
+            return True
+    return _has_role_claim_button(getattr(message, "components", None))
+
+
+async def _role_panels_in_channel(channel):
+    """Все панели ролей в канале (последние 100 сообщений).
+
+    None — историю прочитать не удалось: публиковать новую вслепую нельзя,
+    иначе появятся дубли.
+    """
+    history = getattr(channel, "history", None)
+    if history is None:  # фейки в тестах и каналы без истории
+        return []
+    panels = []
+    try:
+        async for message in history(limit=100):
+            if _is_role_panel(message):
+                panels.append(message)
+    except discord.Forbidden:
+        log("⚠️ панель ролей: нет доступа к истории канала")
+        return None
+    except Exception as e:
+        log(f"⚠️ панель ролей: не прочитал историю: {type(e).__name__}: {e}")
+        return None
+    return panels
+
+
+async def _delete_role_panels(panels, keep_id=None) -> int:
+    """Удаляет лишние панели ролей, оставляя одну (keep_id)."""
+    deleted = 0
+    for message in panels or []:
+        if keep_id is not None and str(message.id) == str(keep_id):
+            continue
+        try:
+            await message.delete()
+            deleted += 1
+        except discord.NotFound:
+            pass
+        except Exception as e:
+            log(f"⚠️ панель ролей: не удалил дубль {message.id}: {e}")
+    return deleted
+
+
 async def ensure_role_panel(client) -> str:
-    """Публикует панель «Получить роль», если её ещё нет в канале."""
+    """В канале ровно одна панель «Получить роль».
+
+    Флаг с id мог потеряться (новая БД/очистка meta), и старый код в этом
+    случае публиковал ещё одну панель. Теперь сначала ищется живая панель:
+    она «усыновляется», а все дубли удаляются.
+    """
     channel = (client.get_channel(ROLE_PANEL_CHANNEL_ID)
                if ROLE_PANEL_CHANNEL_ID else None)
     if channel is None:
         return "канал не найден"
+
+    panels = await _role_panels_in_channel(channel)
+
     old_id = await seen_repo.get_flag(ROLE_PANEL_FLAG)
+    tracked = None
     if old_id:
         try:
-            await channel.fetch_message(int(old_id))
-            return "панель уже на месте"
+            tracked = await channel.fetch_message(int(old_id))
         except discord.NotFound:
-            pass  # сообщение удалили — публикуем заново
+            tracked = None  # сообщение удалили — панель вернём
         except discord.Forbidden:
-            # Нет доступа к истории: не публикуем вторую панель вслепую.
             log("⚠️ панель ролей: нет доступа к истории канала")
             return "нет доступа к истории канала — панель не проверена"
         except discord.HTTPException as e:
@@ -9334,6 +9402,25 @@ async def ensure_role_panel(client) -> str:
         except Exception as e:
             log(f"⚠️ панель ролей: {e}")
             return "не удалось проверить панель, попробуй позже"
+
+    if tracked is None and panels is None:
+        # Не знаем, есть ли панель: вторая панель хуже, чем никакой правки.
+        return "нет доступа к истории канала — панель не проверена"
+
+    if tracked is None and panels:
+        # Флаг потерян, но панель в канале есть: берём её, дубли убираем.
+        tracked = panels[0]
+        await seen_repo.set_flag(ROLE_PANEL_FLAG, str(tracked.id))
+
+    if tracked is not None:
+        removed = await _delete_role_panels(panels, keep_id=tracked.id)
+        await seen_repo.set_flag(ROLE_PANEL_FLAG, str(tracked.id))
+        if removed:
+            return f"панель уже на месте, удалено дублей: {removed}"
+        return "панель уже на месте"
+
+    # Панели нет — убираем всё похожее (старые версии, битые дубли) и шлём одну.
+    await _delete_role_panels(panels)
     msg = await safe_send(channel, embed=_role_panel_embed(),
                           view=RoleClaimView())
     if msg is None:
