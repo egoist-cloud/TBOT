@@ -3837,6 +3837,9 @@ class MyBot(commands.Bot):
 
             global ai_service
             ai_service = AIService(api.session, data_dir=str(DATA_DIR))
+            # Один загрузчик ai_project.md на проект: агент берёт контекст
+            # из AIService, а не ищет файл по своим путям.
+            agent.project_context = ai_service.project_context[:2000]
             n_providers = len(ai_service.providers)
             if n_providers == 0:
                 # Ключей нет — бот работает, но ИИ-команды сообщат о недоступности.
@@ -8602,40 +8605,30 @@ async def before_voice_stats_flush():
 # ============================================================
 AGENT_CHECK_MINUTES = env_int("AGENT_CHECK_MINUTES", 30)
 
-# Сводка по коду для идей агента: считается один раз за процесс.
-_CODE_OVERVIEW_CACHE: dict = {}
-_CODE_OVERVIEW_DIRS_SKIP = {"tests", "__pycache__", "venv", ".venv", "node_modules",
-                           ".git", "data", ".mypy_cache", ".pytest_cache"}
-
-
 def _code_overview() -> str:
-    """Краткая структура кода: файлы, размер, число команд — для промпта."""
-    cached = _CODE_OVERVIEW_CACHE.get("text")
-    if cached is not None:
-        return cached
+    """Краткая структура кода: файлы, размер, число команд — для промпта.
+
+    Без кэша: вызов один раз в 30 минут, а после правок на ходу (hot reload)
+    сводка должна отражать текущий код и список команд, а не первый запуск.
+    """
     root = Path(__file__).resolve().parent
+    paths = list(root.glob("*.py")) + list((root / "quantum").rglob("*.py"))
     files = []
-    try:
-        for path in root.rglob("*.py"):
-            rel = path.relative_to(root)
-            if any(part in _CODE_OVERVIEW_DIRS_SKIP for part in rel.parts):
-                continue
-            try:
-                with path.open(encoding="utf-8", errors="ignore") as fh:
-                    lines = sum(1 for _ in fh)
-            except OSError:
-                continue
-            files.append((rel.as_posix(), lines))
-    except Exception as e:
-        log(f"⚠️ code overview: {e}")
+    for path in paths:
+        if "__pycache__" in path.parts:
+            continue
+        try:
+            lines = len(path.read_text(encoding="utf-8", errors="ignore")
+                        .splitlines())
+        except OSError:
+            continue
+        files.append((path.relative_to(root).as_posix(), lines))
     total = sum(lines for _, lines in files)
     biggest = sorted(files, key=lambda item: -item[1])[:10]
     listing = ", ".join(f"{name} (~{lines})" for name, lines in biggest)
-    text = (f"Python-файлов: {len(files)}, всего ~{total} строк. "
+    return (f"Python-файлов: {len(files)}, всего ~{total} строк. "
             f"Крупнейшие: {listing}. "
-            f"Слэш-команд: {len(bot.tree.get_commands())}.")
-    _CODE_OVERVIEW_CACHE["text"] = text[:1200]
-    return _CODE_OVERVIEW_CACHE["text"]
+            f"Слэш-команд: {len(bot.tree.get_commands())}.")[:1200]
 
 
 def _agent_extra() -> dict:

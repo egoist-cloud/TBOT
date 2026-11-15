@@ -216,7 +216,8 @@ def test_idea_prompt_mentions_code_and_project():
     agent = _agent()
     agent.project_context = "Команда /profile показывает войс и сообщения."
     prompt = agent.build_idea_prompt(
-        {"links": 10}, [], "script.py (~9500), quantum/ai/service.py (~300)")
+        {"links": 10,
+         "code_overview": "script.py (~9500), quantum/ai/service.py (~300)"})
 
     assert "улучшению кода" in prompt
     assert "Структура кода" in prompt
@@ -248,7 +249,7 @@ def test_force_idea_posts_and_sets_schedule():
 def test_idea_prompt_rejects_repeat_ideas():
     """Уже предложенные идеи передаются в промпт как запрет на повтор."""
     prompt = _agent().build_idea_prompt(
-        {}, ["Добавить /admins", "Сделать отчёт"], "")
+        {}, ["Добавить /admins", "Сделать отчёт"])
     assert "Добавить /admins" in prompt
     assert "не повторяй" in prompt
 
@@ -348,3 +349,30 @@ def test_force_idea_goes_to_idea_channel():
 
     asyncio.run(scenario())
     print("  ok: ручная идея идёт в канал идей")
+
+
+def test_code_overview_is_not_cached_across_command_changes():
+    """Hot reload: сводка по коду видит новые команды, кэша нет."""
+    import discord
+
+    before = botmod._code_overview()
+    command = discord.app_commands.Command(
+        name="tmp_overview_probe", description="probe",
+        callback=lambda interaction: None)
+    botmod.bot.tree.add_command(command)
+    try:
+        after = botmod._code_overview()
+    finally:
+        botmod.bot.tree.remove_command("tmp_overview_probe")
+
+    assert "script.py" in before
+    assert "Слэш-команд" in before
+    assert after != before, "сводка закэширована и не увидит правки"
+    assert botmod._code_overview() == before, "после удаления команды — снова как было"
+    print("  ok: сводка по коду не кэшируется")
+
+
+def test_project_context_filled_from_ai_service():
+    """Агент берёт ai_project.md из AIService, своего загрузчика больше нет."""
+    assert Agent(_FakeBot(), 111).project_context == ""
+    assert not hasattr(agentmod, "load_project_context")

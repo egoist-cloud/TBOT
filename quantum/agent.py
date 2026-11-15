@@ -16,9 +16,7 @@ from __future__ import annotations
 import datetime
 import json
 import logging
-import os
 import time
-from pathlib import Path
 
 import discord
 
@@ -32,28 +30,6 @@ from .repositories import users as users_repo
 from .repositories import votes as votes_repo
 
 log = logging.getLogger("quantum.agent")
-
-
-def load_project_context() -> str:
-    """База знаний проекта (ai_project.md) для идей агента.
-
-    Ищем в DATA_DIR и в корне репозитория: на хостинге DATA_DIR может быть
-    отдельным томом, и файла там нет.
-    """
-    name = os.getenv("AI_PROJECT_FILE") or "ai_project.md"
-    path = Path(name)
-    if path.is_absolute():
-        candidates = [path]
-    else:
-        candidates = [Path(os.getenv("DATA_DIR", ".")) / name,
-                      Path(__file__).resolve().parents[1] / name]
-    for candidate in candidates:
-        try:
-            if candidate.is_file():
-                return candidate.read_text(encoding="utf-8").strip()[:2000]
-        except Exception as e:  # noqa: BLE001 - знания не должны ронять агента
-            log.warning("ai_project.md (%s): %s", candidate, e)
-    return ""
 
 # Канал агента и расписание (в минутах).
 AGENT_HEALTH_INTERVAL_MINUTES = env_int("AGENT_HEALTH_INTERVAL_MINUTES", 120)
@@ -105,7 +81,8 @@ class Agent:
         self.error_stats: dict[str, int] = {}
         self.started_at = time.time()
         # Факты о проекте: идеи должны быть про этот бот, а не абстрактные.
-        self.project_context = load_project_context()
+        # Заполняется в setup_hook из AIService (единый загрузчик файла).
+        self.project_context = ""
 
     # ------------------------------------------------------------
     # Служебное
@@ -251,14 +228,14 @@ class Agent:
                 return str(result), str(getattr(prov, "name", "?"))
         return "", ""
 
-    def build_idea_prompt(self, stats: dict, known: list | None = None,
-                          code_overview: str = "") -> str:
+    def build_idea_prompt(self, stats: dict, known: list | None = None) -> str:
         """Промпт для идеи по улучшению этого кода.
 
-        project_context и code_overview дают ИИ конкретику (команды, модули,
-        правила проекта), иначе ответы получаются общими.
+        project_context и stats["code_overview"] дают ИИ конкретику (команды,
+        модули, правила проекта), иначе ответы получаются общими.
         """
         known = ", ".join(known or []) or "—"
+        code_overview = str(stats.get("code_overview") or "")
         parts = [
             "Ты — ИИ-агент, который наблюдает за Discord-ботом игрового клуба "
             "TALENT (Python, discord.py) и предлагает, что улучшить в его коде.",
@@ -290,8 +267,7 @@ class Agent:
     async def build_idea_embed(self, providers, stats: dict):
         """Embed с идеей агента (None — если ИИ недоступен)."""
         known = await self.known_ideas()
-        prompt = self.build_idea_prompt(
-            stats, known, str(stats.get("code_overview") or ""))
+        prompt = self.build_idea_prompt(stats, known)
         text, provider = await self.ask_provider(providers, prompt)
         if not text:
             return None
@@ -336,14 +312,7 @@ class Agent:
         if (AGENT_IDEA_INTERVAL_MINUTES > 0
                 and now - await self._flag_time(_FLAG_IDEA) >=
                 AGENT_IDEA_INTERVAL_MINUTES * 60):
-            stats = await self.snapshot(extra)
-            embed = await self.build_idea_embed(providers, stats)
-            if embed is not None:
-                await self.post(embed, channel_id=self.idea_channel_id)
-                await self.remember_idea(embed.description or "")
-                # Флаг ставим только после успешной идеи: если все
-                # провайдеры были в паузе, попробуем в следующий цикл.
-                await seen_repo.set_flag(_FLAG_IDEA, str(now))
+            await self.force_idea(providers, extra)
 
     async def force_idea(self, providers, extra: dict | None = None):
         """Сгенерировать и опубликовать идею по запросу (без расписания)."""
