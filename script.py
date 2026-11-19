@@ -3791,8 +3791,11 @@ class ClanView(discord.ui.View):
 # ревьюеру (см. проверку target.id != i.user.id), а свою — всем.
 # /check и /status остаются модераторскими: это статистика по заявкам,
 # которые модератор брал/решал, и она выдаётся через /give.
-PUBLIC_COMMANDS = {"link", "unlink", "ping", "health", "lookup", "ask",
-                   "rules", "search", "help", "profile"}
+# /profile и /lookup тоже модераторские: они отдают SteamID, роли
+# на сайте и статистику любого участника — это чужие персональные
+# данные, а не публичная справка о боте.
+PUBLIC_COMMANDS = {"link", "unlink", "ping", "health", "ask",
+                   "rules", "search", "help"}
 
 # Команды, которые нельзя делегировать через /give: они управляют доступом
 # или меняют данные опаснее, чем обычная модерация. Проверка прав внутри
@@ -3809,7 +3812,8 @@ MODERATOR_COMMANDS = [
     "check", "check_all", "check_bans", "check_mutes", "check_clan",
     "check_onlineall", "activity_week", "activity", "activity_all",
     "activity_show",
-    "search", "player_info", "clan_info", "status", "admins", "moders",
+    "search", "lookup", "profile", "player_info", "clan_info", "status",
+    "admins", "moders",
 ]
 
 

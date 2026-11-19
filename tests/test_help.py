@@ -50,11 +50,15 @@ def test_help_sections_match_access():
         return any(line.startswith(f"`/{name}`") for line in lines[section])
 
     # Игроку: публичные команды
-    for name in ("link", "unlink", "lookup", "rules", "ask", "ping",
+    for name in ("link", "unlink", "rules", "ask", "ping",
                  "health", "help", "search"):
         assert has("player", name), f"{name} должна быть у игрока"
+    # PII-команды доступны не игроку: чужие SteamID и роли на сайте.
+    for name in ("lookup", "profile"):
+        assert not has("player", name), f"{name} не должна быть у игрока"
     # Модератору: проверки и заявки
-    for name in ("check", "status", "check_bans", "check_clan"):
+    for name in ("check", "status", "check_bans", "check_clan",
+                 "lookup", "profile"):
         assert has("mod", name), f"{name} должна быть у модератора"
     # Админу: служебные
     for name in ("panel", "sync_all", "auto_link", "clan_roleclear", "give", "audit"):

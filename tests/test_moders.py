@@ -119,10 +119,13 @@ def test_moders_panel_has_priority_and_cs2red_links(monkeypatch):
 
             names = [field.name for field in embed.fields]
             values = [field.value for field in embed.fields]
+            # Знаменатель берём из списка, а не числом: добавление
+            # модераторской команды не должно ломать тест панели.
+            total = len(botmod.MODERATOR_COMMANDS)
             assert any(name.startswith("👑 Full") for name in names)
-            assert "📊 16/16" in names
-            assert "📊 2/16" in names
-            assert "📊 0/16" in names
+            assert f"📊 {total}/{total}" in names
+            assert f"📊 2/{total}" in names
+            assert f"📊 0/{total}" in names
             assert any("Приоритет: **4/4**" in value for value in values)
             assert any("Приоритет: **1/4**" in value for value in values)
             assert any("Приоритет: **0/4**" in value for value in values)

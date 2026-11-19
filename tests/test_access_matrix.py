@@ -144,8 +144,8 @@ def test_only_expected_commands_are_public():
     сервера. Убедитесь, что она не ходит в cs2red и не меняет данные,
     и только потом добавьте её в ожидаемый набор.
     """
-    expected = {"link", "unlink", "ping", "health", "lookup", "ask",
-                "rules", "search", "help", "profile"}
+    expected = {"link", "unlink", "ping", "health", "ask",
+                "rules", "search", "help"}
     assert set(botmod.PUBLIC_COMMANDS) == expected
 
 
@@ -342,8 +342,20 @@ def test_search_is_public_for_ordinary_member():
     asyncio.run(scenario())
 
 
+def test_pii_commands_are_grantable():
+    """/profile и /lookup отдают чужие SteamID и роли — только модераторам.
+
+    Что обычный участник получает отказ, проверяет
+    test_ordinary_member_is_denied: GATED_COMMANDS — это MODERATOR_COMMANDS
+    минус PUBLIC_COMMANDS. Здесь остаётся только то, чего нет в других
+    тестах: команду должно быть можно выдать через /give.
+    """
+    for name in ("lookup", "profile"):
+        assert name in MODERATOR_COMMANDS, f"{name} нельзя выдать через /give"
+
+
 @pytest.mark.parametrize("command", ["ping", "health", "link", "unlink",
-                                     "lookup", "ask", "rules"])
+                                     "ask", "rules"])
 def test_public_commands_are_open_to_everyone(command):
     async def scenario():
         await init_db()
