@@ -6,7 +6,11 @@
 #   2) pytest — тесты: утечка cookie на сторонние хосты, маскирование
 #      секретов в логах, атомарность голосования, единый app_id заявки,
 #      миграции БД.
-#   3) docker build — Dockerfile собирается, а образ запускается:
+#   3) pip-audit — в requirements.txt нет пакетов с известными уязвимостями
+#      (CVE/GHSA из PyPI advisory и OSV).
+#   4) bandit — в коде нет очевидно опасных конструкций уровня medium+:
+#      shell=True, eval/exec, хардкод паролей, небезопасный random и т.п.
+#   5) docker build — Dockerfile собирается, а образ запускается:
 #      entrypoint отрабатывает, код бота импортируется, а пользователь bot
 #      может писать в /data на именованном volume (права тома).
 #      На изменениях только документации (*.md, docs/) образ не собирается.
@@ -28,7 +32,7 @@ concurrency:
 
 jobs:
   test:
-    name: ruff + pytest
+    name: ruff + pytest + security
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -86,6 +90,26 @@ jobs:
 
       - name: Ruff (lint)
         run: ruff check .
+
+      # Аудит зависимостей и статический анализ безопасности — отдельными
+      # шагами, чтобы в UI сразу было видно, что именно упало. --strict
+      # дополнительно валит шаг, если зависимости не резолвятся.
+      - name: pip-audit (dependency vulnerabilities)
+        run: |
+          set -eu
+          if ! pip-audit -r requirements.txt --strict --progress-spinner off; then
+            echo "::error::pip-audit нашёл уязвимые зависимости. Обновите пакет в requirements.txt до версии из отчёта (Fixed in) и запустите pip-audit локально."
+            exit 1
+          fi
+
+      - name: bandit (security lint)
+        run: |
+          set -eu
+          if ! bandit -r script.py quantum ai_rules.py github_sync.py \
+              -x tests,__pycache__ -ll; then
+            echo "::error::bandit нашёл потенциально опасный код (severity >= medium). Исправьте место из отчёта; если это ложное срабатывание — добавьте точечный # nosec BXXX с пояснением."
+            exit 1
+          fi
 
       - name: Pytest
         run: pytest -v

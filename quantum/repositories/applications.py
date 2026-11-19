@@ -192,7 +192,7 @@ async def list_pending_applications() -> list:
     db = await get_db()
     placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)
     cursor = await db.execute(
-        "SELECT user_id, status, clan_name, message_id, channel_id, app_id, "
+        "SELECT user_id, status, clan_name, message_id, channel_id, app_id, "  # nosec B608  # в запрос идут только "?"
         "taken_by, taken_at, created_at, updated_at FROM applications "
         f"WHERE status IN ({placeholders})", ACTIVE_STATUSES
     )
@@ -266,7 +266,7 @@ async def mark_application_taken(app_id, moderator_id) -> bool:
     # заявки с пустым app_id.
     for table in ("applications", "application_history"):
         sql = (
-            f"UPDATE {table} SET taken_by = ?, taken_at = ?, updated_at = ? "
+            f"UPDATE {table} SET taken_by = ?, taken_at = ?, updated_at = ? "  # nosec B608  # table из фиксированного кортежа
             f"WHERE app_id = ?"
         )
         params = (uid, now, now, app_key)
@@ -275,7 +275,7 @@ async def mark_application_taken(app_id, moderator_id) -> bool:
             updated = True
         else:
             cursor = await db.execute(
-                f"UPDATE {table} SET taken_by = ?, taken_at = ?, updated_at = ? "
+                f"UPDATE {table} SET taken_by = ?, taken_at = ?, updated_at = ? "  # nosec B608  # table из фиксированного кортежа
                 f"WHERE message_id = ?",
                 (uid, now, now, app_key),
             )
@@ -324,7 +324,7 @@ async def count_pending_applications() -> int:
     db = await get_db()
     placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)
     cursor = await db.execute(
-        f"SELECT COUNT(*) AS c FROM applications "
+        f"SELECT COUNT(*) AS c FROM applications "  # nosec B608  # в запрос идут только "?"
         f"WHERE status IN ({placeholders})", ACTIVE_STATUSES)
     row = await cursor.fetchone()
     await cursor.close()
@@ -393,7 +393,7 @@ async def get_user_stats(user_id) -> dict:
     # 3. Все заявки «в работе».
     placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)
     cursor = await db.execute(
-        f"SELECT user_id, message_id, app_id, clan_name, moderator_id, "
+        f"SELECT user_id, message_id, app_id, clan_name, moderator_id, "  # nosec B608  # в запрос идут только "?"
         f"taken_by, taken_at FROM applications "
         f"WHERE status IN ({placeholders})", ACTIVE_STATUSES)
     active = await cursor.fetchall()

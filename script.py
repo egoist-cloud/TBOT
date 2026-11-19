@@ -9934,7 +9934,9 @@ def flask_health():
 
 
 def run_health_server():
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
+    # 0.0.0.0 — health-эндпоинт должен быть доступен снаружи контейнера:
+    # его опрашивают Docker HEALTHCHECK и внешний монитор.
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))  # nosec B104
 
 
 # ============================================================

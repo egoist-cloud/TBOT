@@ -9,3 +9,11 @@ pytest>=8.0
 
 # Покрытие: pytest --cov=... (отчёт по модулям с непокрытыми строками)
 pytest-cov>=6.0
+
+# Аудит зависимостей: ищет известные уязвимости (CVE/GHSA) в requirements.txt.
+# Запускается в .github/workflows/ci.yml шагом «pip-audit».
+pip-audit>=2.10.1
+
+# Статический анализ безопасности кода (bandit).
+# Запускается в .github/workflows/ci.yml шагом «bandit».
+bandit>=1.9.4
