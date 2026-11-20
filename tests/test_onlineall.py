@@ -239,3 +239,129 @@ def test_safe_int_variants():
     assert botmod._safe_int(12.9) == 12
     assert botmod._safe_int(None, -1) == -1
     assert botmod._safe_int("abc", 5) == 5
+
+
+class _ActivityMember:
+    def __init__(self, member_id, name):
+        self.id = member_id
+        self.display_name = name
+        self.mention = f"<@{member_id}>"
+        self.bot = False
+
+
+class _ActivityRole:
+    def __init__(self, members):
+        self.members = members
+        self.mention = "@TALENT"
+
+
+class _ActivityGuild:
+    def __init__(self, role):
+        self.role = role
+
+    def get_role(self, _role_id):
+        return self.role
+
+
+class _ActivityResponse:
+    def __init__(self):
+        self.ephemeral = None
+
+    async def defer(self, ephemeral=False):
+        self.ephemeral = ephemeral
+
+    def is_done(self):
+        return self.ephemeral is not None
+
+
+class _ActivityFollowup:
+    async def send(self, *_args, **_kwargs):
+        return None
+
+
+class _ActivityInteraction:
+    def __init__(self, role):
+        self.response = _ActivityResponse()
+        self.followup = _ActivityFollowup()
+        self.guild = _ActivityGuild(role)
+        self.client = object()
+        self.edits = []
+
+    async def edit_original_response(self, content=None, **_kwargs):
+        self.edits.append(content)
+
+
+def test_collect_online_stats_marks_missing_week_as_unknown(monkeypatch):
+    """Пустой week.total — «нет данных», а не ложный ноль активности."""
+    import asyncio
+
+    member = _ActivityMember(1, "Игрок")
+
+    async def fake_link(_member_id):
+        return "76561198000000001"
+
+    async def fake_activity(_steam_id):
+        return {"week": {}}, ""
+
+    monkeypatch.setattr(botmod.links_repo, "get_link", fake_link)
+    monkeypatch.setattr(botmod.api, "cs2red_activity", fake_activity)
+    monkeypatch.setattr(botmod, "BLOCK_CHECK_DELAY", 0)
+
+    rows, low, no_link, errors, checked = asyncio.run(
+        botmod.collect_online_stats([member]))
+
+    assert rows == [] and low == [] and no_link == []
+    assert checked == 0
+    assert errors == [(member, "нет данных активности")]
+
+
+# ============================================================
+# /online — кто сейчас на серверах, со ссылками на профили
+# ============================================================
+def test_online_command_registered():
+    """/online зарегистрирована, описание на русском."""
+    cmd = botmod.bot.tree.get_command("online")
+    assert cmd is not None, "/online не зарегистрирован"
+    assert "онлайн" in cmd.description.lower()
+    assert "online" in botmod.MODERATOR_COMMANDS
+
+
+def test_build_online_embed_links_profiles():
+    """В отчёте «сейчас онлайн» ник ведёт на профиль cs2red."""
+    from types import SimpleNamespace
+
+    member = SimpleNamespace(id=1, display_name="Игрок", mention="<@1>")
+    embed = botmod._build_online_embed(
+        [(member, "76561198000000001", "Miki", 1800.0)], 5, [])
+
+    text = " ".join(f.value for f in embed.fields)
+    assert "https://cs2red.ru/profile/76561198000000001" in text
+    assert "Miki" in text
+    assert "30 м." in text
+    assert "Никого" not in text
+
+
+def test_build_online_embed_empty_and_errors():
+    """Никого нет — понятный текст; ошибки не ломают embed."""
+    embed = botmod._build_online_embed([], 3, ["Игрок: не узнал ник"])
+    fields = {f.name: f.value for f in embed.fields}
+    assert "Никого" in fields["Сейчас играют"]
+    assert "не узнал ник" in fields["⚠️ Не удалось проверить"]
+
+
+def test_onlineall_embed_shows_profile_links():
+    """Недельный отчёт тоже показывает профили обеих групп."""
+    from types import SimpleNamespace
+
+    member = SimpleNamespace(id=2, display_name="Игрок", mention="<@2>")
+    good = {"nick": "Miki", "steam_id": "76561198000000002",
+            "week": {"total": 12.0}, "prev": {"total": 3.0}}
+    low = {"nick": "Low", "steam_id": "76561198000000003",
+           "week": {"total": 2.0}, "prev": {"total": 1.0}}
+    embed = botmod._build_onlineall_embed(
+        [(member, good)], [(member, low)], [], [], 2, 2)
+
+    fields = {f.name: f.value for f in embed.fields}
+    assert "https://cs2red.ru/profile/76561198000000002" in fields["✅ В норме"]
+    assert "https://cs2red.ru/profile/76561198000000003" in \
+        fields["⚠️ Малоактивные"]

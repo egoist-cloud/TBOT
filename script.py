@@ -3849,7 +3849,8 @@ ADMIN_ONLY_COMMANDS = {
 # Команды, которые админ может выдать модератору. Порядок = порядок в меню.
 MODERATOR_COMMANDS = [
     "check", "check_all", "check_bans", "check_mutes", "check_clan",
-    "check_onlineall", "activity_week", "activity", "activity_all",
+    "check_onlineall", "online", "activity_week", "activity",
+    "activity_all",
     "activity_show",
     "search", "lookup", "profile", "player_info", "clan_info", "status",
     "admins", "moders",
@@ -5678,6 +5679,27 @@ def _fmt_hours(value) -> str:
     return f"{value:.1f} ч."
 
 
+def _profile_url(steam_id) -> str:
+    """Ссылка на профиль cs2red по SteamID или пустая строка."""
+    sid = str(steam_id or "").strip()
+    return f"https://cs2red.ru/profile/{sid}" if sid.isdigit() else ""
+
+
+def _safe_nick(nick) -> str:
+    """Ник без символов, которые ломают markdown-ссылку Discord."""
+    return str(nick or "").replace("[", "(").replace("]", ")")
+
+
+def _player_label(member, data) -> str:
+    """Ник игрока ссылкой на его профиль cs2red, если SteamID известен."""
+    data = data if isinstance(data, dict) else {}
+    url = _profile_url(data.get("steam_id"))
+    if not url:
+        return member.display_name
+    nick = _safe_nick(data.get("nick") or member.display_name)
+    return f"[{nick}]({url})"
+
+
 def _build_onlineall_embed(rows: list, low: list, no_link: list,
                            errors: list, checked: int, total: int) -> discord.Embed:
     """Собирает embed отчёта о недельном онлайне участников клана.
@@ -5700,8 +5722,10 @@ def _build_onlineall_embed(rows: list, low: list, no_link: list,
             p = (data.get("prev") or {}).get("total")
             o = (data.get("week") or {}).get("observer")
             obs = f", наблюд. {_fmt_hours(o)}" if o else ""
+            url = _profile_url(data.get("steam_id"))
+            link = f" · [профиль]({url})" if url else ""
             lines.append(f"• {m.mention} — сейчас {_fmt_hours(w)}, "
-                         f"прошлая {_fmt_hours(p)}{obs}")
+                         f"прошлая {_fmt_hours(p)}{obs}{link}")
         if len(low) > CHECK_ALL_MAX_MEMBERS:
             lines.append(f"…и ещё {len(low) - CHECK_ALL_MAX_MEMBERS}")
         embed.add_field(name="⚠️ Малоактивные", value="\n".join(lines)[:1024],
@@ -5718,7 +5742,7 @@ def _build_onlineall_embed(rows: list, low: list, no_link: list,
             p = (data.get("prev") or {}).get("total")
             o = (data.get("week") or {}).get("observer")
             obs = f", наблюд. {_fmt_hours(o)}" if o else ""
-            lines.append(f"• {m.display_name} — {_fmt_hours(w)} "
+            lines.append(f"• {_player_label(m, data)} — {_fmt_hours(w)} "
                          f"(прошлая {_fmt_hours(p)}{obs})")
         if len(rows) > CHECK_ALL_MAX_MEMBERS:
             lines.append(f"…и ещё {len(rows) - CHECK_ALL_MAX_MEMBERS}")
@@ -5737,11 +5761,29 @@ def _build_onlineall_embed(rows: list, low: list, no_link: list,
     return embed
 
 
+def _week_total_hours(data) -> float | None:
+    """Часы текущей недели из ответа cs2red; None — данных нет.
+
+    Не подставляем 0.0: отсутствие недельного значения — это не «не играет»,
+    а неизвестный результат, который должен попасть в «нет данных».
+    """
+    if not isinstance(data, dict):
+        return None
+    week = data.get("week")
+    if not isinstance(week, dict):
+        return None
+    try:
+        return float(week.get("total"))
+    except (TypeError, ValueError):
+        return None
+
+
 async def collect_online_stats(members: list, progress=None):
     """Обходит участников и собирает их недельный онлайн.
 
     Возвращает ``(rows, low, no_link, errors, checked)``. Пауза
-    ``BLOCK_CHECK_DELAY`` между игроками — требование cs2red.
+    ``BLOCK_CHECK_DELAY`` между игроками — требование cs2red. Ответ без
+    недельного значения попадает в ``errors``, а не в нулевую активность.
     """
     rows, low, no_link, errors = [], [], [], []
     checked = 0
@@ -5756,17 +5798,22 @@ async def collect_online_stats(members: list, progress=None):
                 if err:
                     errors.append((m, err))
                 else:
-                    checked += 1
-                    week = (data.get("week") or {}).get("total")
-                    if week is not None and week < ONLINE_MIN_HOURS:
-                        low.append((m, data))
+                    hours = _week_total_hours(data)
+                    if hours is None:
+                        errors.append((m, "нет данных активности"))
                     else:
-                        rows.append((m, data))
+                        # SteamID нужен отчёту для ссылки на профиль.
+                        data["steam_id"] = str(sid)
+                        checked += 1
+                        if hours < ONLINE_MIN_HOURS:
+                            low.append((m, data))
+                        else:
+                            rows.append((m, data))
             except asyncio.TimeoutError:
                 errors.append((m, "таймаут"))
             except Exception as e:
                 errors.append((m, str(e)[:80]))
-                await log_error(bot, f"/check_onlineall:{m.id}", e)
+                await log_error(bot, f"collect_online_stats:{m.id}", e)
 
         if progress:
             try:
@@ -5845,6 +5892,117 @@ async def check_onlineall(i):
         await log_error(i.client, "/check_onlineall", e)
         try:
             await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}", ephemeral=True)
+        except Exception:
+            pass
+
+
+def _build_online_embed(rows: list, total: int, errors: list) -> discord.Embed:
+    """Embed «кто сейчас онлайн»: ник — ссылкой на профиль cs2red."""
+    embed = discord.Embed(
+        title=f"🟢 Онлайн сейчас — клан «{CLAN_NAME}»",
+        color=0x000000, timestamp=now_utc())
+    embed.add_field(name="👥 В клане", value=str(total), inline=True)
+    embed.add_field(name="🟢 На сервере", value=str(len(rows)), inline=True)
+    if rows:
+        lines = []
+        for _m, sid, nick, secs in rows[:CHECK_ALL_MAX_MEMBERS]:
+            lines.append(f"• [{_safe_nick(nick)}]({_profile_url(sid)}) — "
+                         f"{_fmt_hours(secs / 3600)} на сервере")
+        if len(rows) > CHECK_ALL_MAX_MEMBERS:
+            lines.append(f"…и ещё {len(rows) - CHECK_ALL_MAX_MEMBERS}")
+        embed.add_field(name="Сейчас играют", value="\n".join(lines)[:1024],
+                        inline=False)
+    else:
+        embed.add_field(name="Сейчас играют",
+                        value="Никого из клана на серверах нет.",
+                        inline=False)
+    if errors:
+        embed.add_field(name="⚠️ Не удалось проверить",
+                        value="\n".join(f"• {txt}" for txt in errors[:10])[:1024],
+                        inline=False)
+    embed.set_footer(text=f"Quantum • {utc_stamp()}")
+    return embed
+
+
+@bot.tree.command(name="online",
+                  description="Кто из клана TALENT сейчас онлайн на серверах (с профилями)")
+@single_flight("online", "⏳ /online уже выполняется. Подождите.")
+async def online(i):
+    """Кто из клана сейчас на серверах cs2red, со ссылками на профили.
+
+    Ники и время на сервере берём из ``/api/data/servers`` — тот же
+    источник, что у трекера активности. SteamID участника один: из
+    привязки `/link`, поэтому у каждого онлайн-игрока видна кликабельная
+    ссылка на профиль. Ответ ephemeral.
+    """
+    await i.response.defer(ephemeral=True)
+    try:
+        guild = i.guild
+        if guild is None:
+            await safe_send(i.followup,
+                            "❌ Команда работает только на сервере.",
+                            ephemeral=True)
+            return
+        if not CS2RED_COOKIES:
+            await safe_send(i.followup,
+                            "❌ Нет cookie cs2red (CS2RED_COOKIE_STRING) — "
+                            "список серверов недоступен.", ephemeral=True)
+            return
+        members = _talent_members(guild)
+        if not members:
+            await safe_send(i.followup,
+                            f"ℹ️ Нет участников с ролью «{CLAN_NAME}».",
+                            ephemeral=True)
+            return
+        if api.is_blocked():
+            await safe_send(i.followup,
+                            "⏳ cs2red временно ограничил запросы — "
+                            "попробуй через 5 минут.", ephemeral=True)
+            return
+        times = await api.server_times()
+        if not times:
+            await safe_send(i.followup,
+                            "⚠️ cs2red не вернул список серверов: сейчас "
+                            "никого нет или профиль сайта недоступен.",
+                            ephemeral=True)
+            return
+
+        players = await players_repo.get_all_players()
+        nick_by_steam = {}
+        for sid, profile in (players or {}).items():
+            if isinstance(profile, dict) and profile.get("cs2red_nick"):
+                nick_by_steam[str(sid)] = str(profile["cs2red_nick"])
+
+        rows, errors = [], []
+        for m in members:
+            sid = await links_repo.get_link(m.id)
+            if not sid:
+                continue
+            sid = str(sid)
+            nick = nick_by_steam.get(sid)
+            if not nick:
+                # В базе игроков ника ещё нет — спрашиваем профиль (кэш 1 мин).
+                user = await api.cs2red_user(sid)
+                if user and user.get("nick"):
+                    nick = str(user["nick"])
+                    nick_by_steam[sid] = nick
+            if not nick:
+                errors.append(f"{m.display_name}: не узнал ник на cs2red")
+                continue
+            secs = times.get(nick)
+            if secs is None:
+                continue
+            rows.append((m, sid, nick, float(secs or 0)))
+        rows.sort(key=lambda row: row[3], reverse=True)
+
+        await safe_send(i.followup,
+                        embed=_build_online_embed(rows, len(members), errors),
+                        ephemeral=True)
+    except Exception as e:
+        await log_error(i.client, "/online", e)
+        try:
+            await safe_send(i.followup, f"❌ Ошибка: {str(e)[:200]}",
+                            ephemeral=True)
         except Exception:
             pass
 
@@ -6568,6 +6726,7 @@ HELP_DESCRIPTIONS = {
     "check_mutes": "муты игрока",
     "check_all": "баны и муты у всех с ролью TALENT",
     "check_onlineall": "недельный онлайн клана TALENT",
+    "online": "кто из клана сейчас на серверах (с профилями)",
     "activity_week": "недельный отчёт: топ, малоактивные, две недели подряд",
     "check_clan": "роли клана у всех привязанных через /link",
     "moders": "панель модераторов: права и приоритет",
