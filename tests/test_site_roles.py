@@ -160,3 +160,50 @@ def test_sync_no_manage_roles_does_not_create(monkeypatch):
     assert guild.created == []
     assert "не удалось" in res
     print("  ok: без Manage Roles роль не создаётся")
+
+
+# ============================================================
+# Роль с сайта не снимается, когда данных не хватает
+# ============================================================
+def test_sync_keeps_role_when_roleid_missing(monkeypatch):
+    """В ответе cs2red нет roleId — роль не трогаем."""
+    _patch(monkeypatch, {})
+    held = _Role("Модератор", rid=77)
+    guild = _Guild([held])
+    member = _Member([held])
+
+    res = asyncio.run(botmod.sync_role_by_id(
+        guild, member, "76561198000000001", user={"id": 7}))
+
+    assert "нет roleId" in res, res
+    assert member.removed == []
+    assert held in member.roles
+
+
+def test_sync_keeps_role_for_unknown_roleid(monkeypatch):
+    """roleId есть, но названия бот не знает — снимать нельзя."""
+    _patch(monkeypatch, {})
+    held = _Role("Модератор", rid=77)
+    guild = _Guild([held])
+    member = _Member([held])
+
+    res = asyncio.run(botmod.sync_role_by_id(
+        guild, member, "76561198000000001", user={"id": 7, "roleId": 4242}))
+
+    assert "неизвестна" in res, res
+    assert member.removed == []
+    assert held in member.roles
+
+
+def test_sync_removes_role_when_site_has_nothing(monkeypatch):
+    """roleId=0 — на сайте роли нет, старое поведение сохраняется."""
+    _patch(monkeypatch, {})
+    held = _Role("VIP", rid=77)
+    guild = _Guild([held])
+    member = _Member([held])
+
+    res = asyncio.run(botmod.sync_role_by_id(
+        guild, member, "76561198000000001", user={"id": 7, "roleId": 0}))
+
+    assert "сняты" in res, res
+    assert held not in member.roles

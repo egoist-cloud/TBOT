@@ -175,6 +175,7 @@ def test_auto_remove_role_when_left_clan(monkeypatch):
     old_role = _FakeRole(555, "OldClan", position=3)
     guild = _FakeGuild([old_role])
     member = _FakeMember(111222333, [old_role])
+    monkeypatch.setattr(botmod, "CLAN_ROLE_REMOVE_CONFIRMATIONS", 1)
 
     botmod._remember_member_clan_role(member.id, old_role.id)
     _fake_api(monkeypatch, [{"id": 1, "name": "OldClan",
@@ -192,6 +193,7 @@ def test_auto_remove_role_by_stored_id(monkeypatch):
     old_role = _FakeRole(777, "RenamedClan", position=3)
     guild = _FakeGuild([old_role])
     member = _FakeMember(444555666, [old_role])
+    monkeypatch.setattr(botmod, "CLAN_ROLE_REMOVE_CONFIRMATIONS", 1)
 
     botmod._remember_member_clan_role(member.id, old_role.id)
     _fake_api(monkeypatch, [{"id": 2, "name": "ДругойКлан",
@@ -207,6 +209,7 @@ def test_auto_remove_reports_hierarchy(monkeypatch):
     high_role = _FakeRole(888, "HighClan", position=12)
     guild = _FakeGuild([high_role], me_top=10)
     member = _FakeMember(777888999, [high_role])
+    monkeypatch.setattr(botmod, "CLAN_ROLE_REMOVE_CONFIRMATIONS", 1)
 
     _fake_api(monkeypatch, [{"id": 3, "name": "HighClan",
                              "members": [{"userId": 99}]}])
@@ -224,6 +227,7 @@ def test_auto_remove_succeeds_for_low_role_even_if_high_stays(monkeypatch):
     low_role = _FakeRole(889, "LowClan", position=3)
     guild = _FakeGuild([high_role, low_role], me_top=10)
     member = _FakeMember(777888990, [high_role, low_role])
+    monkeypatch.setattr(botmod, "CLAN_ROLE_REMOVE_CONFIRMATIONS", 1)
 
     # Низкая роль известна боту (запомнена при прошлой синхронизации).
     botmod._remember_clan_role_name("LowClan")
@@ -369,3 +373,49 @@ def test_normalize_block_explicit_false_is_inactive():
          "action": {"steamid64": STEAM, "nick": "Miki"}},
         "Бан", from_admin=True)
     assert block["active"] is False
+
+
+# ============================================================
+# Роль не снимается без подтверждения
+# ============================================================
+def test_clan_role_kept_on_first_miss_and_removed_on_second(monkeypatch):
+    """Один неполный ответ /api/clans не снимает роль клана."""
+    old_role = _FakeRole(901, "OldClan", position=3)
+    guild = _FakeGuild([old_role])
+    member = _FakeMember(121212121, [old_role])
+
+    botmod._remember_clan_role_name("OldClan")
+    botmod._CLAN_MISS_COUNTS.pop(member.id, None)
+    monkeypatch.setattr(botmod, "CLAN_ROLE_REMOVE_CONFIRMATIONS", 2)
+    _fake_api(monkeypatch, [{"id": 1, "name": "OldClan",
+                             "members": [{"userId": 99}]}])
+
+    first = asyncio.run(botmod.sync_clan_role_by_id(guild, member, STEAM))
+    assert old_role in member.roles, first
+    assert "не найден" in first, first
+
+    second = asyncio.run(botmod.sync_clan_role_by_id(guild, member, STEAM))
+    assert old_role not in member.roles, second
+    assert "клан снят" in second, second
+    assert botmod._CLAN_MISS_COUNTS.get(member.id) is None
+
+
+def test_clan_role_miss_counter_resets_when_player_found(monkeypatch):
+    """Игрок снова в составе — счётчик промахов обнуляется."""
+    role = _FakeRole(902, "OldClan", position=3)
+    guild = _FakeGuild([role])
+    member = _FakeMember(131313131, [role])
+
+    botmod._remember_clan_role_name("OldClan")
+    monkeypatch.setattr(botmod, "CLAN_ROLE_REMOVE_CONFIRMATIONS", 2)
+    _fake_api(monkeypatch, [{"id": 1, "name": "OldClan",
+                             "members": [{"userId": 99}]}])
+    asyncio.run(botmod.sync_clan_role_by_id(guild, member, STEAM))
+    assert botmod._CLAN_MISS_COUNTS.get(member.id) == 1
+
+    botmod._CLAN_MISS_COUNTS[member.id] = 1
+    _fake_api(monkeypatch, [{"id": 1, "name": "OldClan",
+                             "members": [{"userId": 7}]}])
+    asyncio.run(botmod.sync_clan_role_by_id(guild, member, STEAM))
+    assert botmod._CLAN_MISS_COUNTS.get(member.id) is None
+    assert role in member.roles

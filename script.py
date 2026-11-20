@@ -2376,7 +2376,7 @@ async def resolve_site_role_name(role_id) -> str | None:
     rid = _role_id_int(role_id)
     if rid is None or rid <= 0:
         return None
-    names = await api.cs2red_roles()
+    names = await api.cs2red_roles() or {}
     if rid in names:
         return names[rid]
     return site_role_name(rid)
@@ -2424,17 +2424,32 @@ async def sync_role_by_id(guild, member, steam_id, user: dict | None = None):
         return f"⚠️ {member.display_name}: не найден на cs2red, роль не тронута"
     if not user.get("id"):
         return f"⚠️ {member.display_name}: некорректный ответ cs2red, роль не тронута"
+    if "roleId" not in user:
+        # Частичный ответ cs2red (без поля роли): решать нечего, не снимаем.
+        return (f"⚠️ {member.display_name}: в ответе cs2red нет roleId, "
+                "роль не тронута")
     role_id = user.get("roleId")
     tn = await resolve_site_role_name(role_id)
-    managed = {n for n in ROLE_MAP.values() if n} | _load_site_role_names()
+    site_names = await api.cs2red_roles()
+    # В managed — все известные названия ролей сайта, иначе чужая старая
+    # роль (например, «Куратор» вместо «Модератор») могла не сняться.
+    managed = ({n for n in ROLE_MAP.values() if n}
+               | set((site_names or {}).values())
+               | _load_site_role_names())
     cur = {r for r in member.roles if r.name in managed}
 
     if tn is None:
         rid = _role_id_int(role_id)
-        if rid and rid not in _WARNED_SITE_ROLE_IDS:
-            _WARNED_SITE_ROLE_IDS.add(rid)
-            log(f"⚠️ roleId={rid} нет в списке ролей cs2red — добавьте в "
-                f'SITE_ROLE_NAMES, например {{"{rid}": "Куратор"}}')
+        if rid and rid > 0:
+            # Роль на сайте есть, но как она называется — неизвестно.
+            # Снимать нельзя: при новом roleId у людей пропадала роль
+            # без выдачи новой, то есть «просто так».
+            if rid not in _WARNED_SITE_ROLE_IDS:
+                _WARNED_SITE_ROLE_IDS.add(rid)
+                log(f"⚠️ roleId={rid} нет в списке ролей cs2red — добавьте в "
+                    f'SITE_ROLE_NAMES, например {{"{rid}": "Куратор"}}')
+            return (f"⚠️ {member.display_name}: роль сайта id={rid} "
+                    "неизвестна, роль не тронута")
         if cur:
             for r in cur:
                 try:
@@ -2450,6 +2465,7 @@ async def sync_role_by_id(guild, member, steam_id, user: dict | None = None):
         target = await _ensure_site_role(guild, tn)
     if target is None:
         return f"⚠️ роль '{tn}' не найдена и создать не удалось"
+    _remember_site_role_name(tn)
     _remember_bot_role(target, "site")
 
     if cur == {target}:
@@ -2477,6 +2493,14 @@ CLAN_ROLES_FILE = "clan_roles.json"
 CLAN_ROLE_CLEANUP_ENABLED = env_int("CLAN_ROLE_CLEANUP", 1) != 0
 # Период автоочистки пустых ролей кланов, часы (10 по умолчанию).
 CLAN_ROLE_CLEANUP_HOURS = env_int("CLAN_ROLE_CLEANUP_HOURS", 10)
+# Сколько проверок подряд «игрока нет в составе клана» нужно, прежде чем
+# снять роль клана. 1 — снимать сразу (старое поведение), 2 — защита от
+# неполного ответа /api/clans: иначе роль пропадала «просто так».
+CLAN_ROLE_REMOVE_CONFIRMATIONS = max(
+    1, env_int("CLAN_ROLE_REMOVE_CONFIRMATIONS", 2))
+# Счётчики промахов по участникам (в памяти). Сбрасываются, как только
+# игрок снова найден в составе клана.
+_CLAN_MISS_COUNTS: dict = {}
 
 
 def _load_clan_role_names() -> set:
@@ -2920,6 +2944,15 @@ async def sync_clan_role_by_id(guild, member, steam_id, user: dict | None = None
         held = [r for r in member.roles
                 if r.id in managed_ids or r.name in known_names]
         if held:
+            # Один промах может быть неполным ответом /api/clans. Роль
+            # снимаем только после CLAN_ROLE_REMOVE_CONFIRMATIONS проверок.
+            misses = _CLAN_MISS_COUNTS.get(member.id, 0) + 1
+            _CLAN_MISS_COUNTS[member.id] = misses
+            need = CLAN_ROLE_REMOVE_CONFIRMATIONS
+            if misses < need:
+                return (f"⏳ {member.display_name}: в составе клана не найден "
+                        f"({misses}/{need}) — роль пока оставлена")
+            _CLAN_MISS_COUNTS.pop(member.id, None)
             above = _clan_roles_above_bot(guild, held)
             # Снимаем всё, что ниже роли бота, даже если часть ролей выше:
             # иначе одна «высокая» роль блокировала бы всю очистку.
@@ -2935,9 +2968,11 @@ async def sync_clan_role_by_id(guild, member, steam_id, user: dict | None = None
                 return "⚠️ клан снят не полностью: " + "; ".join(errors)
             _forget_member_clan_role(member.id)
             return "🔄 клан снят"
+        _CLAN_MISS_COUNTS.pop(member.id, None)
         _forget_member_clan_role(member.id)  # запись без роли — чистим
         return "ℹ️ без клана"
 
+    _CLAN_MISS_COUNTS.pop(member.id, None)  # игрок снова в составе
     clan_name = (clan.get("clan_name") or "").strip()
     if not clan_name:
         return "ℹ️ клан без имени"

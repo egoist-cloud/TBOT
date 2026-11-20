@@ -312,6 +312,7 @@ def test_leaving_clan_via_sync_deletes_role(monkeypatch):
     monkeypatch.setattr(botmod, "_load_clan_role_names", lambda: {"123"})
     monkeypatch.setattr(botmod, "_load_clan_members", lambda: {})
     monkeypatch.setattr(botmod, "_forget_member_clan_role", lambda mid: None)
+    monkeypatch.setattr(botmod, "CLAN_ROLE_REMOVE_CONFIRMATIONS", 1)
 
     res = asyncio.run(botmod.sync_clan_role_by_id(
         guild, member, "76561198000000001", user={"id": 7}))
