@@ -186,3 +186,39 @@ def test_clan_panel_allowed_mentions_only_role():
     assert mentions is not None
     assert [r.id for r in mentions.roles] == [botmod.CLAN_QUESTIONS_ROLE_ID]
     assert mentions.everyone is False
+
+
+def _questions_text(embed) -> str:
+    return {f.name: f.value for f in embed.fields}["💬 По вопросам вступления"]
+
+
+def test_clan_panel_defaults_are_role_and_38_hours():
+    """Контакт — настоящая роль, а панель пересоздаётся раз в 38 часов."""
+    assert botmod.CLAN_QUESTIONS_ROLE_ID == 1396606001188175922
+    assert botmod.CLAN_PANEL_REFRESH_HOURS == 38
+
+
+def test_conditions_embed_mentions_existing_questions_role(monkeypatch):
+    """Роль вопросов есть на сервере — в панели её упоминание."""
+    monkeypatch.setattr(botmod, "CLAN_QUESTIONS_ROLE_ID", 1396606001188175922)
+    role = SimpleNamespace(id=1396606001188175922, name="Куратор")
+    guild = SimpleNamespace(
+        get_role=lambda rid: role if rid == role.id else None)
+    client = SimpleNamespace(get_guild=lambda _gid: guild)
+
+    embed = botmod._build_clan_conditions_embed(client)
+
+    assert f"<@&{role.id}>" in _questions_text(embed)
+
+
+def test_conditions_embed_hides_missing_questions_role(monkeypatch):
+    """Роли нет на сервере — вместо «Неизвестная роль» обычный текст."""
+    monkeypatch.setattr(botmod, "CLAN_QUESTIONS_ROLE_ID", 1396606001188175922)
+    guild = SimpleNamespace(get_role=lambda _rid: None)
+    client = SimpleNamespace(get_guild=lambda _gid: guild)
+
+    embed = botmod._build_clan_conditions_embed(client)
+
+    questions = _questions_text(embed)
+    assert "<@&" not in questions, questions
+    assert "администрации" in questions

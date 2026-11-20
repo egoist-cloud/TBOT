@@ -8250,7 +8250,36 @@ async def activity_all(i):
 # ============================================================
 # !setup_clan (алиас !setup) - официальные условия вступления
 # ============================================================
-def _build_clan_conditions_embed() -> discord.Embed:
+_QUESTIONS_ROLE_WARNED = False
+
+
+def _warn_questions_role_missing() -> None:
+    """Один раз предупреждает, что CLAN_QUESTIONS_ROLE_ID нет на сервере."""
+    global _QUESTIONS_ROLE_WARNED
+    if _QUESTIONS_ROLE_WARNED:
+        return
+    _QUESTIONS_ROLE_WARNED = True
+    log(f"⚠️ CLAN_QUESTIONS_ROLE_ID={CLAN_QUESTIONS_ROLE_ID} нет на сервере — "
+        "в панели заявки будет «Обратитесь к администрации»")
+
+
+def _clan_questions_text(client=None) -> str:
+    """Строка «По вопросам вступления»: роль или администрация.
+
+    Упоминание ``<@&id>`` роли, которой нет на сервере, Discord рисует как
+    «Неизвестная роль», поэтому битое упоминание в панель не попадает.
+    """
+    if not CLAN_QUESTIONS_ROLE_ID:
+        return "Обратитесь к администрации."
+    guild = (client.get_guild(GUILD_ID)
+             if client is not None and hasattr(client, "get_guild") else None)
+    if guild is not None and guild.get_role(CLAN_QUESTIONS_ROLE_ID) is None:
+        _warn_questions_role_missing()
+        return "Обратитесь к администрации."
+    return f"Обратитесь к <@&{CLAN_QUESTIONS_ROLE_ID}>."
+
+
+def _build_clan_conditions_embed(client=None) -> discord.Embed:
     """Embed с официальными условиями вступления в клан.
 
     Используется текстовой командой !setup_clan, чтобы текст условий
@@ -8288,22 +8317,23 @@ def _build_clan_conditions_embed() -> discord.Embed:
         important += ("\nПосле отказа повторная заявка — через "
                       f"{APPLICATION_REJECT_COOLDOWN_DAYS} дн.")
     embed.add_field(name="⚠️ Важно!", value=important, inline=False)
-    if CLAN_QUESTIONS_ROLE_ID:
-        questions = f"Обратитесь к <@&{CLAN_QUESTIONS_ROLE_ID}>."
-    else:
-        questions = "Обратитесь к администрации."
     embed.add_field(
         name="💬 По вопросам вступления",
-        value=questions,
+        value=_clan_questions_text(client),
         inline=False,
     )
     embed.set_footer(text=f"Quantum • {now_utc().strftime('%d.%m.%Y %H:%M')}")
     return embed
 
 
-def _clan_panel_mentions() -> discord.AllowedMentions | None:
+def _clan_panel_mentions(client=None) -> discord.AllowedMentions | None:
     """Разрешает пинг только роли вопросов, без @everyone и @here."""
     if not CLAN_QUESTIONS_ROLE_ID:
+        return None
+    guild = (client.get_guild(GUILD_ID)
+             if client is not None and hasattr(client, "get_guild") else None)
+    if guild is not None and guild.get_role(CLAN_QUESTIONS_ROLE_ID) is None:
+        # Роли нет — её упоминания в панели тоже не будет.
         return None
     return discord.AllowedMentions(
         everyone=False, users=False,
@@ -8318,10 +8348,12 @@ CLAN_PANEL_TITLE = "Официальные условия вступления �
 # Канал панели заявки. Можно переопределить в любой момент без !setup_clan:
 # если в meta нет канала (или он недоступен), берём этот id.
 CLAN_PANEL_CHANNEL_ID = env_int("CLAN_PANEL_CHANNEL_ID", 1236678127778795660)
-# Раз в сколько часов пересоздавать панель (по умолчанию — сутки).
-CLAN_PANEL_REFRESH_HOURS = env_int("CLAN_PANEL_REFRESH_HOURS", 24)
-# Роль, которую тегаем в блоке «По вопросам вступления».
-CLAN_QUESTIONS_ROLE_ID = env_int("CLAN_QUESTIONS_ROLE_ID", 1113899288192356402)
+# Раз в сколько часов пересоздавать панель (по умолчанию — 38 часов).
+CLAN_PANEL_REFRESH_HOURS = env_int("CLAN_PANEL_REFRESH_HOURS", 38)
+# Роль, которую тегаем в блоке «По вопросам вступления». Здесь именно роль:
+# id пользователя в упоминании роли Discord показывает как «Неизвестная роль».
+CLAN_QUESTIONS_ROLE_ID = env_int("CLAN_QUESTIONS_ROLE_ID",
+                                 1396606001188175922)
 # Описание панели для общего реестра: флаги clan_panel_* уже совпадают.
 CLAN_PANEL_SPEC = PanelSpec("clan_panel", CLAN_PANEL_CHANNEL_ID,
                             CLAN_PANEL_TITLE)
@@ -8376,8 +8408,8 @@ async def refresh_clan_panel(bot) -> str:
     Возвращает человекочитаемый статус — его пишет вызывающая задача.
     """
     result = await _clan_panels(bot).ensure(
-        lambda: (_build_clan_conditions_embed(), ClanView(),
-                 _clan_panel_mentions()),
+        lambda: (_build_clan_conditions_embed(bot), ClanView(),
+                 _clan_panel_mentions(bot)),
         refresh=True)
     if result.status == "no_channel":
         return result.error
@@ -8397,7 +8429,7 @@ async def refresh_clan_panel(bot) -> str:
 
 @tasks.loop(hours=1)
 async def clan_panel_refresh():
-    """Раз в CLAN_PANEL_REFRESH_HOURS (сутки) перепубликует панель заявки.
+    """Раз в CLAN_PANEL_REFRESH_HOURS (38 часов) перепубликует панель заявки.
 
     Проверка раз в час нужна, чтобы удалённая вручную панель вернулась
     быстро, а не ждала сутки. Свежую и целую панель не трогаем.
@@ -8474,8 +8506,8 @@ async def setup_clan(ctx):
         # Тот же реестр, что у автообновления: старые панели (включая
         # неучтённые) удаляются, новая публикуется одна.
         result = await _clan_panels(ctx.bot).ensure(
-            lambda: (_build_clan_conditions_embed(), ClanView(),
-                     _clan_panel_mentions()),
+            lambda: (_build_clan_conditions_embed(ctx.bot), ClanView(),
+                     _clan_panel_mentions(ctx.bot)),
             refresh=True, channel=ctx.channel)
         if result.status in ("send_forbidden", "send_failed"):
             log(f"⚠️ панель: не опубликована ({result.status}): {result.error}")
