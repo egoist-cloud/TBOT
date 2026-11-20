@@ -7,8 +7,9 @@
   3. RAG-поиск по rules.txt -> топ-5 пунктов;
   4. формируем промпт: системная инструкция + найденные правила +
      примеры из ai_training.json (файл опционален);
-  5. перебираем провайдеров по очереди (Gemini -> OpenRouter -> LLM7),
-     пока кто-то не вернёт непустой ответ;
+  5. перебираем провайдеров по очереди (Gemini -> ... -> LLM7 ->
+     Pollinations), пока кто-то не вернёт непустой ответ;
+     LLM7/Pollinations работают без ключа и остаются резервом;
   6. кладём ответ в кэш и возвращаем вместе с использованными пунктами.
 """
 from __future__ import annotations
@@ -265,9 +266,9 @@ class AIService:
                        "попробуй через несколько минут.")
             else:
                 msg = ("Не удалось получить ответ ни от одного ИИ-провайдера. "
-                       "Проверь, что задан хотя бы один ключ "
-                       "(GEMINI_API_KEY / GROQ_API_KEY / CEREBRAS_API_KEY / "
-                       "MISTRAL_API_KEY / OPENROUTER_API_KEY / LLM7_API_KEY).")
+                       "Бесплатные резервы без ключа (LLM7, Pollinations) "
+                       "тоже не ответили — скорее всего общий лимит; попробуй "
+                       "через несколько минут.")
             return {"ok": False, "response": "", "rules_used": rules_used,
                     "provider": "", "cached": False, "error": msg,
                     "limited": False, "remaining": self.limiter.remaining(user_id)}

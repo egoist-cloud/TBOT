@@ -21,15 +21,18 @@ from quantum.ai.providers import (  # noqa: E402
     CloudflareProvider,
     CohereProvider,
     GeminiProvider,
-    GitHubModelsProvider,
     GroqProvider,
     HuggingFaceProvider,
     LLM7Provider,
     MistralProvider,
     NvidiaProvider,
     OpenRouterProvider,
+    PollinationsProvider,
     SambaNovaProvider,
+    _gemini_model_rank,
     _is_auth_error,
+    _model_from_error,
+    _retry_from_body,
     make_providers,
     provider_catalog,
 )
@@ -40,10 +43,10 @@ _ENV_KEYS = (
     "GEMINI_API_KEY", "GEMINI_MODEL", "GEMINI_API_URL",
     "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "OPENROUTER_BASE_URL",
     "LLM7_API_KEY", "LLM7_MODEL", "LLM7_BASE_URL",
+    "POLLINATIONS_API_KEY", "POLLINATIONS_MODEL", "POLLINATIONS_BASE_URL",
     "GROQ_API_KEY", "GROQ_MODEL", "GROQ_BASE_URL",
     "CEREBRAS_API_KEY", "CEREBRAS_MODEL",
     "MISTRAL_API_KEY", "MISTRAL_MODEL",
-    "GITHUB_MODELS_TOKEN", "GITHUB_MODELS_MODEL",
     "NVIDIA_API_KEY", "NVIDIA_MODEL",
     "SAMBANOVA_API_KEY", "SAMBANOVA_MODEL",
     "COHERE_API_KEY", "COHERE_MODEL",
@@ -201,17 +204,19 @@ def test_is_auth_error_only_401_and_403():
 # Каскад провайдеров
 # ============================================================
 def test_make_providers_only_with_keys_in_order(monkeypatch):
-    """В каскад попадают только включённые, порядок — Gemini→OpenRouter→LLM7."""
-    assert make_providers(_FakeSession()) == []
+    """Без ключей остаются только бесплатные резервы; ключевые — по порядку."""
+    assert [p.name for p in make_providers(_FakeSession())] == [
+        "llm7", "pollinations"]
 
     monkeypatch.setenv("OPENROUTER_API_KEY", "or")
-    monkeypatch.setenv("LLM7_API_KEY", "l7")
     providers = make_providers(_FakeSession())
-    assert [p.name for p in providers] == ["openrouter", "llm7"]
+    assert [p.name for p in providers] == [
+        "openrouter", "llm7", "pollinations"]
 
     monkeypatch.setenv("GEMINI_API_KEY", "gm")
     providers = make_providers(_FakeSession())
-    assert [p.name for p in providers] == ["gemini", "openrouter", "llm7"]
+    assert [p.name for p in providers] == [
+        "gemini", "openrouter", "llm7", "pollinations"]
     print("  ok: каскад и порядок провайдеров")
 
 
@@ -232,6 +237,22 @@ def test_gemini_model_priority(monkeypatch):
     monkeypatch.setenv("GEMINI_MODEL", "gemini-3-flash")
     assert provider._model == "gemini-3-flash"
     print("  ok: приоритет модели Gemini")
+
+
+def test_gemini_prefers_newest_flash_and_parses_404_hint():
+    """Резервная модель — новая 3.x flash, а не старая/удалённая 2.5."""
+    names = ["gemini-2.5-flash", "gemini-3.5-flash-lite",
+             "gemini-3.8-flash", "gemini-3.8-flash-preview"]
+    names.sort(key=_gemini_model_rank)
+    assert names[0] == "gemini-3.8-flash"
+    assert _gemini_model_rank("gemini-flash-latest") < \
+        _gemini_model_rank("gemini-3.8-flash")
+
+    message = ("This model models/gemini-2.5-flash is no longer available. "
+               "Please update your code to use models/gemini-3.8-flash")
+    assert _model_from_error(message, "gemini-2.5-flash") == "gemini-3.8-flash"
+    assert _model_from_error(message, "gemini-3.8-flash") is None
+    print("  ok: Gemini выбирает новую flash-модель")
 
 
 def test_gemini_max_output_tokens(monkeypatch):
@@ -360,8 +381,10 @@ def test_gemini_http_errors(monkeypatch, status, expected):
     assert _complete(provider) is None
     assert expected in provider.last_error
     assert provider.last_status == status
-    assert provider.failures == 1
-    assert provider.requests == 1
+    # На 404 Gemini пробует ещё несколько актуальных моделей, поэтому
+    # ошибок/запросов может быть больше одного.
+    assert provider.failures >= 1
+    assert provider.requests >= 1
     print(f"  ok: Gemini HTTP {status}")
 
 
@@ -580,8 +603,6 @@ def test_new_providers_defaults(monkeypatch):
          "https://api.cerebras.ai/v1", "gpt-oss-120b"),
         (MistralProvider, "MISTRAL_API_KEY",
          "https://api.mistral.ai/v1", "mistral-small-latest"),
-        (GitHubModelsProvider, "GITHUB_MODELS_TOKEN",
-         "https://models.github.ai/inference", "openai/gpt-4o-mini"),
         (NvidiaProvider, "NVIDIA_API_KEY",
          "https://integrate.api.nvidia.com/v1",
          "meta/llama-3.3-70b-instruct"),
@@ -618,7 +639,7 @@ def test_cloudflare_requires_account_id(monkeypatch):
 def test_cascade_order_with_many_keys(monkeypatch):
     """Порядок каскада: быстрые бесплатные тиры идут раньше LLM7."""
     for key in ("GEMINI_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY",
-                "MISTRAL_API_KEY", "GITHUB_MODELS_TOKEN", "OPENROUTER_API_KEY",
+                "MISTRAL_API_KEY", "OPENROUTER_API_KEY",
                 "NVIDIA_API_KEY", "SAMBANOVA_API_KEY", "COHERE_API_KEY",
                 "HUGGINGFACE_API_KEY", "LLM7_API_KEY"):
         monkeypatch.setenv(key, "k")
@@ -627,8 +648,9 @@ def test_cascade_order_with_many_keys(monkeypatch):
 
     names = [p.name for p in make_providers(_FakeSession())]
     assert names == [
-        "gemini", "groq", "cerebras", "mistral", "github", "openrouter",
+        "gemini", "groq", "cerebras", "mistral", "openrouter",
         "nvidia", "sambanova", "cohere", "huggingface", "cloudflare", "llm7",
+        "pollinations",
     ], names
     print("  ok: полный каскад провайдеров")
 
@@ -676,25 +698,37 @@ def test_success_clears_cooldown(monkeypatch):
 
 
 AI_ENV_KEYS = ("GEMINI_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY",
-               "MISTRAL_API_KEY", "GITHUB_MODELS_TOKEN", "GITHUB_TOKEN",
+               "MISTRAL_API_KEY",
                "OPENROUTER_API_KEY", "NVIDIA_API_KEY", "SAMBANOVA_API_KEY",
                "COHERE_API_KEY", "HUGGINGFACE_API_KEY",
                "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID",
                "LLM7_API_KEY")
 
 
+def test_provider_catalog_excludes_retired_github(monkeypatch):
+    """GitHub Models закрыт — старый токен не должен добавлять провайдера."""
+    for key in AI_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("GITHUB_MODELS_TOKEN", "old-token")
+
+    names = [item["name"] for item in provider_catalog()]
+    assert "github" not in names
+    print("  ok: закрытый GitHub Models не попадает в каталог")
+
+
 def test_provider_catalog_lists_every_provider(monkeypatch):
-    """/ai_status видит все 12 провайдеров, включая выключенные."""
+    """Провайдеров 12; LLM7 и Pollinations доступны без ключа."""
     for key in AI_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
 
     catalog = provider_catalog()
 
     assert len(catalog) == 12
-    assert all(item["enabled"] is False for item in catalog)
+    assert [item["name"] for item in catalog if item["enabled"]] == [
+        "llm7", "pollinations"]
     names = [item["name"] for item in catalog]
-    assert names[0] == "gemini" and names[-1] == "llm7"
-    # У каждого есть переменная ключа, которую можно показать админу.
+    assert names[0] == "gemini" and names[-1] == "pollinations"
+    # У каждого есть переменная, которую можно показать админу.
     assert all(item["env"] for item in catalog)
 
 
@@ -707,7 +741,7 @@ def test_provider_catalog_marks_only_configured(monkeypatch):
     enabled = [item["name"] for item in provider_catalog()
                if item["enabled"]]
 
-    assert enabled == ["groq"]
+    assert enabled == ["groq", "llm7", "pollinations"]
 
 
 def test_provider_catalog_cloudflare_needs_account_id(monkeypatch):
@@ -759,6 +793,68 @@ def test_gemini_falls_back_to_discovered_model(monkeypatch):
     print("  ok: Gemini переключился на доступную модель")
 
 
+def test_gemini_404_uses_model_from_error(monkeypatch):
+    """404 с подсказкой Google: повторяем запрос на предложенной модели."""
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-flash")
+    payload = _gemini_payload("ОК")
+    body = ('{"error":{"message":"This model models/gemini-2.5-flash is no '
+            'longer available. Please update your code to use '
+            'models/gemini-3.8-flash"}}')
+
+    class _SeqSession(_FakeSession):
+        def __init__(self):
+            super().__init__(get_response=_FakeResponse(payload={"models": []}))
+            self._responses = [
+                _FakeResponse(status=404, body=body),
+                _FakeResponse(payload=payload),
+            ]
+
+        def post(self, url, **kwargs):
+            self.calls.append({"url": url, **kwargs})
+            return _FakePost(self._responses.pop(0))
+
+    session = _SeqSession()
+    provider = GeminiProvider(session)
+
+    assert _complete(provider) == "ОК"
+    assert provider._model == "gemini-3.8-flash"
+    assert "gemini-3.8-flash" in session.calls[-1]["url"]
+    assert provider.last_status == 200
+    assert provider.last_error == ""
+    print("  ok: Gemini использовал модель из 404")
+
+
+def test_gemini_stale_model_list_uses_known_new(monkeypatch):
+    """ListModels вернул ту же 2.5 — берём алиас flash-latest, а не зацикливаемся."""
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-flash")
+    models = {"models": [
+        {"name": "models/gemini-2.5-flash",
+         "supportedGenerationMethods": ["generateContent"]},
+    ]}
+
+    class _SeqSession(_FakeSession):
+        def __init__(self):
+            super().__init__(get_response=_FakeResponse(payload=models))
+            self._responses = [
+                _FakeResponse(status=404, body='{"error":"not found"}'),
+                _FakeResponse(payload=_gemini_payload("ОК")),
+            ]
+
+        def post(self, url, **kwargs):
+            self.calls.append({"url": url, **kwargs})
+            return _FakePost(self._responses.pop(0))
+
+    session = _SeqSession()
+    provider = GeminiProvider(session)
+
+    assert _complete(provider) == "ОК"
+    assert provider._model == "gemini-flash-latest"
+    assert "gemini-flash-latest" in session.calls[-1]["url"]
+    print("  ok: устаревший ListModels обойдён известной моделью")
+
+
 def test_gemini_404_without_model_list_keeps_error(monkeypatch):
     """404 и пустой список моделей: понятная ошибка, без падения."""
     monkeypatch.setenv("GEMINI_API_KEY", "k")
@@ -775,12 +871,12 @@ def test_gemini_404_without_model_list_keeps_error(monkeypatch):
 
 def test_openai_html_200_is_reported_and_cooled_down(monkeypatch):
     """200 с HTML вместо JSON: понятная причина и пауза, без ложного успеха."""
-    monkeypatch.setenv("GITHUB_MODELS_TOKEN", "k")
+    monkeypatch.setenv("GROQ_API_KEY", "k")
     session = _FakeSession(_FakeResponse(
         status=200, body="<html><body>Sign in</body></html>",
         json_error=ValueError("Expecting value"),
         headers={"Content-Type": "text/html"}))
-    provider = GitHubModelsProvider(session)
+    provider = GroqProvider(session)
 
     assert _complete(provider) is None
     assert "не JSON" in provider.last_error
@@ -791,8 +887,8 @@ def test_openai_html_200_is_reported_and_cooled_down(monkeypatch):
 
 def test_openai_error_payload_with_200(monkeypatch):
     """200 с объектом error внутри — ошибка API, а не пустой ответ."""
-    monkeypatch.setenv("GITHUB_MODELS_TOKEN", "k")
-    provider = GitHubModelsProvider(_FakeSession(_FakeResponse(
+    monkeypatch.setenv("GROQ_API_KEY", "k")
+    provider = GroqProvider(_FakeSession(_FakeResponse(
         payload={"error": {"message": "quota exceeded"}})))
 
     assert _complete(provider) is None
@@ -823,3 +919,132 @@ def test_status_line_shows_human_cooldown(monkeypatch):
 
     assert "2 ч" in line
     assert "7200" not in line
+
+
+# ============================================================
+# Бесплатные резервы без ключа: ИИ работает при пустом .env
+# ============================================================
+def test_llm7_works_without_key():
+    """LLM7 активен без ключа и не шлёт пустой Authorization."""
+    session = _FakeSession(_FakeResponse(payload=_openai_payload("привет")))
+    provider = LLM7Provider(session)
+
+    assert provider.enabled is True
+    assert _complete(provider) == "привет"
+    call = session.calls[0]
+    assert "Authorization" not in call["headers"]
+    assert provider.status_line().startswith("llm7: работает")
+    print("  ok: LLM7 без ключа")
+
+
+def test_pollinations_request_shape():
+    """Pollinations: путь /openai, модель openai-fast, без ключа в заголовках."""
+    session = _FakeSession(_FakeResponse(payload=_openai_payload("ответ")))
+    provider = PollinationsProvider(session)
+
+    assert provider.enabled is True
+    assert _complete(provider) == "ответ"
+    call = session.calls[0]
+    assert call["url"] == "https://text.pollinations.ai/openai"
+    assert "Authorization" not in call["headers"]
+    assert call["json"]["model"] == "openai-fast"
+    print("  ok: Pollinations без ключа")
+
+
+def test_pollinations_uses_optional_key(monkeypatch):
+    """Ключ Pollinations (если задан) уходит как Bearer."""
+    monkeypatch.setenv("POLLINATIONS_API_KEY", "pk")
+    session = _FakeSession(_FakeResponse(payload=_openai_payload("ok")))
+    provider = PollinationsProvider(session)
+
+    assert _complete(provider) == "ok"
+    assert session.calls[0]["headers"]["Authorization"] == "Bearer pk"
+    print("  ok: ключ Pollinations")
+
+
+def test_retry_hint_from_body_sets_cooldown():
+    """429 без Retry-After: пауза берётся из «retry in N seconds» в теле."""
+    body = ('{"error":{"message":"Your free token allowance has been '
+            'reached. Please retry in 3600 seconds."}}')
+    provider = LLM7Provider(_FakeSession(_FakeResponse(429, body=body)))
+
+    assert _complete(provider) is None
+    assert 3500 <= provider.cooldown_left <= 3600
+    assert _retry_from_body(body) == 3600
+    assert _retry_from_body("no hint here") is None
+    print("  ok: пауза из тела 429")
+
+
+def test_gemini_strips_models_prefix(monkeypatch):
+    """GEMINI_MODEL=models/... не даёт /models/models/... и ложный 404."""
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setenv("GEMINI_MODEL", "models/gemini-2.5-flash")
+    session = _FakeSession(_FakeResponse(payload=_gemini_payload("ok")))
+    provider = GeminiProvider(session)
+
+    assert provider._model == "gemini-2.5-flash"
+    assert "models/models/" not in provider._build_url()
+    assert provider._build_url().endswith(
+        "/models/gemini-2.5-flash:generateContent")
+    assert _complete(provider) == "ok"
+    print("  ok: префикс models/ срезан")
+
+
+# ============================================================
+# Подсказка в /ai_status: какой ключ взять следующим
+# ============================================================
+class _Paused:
+    """Заглушка провайдера: только cooldown_left, как у AIProvider."""
+
+    def __init__(self, cooldown_left=0):
+        self.cooldown_left = cooldown_left
+
+
+def _catalog(**enabled):
+    names = ("gemini", "groq", "cerebras", "openrouter", "llm7",
+             "pollinations")
+    return [{"name": n, "enabled": n in enabled or n in
+             ("llm7", "pollinations")} for n in names]
+
+
+def test_key_hint_without_keys_recommends_gemini():
+    """Ключей нет — подсказка предлагает Gemini и говорит, что деплой не нужен."""
+    import script as botmod
+
+    text = botmod._ai_key_hint(_catalog(), {})
+    assert "ключей нет" in text
+    assert "GEMINI_API_KEY" in text
+    assert "деплой не нужен" in text
+
+
+def test_key_hint_skips_keys_already_set():
+    """Gemini уже задан — следующим предлагается Groq."""
+    import script as botmod
+
+    text = botmod._ai_key_hint(_catalog(gemini=True), {})
+    assert "GEMINI_API_KEY" not in text
+    assert "GROQ_API_KEY" in text
+
+
+def test_key_hint_mentions_paused_provider():
+    """Все основные ключи есть, Gemini в паузе — подсказка про новый ключ."""
+    import script as botmod
+
+    running = {"gemini": _Paused(600),
+               "groq": _Paused(0),
+               "cerebras": _Paused(0)}
+    text = botmod._ai_key_hint(_catalog(gemini=True, groq=True, cerebras=True),
+                               running)
+    assert "GEMINI_API_KEY" in text
+    assert "паузе" in text
+
+
+def test_key_hint_all_keys_ok():
+    """Все основные ключи заданы и не в паузе — действий не требуется."""
+    import script as botmod
+
+    running = {n: _Paused(0)
+               for n in ("gemini", "groq", "cerebras")}
+    text = botmod._ai_key_hint(_catalog(gemini=True, groq=True, cerebras=True),
+                               running)
+    assert "с запасом" in text

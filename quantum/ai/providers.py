@@ -26,11 +26,13 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 
 import aiohttp
 
 from ..env import env_float, env_int
+from ..safety import safe_text
 
 log = logging.getLogger("quantum.ai")
 
@@ -43,12 +45,26 @@ COOLDOWN_AUTH = env_int("AI_PROVIDER_AUTH_COOLDOWN_SECONDS", 3600)
 COOLDOWN_CONFIG = env_int("AI_PROVIDER_CONFIG_COOLDOWN_SECONDS", 1800)
 COOLDOWN_ERROR = env_int("AI_PROVIDER_ERROR_COOLDOWN_SECONDS", 120)
 
+# Резервные имена, если ListModels недоступен. Сначала алиас Google — он
+# всегда указывает на живую flash-модель, — затем стабильные модели от
+# новых к старым. Несуществующие имена здесь вредны: каждый такой вариант
+# это лишний 404 и потерянные секунды.
+_GEMINI_KNOWN_FALLBACKS = (
+    "gemini-flash-latest",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+)
+
 
 class AIProvider:
     """Базовый класс провайдера."""
 
     name = "abstract"
     env_key = ""
+    # Пауза после 429. У бесплатных анонимных endpoint'ов лимит маленький,
+    # поэтому им можно задать более короткую паузу, чем общий час/10 минут.
+    cooldown_limit = COOLDOWN_LIMIT
 
     def __init__(self, session: aiohttp.ClientSession, timeout: float = DEFAULT_TIMEOUT):
         self.session = session
@@ -85,7 +101,7 @@ class AIProvider:
         if status in (401, 403):
             secs = COOLDOWN_AUTH
         elif status == 429:
-            secs = COOLDOWN_LIMIT
+            secs = self.cooldown_limit
             try:
                 if retry_after is not None:
                     secs = max(secs, int(float(retry_after)))
@@ -100,7 +116,7 @@ class AIProvider:
         self.last_status = status
         if err:
             self.failures += 1
-            self.last_error = err
+            self.last_error = safe_text(err)
             self._start_cooldown(status, retry_after)
         else:
             self.last_error = ""
@@ -110,7 +126,8 @@ class AIProvider:
         """Строка для /health: включён/выключен, ошибки, пауза, статусы."""
         if not self.enabled:
             return f"{self.name}: выключен (нет {self.env_key})"
-        state = f"ошибка: {self.last_error[:120]}" if self.last_error else "работает"
+        state = (f"ошибка: {safe_text(self.last_error, 120)}"
+                 if self.last_error else "работает")
         if self.cooldown_left:
             state += (f", пауза после лимита/ошибки ещё "
                       f"{_fmt_duration(self.cooldown_left)}")
@@ -146,6 +163,69 @@ def _fmt_duration(seconds: int) -> str:
     return f"{minutes} мин"
 
 
+def _normalize_model(name: str) -> str:
+    """``models/gemini-2.5-flash`` → ``gemini-2.5-flash``.
+
+    Модель часто копируют из документации вместе с префиксом ``models/``.
+    В шаблоне адреса он уже есть, поэтому запрос уходил на
+    ``/models/models/...`` и получал 404 «модель не найдена», хотя модель
+    существует. Тот же префикс мог попасть в .env из прошлых версий.
+    """
+    name = (name or "").strip()
+    while name.lower().startswith("models/"):
+        name = name[len("models/"):].strip()
+    return name
+
+
+def _model_version(name: str) -> tuple[int, int]:
+    """Версия из имени Gemini-модели: ``gemini-3.8-flash`` → (3, 8)."""
+    match = re.search(r"gemini-(\d+)(?:\.(\d+))?", (name or "").lower())
+    if not match:
+        return (0, 0)
+    return (int(match.group(1)), int(match.group(2) or 0))
+
+
+def _model_from_error(text: str, current: str = "") -> str | None:
+    """Модель, которую Google советует в тексте 404 (``models/...``).
+
+    В сообщении сначала упоминается недоступная модель, затем —
+    рекомендуемая. Берём только версию новее текущей, чтобы не выбрать
+    ту же самую ``gemini-2.5-flash`` повторно.
+    """
+    names = []
+    for name in re.findall(r"models/([A-Za-z0-9._-]+)", text or ""):
+        low = name.lower()
+        if not low.startswith("gemini"):
+            continue
+        if any(bad in low for bad in ("embedding", "image", "tts", "live",
+                                      "vision", "aqa")):
+            continue
+        if name not in names:
+            names.append(name)
+    if not names:
+        return None
+    if current:
+        newer = [name for name in names
+                 if _model_version(name) > _model_version(current)]
+        if newer:
+            return max(newer, key=_model_version)
+        return None
+    return names[-1]
+
+
+def _gemini_model_rank(name: str) -> tuple:
+    """Сортировка моделей Gemini: новые flash раньше старых и preview."""
+    low = name.lower()
+    major, minor = _model_version(low)
+    latest = "latest" in low
+    preview = any(part in low for part in ("preview", "experimental", "-exp"))
+    lite = "lite" in low
+    non_flash = "flash" not in low
+    # preview/experimental — в конец; lite — после обычного flash;
+    # alias *-latest — вперёд; затем более новая версия.
+    return (preview, non_flash, lite, not latest, -major, -minor, len(low), low)
+
+
 def _parse_json_body(raw: str) -> dict | None:
     """JSON из тела ответа, включая SSE-строки ``data: {...}``.
 
@@ -172,6 +252,31 @@ def _parse_json_body(raw: str) -> dict | None:
         if isinstance(parsed, dict):
             return parsed
     return None
+
+
+_RETRY_IN_BODY = re.compile(
+    r"retry\s+(?:again\s+)?in\s+(\d+(?:\.\d+)?)\s*"
+    r"(?:s|sec|secs|second|seconds)?",
+    re.IGNORECASE,
+)
+
+
+def _retry_from_body(raw: str) -> int | None:
+    """Секунды до следующей попытки из текста ответа.
+
+    LLM7 и часть шлюзов на 429 пишут «Please retry in 3600 seconds» в теле
+    и не отдают Retry-After. Без разбора тела провайдер уходил в паузу на
+    10 минут и снова попадал под 429.
+    """
+    if not raw:
+        return None
+    match = _RETRY_IN_BODY.search(raw)
+    if not match:
+        return None
+    try:
+        return max(1, int(float(match.group(1))))
+    except (TypeError, ValueError):
+        return None
 
 
 class GeminiProvider(AIProvider):
@@ -204,6 +309,9 @@ class GeminiProvider(AIProvider):
         super().__init__(*args, **kwargs)
         # Модель, найденная через ListModels, если настроенная недоступна.
         self._resolved_model = ""
+        # Полное тело последнего ответа: в last_error оно обрезано, а
+        # подсказка Google с новой моделью может быть дальше 200 символов.
+        self._last_body = ""
 
     @property
     def _model(self) -> str:
@@ -213,10 +321,10 @@ class GeminiProvider(AIProvider):
         # ``AI_MODEL`` берём только если в нём явно Gemini-модель: в старых
         # .env переменная была общей с LLM7 и там мог лежать селектор
         # вроде ``default``, из-за которого Gemini получал 404.
-        explicit = (os.getenv("GEMINI_MODEL") or "").strip()
+        explicit = _normalize_model(os.getenv("GEMINI_MODEL") or "")
         if explicit:
             return explicit
-        legacy = (os.getenv("AI_MODEL") or "").strip()
+        legacy = _normalize_model(os.getenv("AI_MODEL") or "")
         if legacy and ("gemini" in legacy.lower()):
             return legacy
         return self.default_model
@@ -261,9 +369,7 @@ class GeminiProvider(AIProvider):
                 continue
             names.append(name)
         # Стабильные flash-модели важнее preview/experimental и lite.
-        names.sort(key=lambda name: ("preview" in name or "exp" in name,
-                                     "lite" in name or "flash" not in name,
-                                     name))
+        names.sort(key=_gemini_model_rank)
         return names[0] if names else None
 
     async def complete(self, messages: list) -> str | None:
@@ -301,14 +407,39 @@ class GeminiProvider(AIProvider):
         }
         result = await self._post(self._build_url(), headers, body)
         if result is None and self.last_status == 404:
-            # Настроенная модель отключена/переименована — берём доступную.
-            fallback = await self._discover_model()
-            if fallback and fallback != self._model:
-                log.info("gemini: модель %s недоступна, переключаюсь на %s",
-                         self._model, fallback)
-                self._resolved_model = fallback
-                result = await self._post(self._build_url(), headers, body)
+            result = await self._retry_with_fallback(headers, body)
         return result
+
+    async def _retry_with_fallback(self, headers: dict, body: dict) -> str | None:
+        """404 на настроенной модели: пробуем подсказку Google и ListModels."""
+        current = self._model
+        candidates: list[str] = []
+        hinted = _model_from_error(self._last_body or self.last_error, current)
+        if hinted and hinted != current:
+            candidates.append(hinted)
+        discovered = await self._discover_model()
+        if discovered and discovered != current and discovered not in candidates:
+            candidates.append(discovered)
+        # Даже если ListModels вернул недоступную модель (или пустой список),
+        # пробуем известные актуальные flash. Иначе один 404 на «свежей»
+        # модели снова оставлял бы провайдера без ответа.
+        for name in _GEMINI_KNOWN_FALLBACKS:
+            if name != current and name not in candidates:
+                candidates.append(name)
+
+        for candidate in candidates:
+            log.info("gemini: модель %s недоступна, переключаюсь на %s",
+                     current, candidate)
+            self._resolved_model = candidate
+            result = await self._post(self._build_url(), headers, body)
+            if result is not None:
+                return result
+            if self.last_status != 404:
+                break
+        # Ни одна резервная модель не подошла: следующий запрос снова начнёт
+        # с настроенной, а не застрянет на последней неудачной.
+        self._resolved_model = ""
+        return None
 
     async def _post(self, url: str, headers: dict, body: dict) -> str | None:
         self.requests += 1
@@ -317,27 +448,32 @@ class GeminiProvider(AIProvider):
                 url, json=body, headers=headers,
                 timeout=aiohttp.ClientTimeout(total=self.timeout),
             ) as r:
-                raw = (await r.text())[:2000]
+                raw = await r.text()
+                preview = safe_text(raw, 200)
+                self._last_body = safe_text(raw, 2000)
                 if r.status != 200:
                     # Тело ошибки — в лог, а не в stdout: в нём бывают куски
                     # промпта и служебные данные аккаунта Google.
-                    log.warning("gemini: HTTP %s: %s", r.status, raw[:200])
+                    log.warning("gemini: HTTP %s: %s", r.status, preview)
                     if _is_auth_error(r.status):
                         msg = (f"авторизация {r.status}: неверный API-ключ "
-                               f"({self.env_key}): {raw[:200]}")
+                               f"({self.env_key}): {preview}")
                         self._record(r.status, msg)
                     elif r.status in (429,) or r.status >= 500:
-                        msg = f"временный сбой {r.status}: {raw[:200]}"
-                        self._record(r.status, msg, self._retry_after(r))
+                        msg = f"временный сбой {r.status}: {preview}"
+                        self._record(r.status, msg,
+                                     self._retry_after(r)
+                                     or _retry_from_body(raw))
                     elif r.status == 400:
-                        msg = f"неверный запрос (проверь GEMINI_MODEL): {raw[:200]}"
+                        msg = (f"неверный запрос (проверь GEMINI_MODEL): "
+                               f"{preview}")
                         self._record(r.status, msg)
                     elif r.status == 404:
                         msg = (f"модель не найдена (проверь GEMINI_MODEL): "
-                               f"{raw[:200]}")
+                               f"{preview}")
                         self._record(r.status, msg)
                     else:
-                        msg = f"HTTP {r.status}: {raw[:200]}"
+                        msg = f"HTTP {r.status}: {preview}"
                         self._record(r.status, msg)
                     return None
                 try:
@@ -346,7 +482,7 @@ class GeminiProvider(AIProvider):
                     data = _parse_json_body(raw)
                 if not isinstance(data, dict):
                     ctype = r.headers.get("Content-Type", "?")
-                    msg = f"ответ не JSON ({ctype}): {raw[:200]}"
+                    msg = f"ответ не JSON ({ctype}): {safe_text(raw, 200)}"
                     self._record(None, msg)
                     return None
                 self._record(r.status, "")
@@ -387,6 +523,8 @@ class _OpenAICompatProvider(AIProvider):
     max_output_env = "AI_MAX_OUTPUT_TOKENS"
     # Доп. заголовки конкретного провайдера (например, Accept у GitHub).
     extra_headers: dict = {}
+    # Путь метода: у части шлюзов это /openai, а не /chat/completions.
+    completion_path = "/chat/completions"
 
     @property
     def _base_url(self) -> str:
@@ -403,6 +541,15 @@ class _OpenAICompatProvider(AIProvider):
         except (TypeError, ValueError):
             return 2000
 
+    def _headers(self) -> dict:
+        """Заголовки запроса; анонимные endpoint'ы работают без Authorization."""
+        headers = {"Content-Type": "application/json"}
+        key = self._api_key()
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        headers.update(self.extra_headers)
+        return headers
+
     async def complete(self, messages: list) -> str | None:
         if not self.enabled:
             return None
@@ -411,32 +558,31 @@ class _OpenAICompatProvider(AIProvider):
             "messages": messages,
             "max_tokens": self._max_output,
         }
-        headers = {
-            "Authorization": f"Bearer {self._api_key()}",
-            "Content-Type": "application/json",
-        }
-        headers.update(self.extra_headers)
-        url = f"{self._base_url}/chat/completions"
+        headers = self._headers()
+        url = f"{self._base_url}{self.completion_path}"
         self.requests += 1
         try:
             async with self.session.post(
                 url, json=body, headers=headers,
                 timeout=aiohttp.ClientTimeout(total=self.timeout),
             ) as r:
-                raw = (await r.text())[:2000]
+                raw = await r.text()
+                preview = safe_text(raw, 200)
                 if r.status != 200:
                     if _is_auth_error(r.status):
                         msg = (f"авторизация {r.status}: неверный API-ключ "
-                               f"({self.env_key}): {raw[:200]}")
+                               f"({self.env_key}): {preview}")
                         self._record(r.status, msg)
                     elif r.status in (429,) or r.status >= 500:
-                        msg = f"временный сбой {r.status}: {raw[:200]}"
-                        self._record(r.status, msg, self._retry_after(r))
+                        msg = f"временный сбой {r.status}: {preview}"
+                        self._record(r.status, msg,
+                                     self._retry_after(r)
+                                     or _retry_from_body(raw))
                     elif r.status == 400:
-                        msg = f"неверный запрос (проверь модель): {raw[:200]}"
+                        msg = f"неверный запрос (проверь модель): {preview}"
                         self._record(r.status, msg)
                     else:
-                        self._record(r.status, f"HTTP {r.status}: {raw[:200]}")
+                        self._record(r.status, f"HTTP {r.status}: {preview}")
                     return None
                 try:
                     data = await r.json(content_type=None)
@@ -444,11 +590,11 @@ class _OpenAICompatProvider(AIProvider):
                     data = _parse_json_body(raw)
                 if not isinstance(data, dict):
                     ctype = r.headers.get("Content-Type", "?")
-                    msg = f"ответ не JSON ({ctype}): {raw[:200]}"
+                    msg = f"ответ не JSON ({ctype}): {safe_text(raw, 200)}"
                     self._record(None, msg)
                     return None
                 if isinstance(data.get("error"), (dict, str)):
-                    msg = f"ошибка API: {str(data['error'])[:200]}"
+                    msg = f"ошибка API: {safe_text(str(data['error']), 200)}"
                     self._record(400, msg)
                     return None
                 self._record(r.status, "")
@@ -483,22 +629,53 @@ class OpenRouterProvider(_OpenAICompatProvider):
     default_model = "gpt-4o-mini"
 
 
-class LLM7Provider(_OpenAICompatProvider):
-    """LLM7 — OpenAI-совместимый API с селекторами моделей (default/fast/pro)."""
+class KeylessProvider(_OpenAICompatProvider):
+    """Провайдер с бесплатным анонимным тиром: работает и без ключа.
+
+    Ключ необязателен: с ним лимит выше, без него запросы идут на общий
+    анонимный лимит. Иначе пустой .env оставлял бота вообще без ИИ — и
+    /ai_status показывал только «нет ключа» у всего каскада.
+    """
+
+    @property
+    def enabled(self) -> bool:
+        return True
+
+
+class LLM7Provider(KeylessProvider):
+    """LLM7 — бесплатный OpenAI-совместимый API, ключ не обязателен.
+
+    У LLM7 свои селекторы моделей (``default``/``fast``/``pro``), поэтому
+    модель читается из ``LLM7_MODEL`` (не из общего ``AI_MODEL``: там может
+    лежать имя Gemini-модели, и LLM7 ответил бы 400).
+    """
 
     name = "llm7"
     env_key = "LLM7_API_KEY"
     base_url_env = "LLM7_BASE_URL"
     default_base_url = "https://api.llm7.io/v1"
-    # У LLM7 свои селекторы моделей (default/fast/pro). Общий ``AI_MODEL``
-    # здесь намеренно НЕ используется: если в старом .env там лежит имя
-    # Gemini-модели, запросы к LLM7 падали бы с 400.
     model_env = "LLM7_MODEL"
     default_model = "default"
 
-    @property
-    def _model(self) -> str:
-        return os.getenv("LLM7_MODEL") or self.default_model
+
+class PollinationsProvider(KeylessProvider):
+    """Pollinations.ai — бесплатный OpenAI-совместимый endpoint без ключа.
+
+    Единственная модель анонимного тира — ``openai-fast`` (алиасы
+    ``openai`` / ``gpt-oss``): gpt-oss-20b на OVH. Ответ обычный
+    chat.completion. Полный путь эндпоинта — ``/openai``, поэтому
+    ``completion_path`` переопределён.
+    """
+
+    name = "pollinations"
+    env_key = "POLLINATIONS_API_KEY"
+    base_url_env = "POLLINATIONS_BASE_URL"
+    default_base_url = "https://text.pollinations.ai"
+    completion_path = "/openai"
+    model_env = "POLLINATIONS_MODEL"
+    default_model = "openai-fast"
+    # Анонимный тир небольшой: после 429 достаточно минуты.
+    cooldown_limit = 60
 
 
 class GroqProvider(_OpenAICompatProvider):
@@ -532,24 +709,6 @@ class MistralProvider(_OpenAICompatProvider):
     default_base_url = "https://api.mistral.ai/v1"
     model_env = "MISTRAL_MODEL"
     default_model = "mistral-small-latest"
-
-
-class GitHubModelsProvider(_OpenAICompatProvider):
-    """GitHub Models — модели из маркетплейса по токену GitHub."""
-
-    name = "github"
-    env_key = "GITHUB_MODELS_TOKEN"
-    base_url_env = "GITHUB_MODELS_BASE_URL"
-    default_base_url = "https://models.github.ai/inference"
-    model_env = "GITHUB_MODELS_MODEL"
-    default_model = "openai/gpt-4o-mini"
-    extra_headers = {"Accept": "application/json"}
-
-    def _api_key(self) -> str:
-        # Отдельный токен, иначе — общий GITHUB_TOKEN (если у него есть
-        # доступ к GitHub Models).
-        return (os.getenv("GITHUB_MODELS_TOKEN")
-                or os.getenv("GITHUB_TOKEN") or "").strip()
 
 
 class NvidiaProvider(_OpenAICompatProvider):
@@ -628,7 +787,6 @@ _PROVIDER_CLASSES = (
     GroqProvider,
     CerebrasProvider,
     MistralProvider,
-    GitHubModelsProvider,
     OpenRouterProvider,
     NvidiaProvider,
     SambaNovaProvider,
@@ -636,6 +794,7 @@ _PROVIDER_CLASSES = (
     HuggingFaceProvider,
     CloudflareProvider,
     LLM7Provider,
+    PollinationsProvider,
 )
 
 
@@ -650,8 +809,8 @@ def provider_catalog(session=None) -> list[dict]:
         inst = cls(session)
         if isinstance(inst, CloudflareProvider):
             env_names = "CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID"
-        elif isinstance(inst, GitHubModelsProvider):
-            env_names = "GITHUB_MODELS_TOKEN (или GITHUB_TOKEN)"
+        elif isinstance(inst, KeylessProvider):
+            env_names = f"{inst.env_key} (необязательно)"
         else:
             env_names = inst.env_key
         result.append({
@@ -669,11 +828,13 @@ def make_providers(
 ) -> list[AIProvider]:
     """Собирает каскад провайдеров в порядке приоритета.
 
-    В список попадают только те, у кого есть ключ. Порядок задан в
-    ``_PROVIDER_CLASSES``: Gemini → Groq → Cerebras → Mistral → GitHub →
-    OpenRouter → NVIDIA → SambaNova → Cohere → HuggingFace → Cloudflare →
-    LLM7. Если у провайдера кончился лимит, он уходит в паузу, а запрос
-    обслуживает следующий.
+    Ключевые провайдеры попадают в список только при наличии ключа.
+    Бесплатные без ключа (LLM7, Pollinations) есть всегда, поэтому каскад
+    не бывает пустым. Порядок задан в ``_PROVIDER_CLASSES``:
+    Gemini → Groq → Cerebras → Mistral → OpenRouter → NVIDIA → SambaNova →
+    Cohere → HuggingFace → Cloudflare → LLM7 → Pollinations. Если у
+    провайдера кончился лимит, он уходит в паузу (по Retry-After или по
+    «retry in N seconds» из тела), а запрос обслуживает следующий.
     """
     result: list[AIProvider] = []
     for cls in _PROVIDER_CLASSES:

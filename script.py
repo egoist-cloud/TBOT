@@ -270,6 +270,10 @@ _SECRET_ENV_NAMES = (
     "STEAM_API_KEY",
     "GEMINI_API_KEY", "GOOGLE_API_KEY",
     "AI_API_KEY", "LLM7_API_KEY", "OPENROUTER_API_KEY",
+    "POLLINATIONS_API_KEY",
+    "GROQ_API_KEY", "CEREBRAS_API_KEY", "MISTRAL_API_KEY",
+    "NVIDIA_API_KEY", "SAMBANOVA_API_KEY", "COHERE_API_KEY",
+    "HUGGINGFACE_API_KEY", "CLOUDFLARE_API_TOKEN",
     "GITHUB_TOKEN", "DISCORD_TOKEN",
 )
 
@@ -3891,9 +3895,9 @@ class MyBot(commands.Bot):
             n_providers = len(ai_service.providers)
             if n_providers == 0:
                 # Ключей нет — бот работает, но ИИ-команды сообщат о недоступности.
-                log("⚠️ AI провайдеры не настроены: задайте хотя бы один ключ "
-                    "(GEMINI_API_KEY / GROQ_API_KEY / CEREBRAS_API_KEY / "
-                    "MISTRAL_API_KEY / OPENROUTER_API_KEY / LLM7_API_KEY).")
+                log("⚠️ AI провайдеры не настроены: бесплатные резервы "
+                    "(LLM7, Pollinations) тоже не созданы; "
+                    "проверьте зависимости.")
             else:
                 n_rules = ai_service.ensure_rules()
                 names = ", ".join(p.name for p in ai_service.providers)
@@ -8969,6 +8973,8 @@ async def ai_status(i):
                         value="\n".join(paused), inline=False)
     embed.add_field(name=f"🔑 Нет ключа ({len(missing)})",
                     value="\n".join(missing)[:1000] or "—", inline=False)
+    embed.add_field(name="💡 Какой ключ даст больше всего",
+                    value=_ai_key_hint(catalog, running), inline=False)
     embed.add_field(
         name="Что делать с лимитом",
         value=("Пауза ставится автоматически, каскад в это время идёт к "
@@ -9754,6 +9760,57 @@ def _uptime_str() -> str:
     if m:
         return f"{m} мин {s} сек"
     return f"{s} сек"
+
+
+# Ключи, которые дают больше всего пользы, и в каком порядке их брать:
+# сначала качество ответа, потом запас по лимитам. Подсказка в /ai_status
+# предлагает первый ещё не заданный ключ — без правок кода и деплоя.
+_AI_KEY_HINT_ORDER = (
+    ("gemini", "GEMINI_API_KEY",
+     "бесплатный тир Gemini: качество и контекст выше keyless-резервов, "
+     "каскад начнётся с него"),
+    ("groq", "GROQ_API_KEY",
+     "бесплатный тир Groq: быстрый и щедрый по лимиту, "
+     "выручает, когда Gemini в паузе"),
+    ("cerebras", "CEREBRAS_API_KEY",
+     "бесплатный тир Cerebras (gpt-oss-120b) — второй запас по лимиту"),
+)
+# Бесплатные без ключа: они есть в каскаде всегда.
+_KEYLESS_PROVIDER_NAMES = ("llm7", "pollinations")
+
+
+def _ai_key_hint(catalog: list, running: dict | None = None) -> str:
+    """Короткая подсказка: какой бесплатный ключ сейчас даст больше всего.
+
+    Считается по фактическому состоянию каскада: уже заданные ключи не
+    предлагаются, а если все основные провайдеры в паузе — подсказка
+    говорит про новый ключ, а не про ожидание.
+    """
+    running = running or {}
+    enabled = {item.get("name") for item in catalog if item.get("enabled")}
+    keyed = sorted(enabled - set(_KEYLESS_PROVIDER_NAMES) - {None})
+    if keyed:
+        state = "Сейчас заданы ключи: " + ", ".join(keyed) + "."
+    else:
+        state = ("Сейчас ключей нет — отвечают только бесплатные без ключа "
+                 "(LLM7, Pollinations).")
+
+    tip = ""
+    for name, env, why in _AI_KEY_HINT_ORDER:
+        if name not in enabled:
+            tip = f"💡 Больше всего даст `{env}` — {why}."
+            break
+    else:
+        paused = [name for name, env, _why in _AI_KEY_HINT_ORDER
+                  if getattr(running.get(name), "cooldown_left", 0)]
+        if paused:
+            env = next(e for n, e, _w in _AI_KEY_HINT_ORDER if n == paused[0])
+            tip = (f"💡 `{env}` в паузе после лимита — новый ключ на другом "
+                   "аккаунте снимет паузу.")
+        else:
+            tip = "💡 Все основные ключи заданы — каскад с запасом."
+    return (f"{state}\n{tip}\nКлюч добавляется в секреты хостинга — "
+            "деплой не нужен.")
 
 
 def _ai_status() -> str:
