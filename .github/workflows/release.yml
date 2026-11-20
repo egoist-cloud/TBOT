@@ -1,0 +1,182 @@
+# Безопасный релиз Quantum/TBOT.
+#
+# Автоматически стартует только после успешного CI на main. Для ручного
+# запуска нужно ввести DEPLOY и пройти environment protection (если он
+# настроен в GitHub → Settings → Environments). Скрипт на хосте собирает
+# новый образ, проверяет /health и откатывается на previous при ошибке.
+#
+# Секреты не хранятся в репозитории: DEPLOY_HOST, DEPLOY_USER,
+# DEPLOY_PATH, DEPLOY_SSH_KEY, DEPLOY_KNOWN_HOSTS и HEALTH_URL задаются
+# в GitHub Secrets. Без них job завершится до подключения к хосту.
+
+name: Release
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Введите DEPLOY для подтверждения ручного релиза'
+        required: true
+        type: string
+      allow_first_deploy:
+        description: 'Разрешить первый релиз без previous-образа'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-production
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify release candidate
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check manual confirmation
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != "DEPLOY" ]; then
+            echo "::error::Для ручного релиза введите confirm=DEPLOY"
+            exit 1
+          fi
+
+      - name: Checkout release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Ruff
+        run: ruff check .
+
+      - name: Pytest
+        run: pytest --no-cov -q
+
+  release:
+    name: Deploy production
+    needs: verify
+    if: |
+      needs.verify.result == 'success' &&
+      (github.event_name == 'workflow_run' ||
+       (github.event_name == 'workflow_dispatch' && inputs.confirm == 'DEPLOY'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: production
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+      HEALTH_URL: ${{ secrets.HEALTH_URL }}
+      TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+      ALLOW_FIRST_DEPLOY: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_first_deploy && '1' || '0' }}
+
+    steps:
+      - name: Checkout release script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref }}
+
+      - name: Validate production secrets
+        shell: bash
+        run: |
+          set -eu
+          missing=0
+          for name in DEPLOY_HOST DEPLOY_USER DEPLOY_PATH DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS HEALTH_URL; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Секрет $name не настроен"
+              missing=$((missing + 1))
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          for value in "$DEPLOY_PATH" "$HEALTH_URL"; do
+            case "$value" in
+              *"'"*|*$'\n'*)
+                echo "::error::DEPLOY_PATH и HEALTH_URL не должны содержать одинарные кавычки или перевод строки"
+                exit 1
+                ;;
+            esac
+          done
+
+      - name: Prepare SSH credentials
+        shell: bash
+        run: |
+          set -eu
+          umask 077
+          printf '%s\n' "$DEPLOY_SSH_KEY" | tr -d '\r' > "$RUNNER_TEMP/deploy_key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" | tr -d '\r' > "$RUNNER_TEMP/known_hosts"
+          chmod 600 "$RUNNER_TEMP/deploy_key" "$RUNNER_TEMP/known_hosts"
+
+      - name: Upload release script
+        shell: bash
+        run: |
+          set -eu
+          scp -q \
+            -i "$RUNNER_TEMP/deploy_key" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$RUNNER_TEMP/known_hosts" \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            scripts/release.sh \
+            "$DEPLOY_USER@$DEPLOY_HOST:/tmp/quantum-release-$TARGET_SHA.sh"
+
+      - name: Deploy and verify /health
+        shell: bash
+        run: |
+          set -eu
+          ssh \
+            -i "$RUNNER_TEMP/deploy_key" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$RUNNER_TEMP/known_hosts" \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            "DEPLOY_DIR='$DEPLOY_PATH' TARGET_SHA='$TARGET_SHA' HEALTH_URL='$HEALTH_URL' ALLOW_FIRST_DEPLOY='$ALLOW_FIRST_DEPLOY' sh '/tmp/quantum-release-$TARGET_SHA.sh'"
+
+      - name: Cleanup remote release script
+        if: always()
+        shell: bash
+        run: |
+          set -eu
+          ssh \
+            -i "$RUNNER_TEMP/deploy_key" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$RUNNER_TEMP/known_hosts" \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            "rm -f '/tmp/quantum-release-$TARGET_SHA.sh'" || true

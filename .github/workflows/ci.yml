@@ -111,6 +111,9 @@ jobs:
             exit 1
           fi
 
+      - name: Release script syntax
+        run: sh -n scripts/release.sh
+
       - name: Pytest
         run: pytest -v
 
