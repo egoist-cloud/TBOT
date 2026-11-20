@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Тесты кнопки «Получить роль»: авто-привязка по нику + синхронизация ролей."""
+"""Тесты кнопки «Получить роль»: авто-привязка по username + роли."""
 import asyncio
 import sys
 import time
@@ -14,8 +14,8 @@ SID = "76561198000000001"
 
 
 def _member(uid=700001, nick="egoist"):
-    return SimpleNamespace(id=uid, display_name=nick, mention=f"<@{uid}>",
-                           bot=False)
+    return SimpleNamespace(id=uid, display_name=nick, name=nick,
+                           mention=f"<@{uid}>", bot=False)
 
 
 class _Response:
@@ -62,6 +62,45 @@ def _claim_item():
 # ============================================================
 # Авто-привязка
 # ============================================================
+def test_role_panel_uses_username_without_brand():
+    """Панель говорит про Discord username и не содержит Quantum."""
+    embed = botmod._role_panel_embed()
+
+    assert "Discord username" in embed.description
+    assert all("Quantum" not in f.value for f in embed.fields)
+    assert "Quantum" not in embed.footer.text, embed.footer.text
+
+
+def test_role_claim_auto_link_uses_username(monkeypatch):
+    """Кнопка ищет по username, даже если display_name другой."""
+    member = _member(uid=700002, nick="egoist")
+    member.name = "ddkkx"
+    seen = []
+
+    async def search(nick, limit=10):
+        seen.append(nick)
+        return [{"steamid64": SID}]
+
+    async def owner(_sid):
+        return None
+
+    async def add(_uid, _sid):
+        return None
+
+    async def noop(*_a, **_kw):
+        return None
+
+    monkeypatch.setattr(botmod.api, "cs2red_search_by_nick", search)
+    monkeypatch.setattr(botmod.links_repo, "get_owner_of", owner)
+    monkeypatch.setattr(botmod.links_repo, "add_link", add)
+    monkeypatch.setattr(botmod, "log_to_channel", noop)
+
+    steam, err = asyncio.run(botmod._auto_link_member(member))
+
+    assert err is None and steam == SID
+    assert seen == ["ddkkx"]
+
+
 def test_auto_link_single_match(monkeypatch):
     linked = []
 

@@ -1651,7 +1651,7 @@ class API:
         return out or self._roles_cache["data"] or {}
 
     async def cs2red_search_by_nick(self, nickname: str, limit: int = 10):
-        """Ищет игроков в админ-панели cs2red по нику.
+        """Ищет игроков в админ-панели cs2red по строке (ник/username).
 
         Возвращает список объектов игроков (у каждого есть поле steamid64),
         или None при ошибке. 403 трактуется как ошибка авторизации.
@@ -4179,51 +4179,95 @@ async def on_member_join(member):
         if ex:
             return
 
-        nick = (member.display_name or "").strip()
-        if not nick:
+        username = _discord_username(member)
+        if not username:
             return
 
         await api._acquire_rate_slot()
-        users = await api.cs2red_search_by_nick(nick)
-        if users is None:
-            # Тихо логируем ошибку cs2red (403/429/сбой) — не падаем.
-            reason = api.blocked_reason or getattr(api, "last_status", None)
-            log(f"🐣 on_member_join {member}: cs2red не ответил ({reason})")
+        steam_id, err = await _auto_link_member(member, quiet=True)
+        if not steam_id:
+            log(f"🐣 on_member_join {member.display_name} (@{username}): "
+                f"автопривязка пропущена — {err}")
             return
 
-        if len(users) == 1:
-            steam_id = api.extract_steam64(users[0])
-            if steam_id:
-                # Не перехватываем SteamID, уже привязанный к другому Discord:
-                # иначе смена ника на сервере позволяла бы увести чужую привязку.
-                owner = await links_repo.get_owner_of(steam_id)
-                if owner and str(owner) != str(member.id):
-                    log(f"🐣 on_member_join {member.display_name}: SteamID `{steam_id}` "
-                        f"уже привязан к {owner} — автопривязка пропущена")
-                    return
-                await links_repo.add_link(member.id, steam_id)
-                c_nick = users[0].get("nick") or nick
-                log(f"✅ Автопривязка при входе: {member.display_name} → `{steam_id}` "
-                    f"(ник на cs2red: {c_nick})")
-                # Лог в канал.
-                if LOG_CHANNEL_ID:
-                    ch = bot.get_channel(LOG_CHANNEL_ID)
-                    if ch is not None:
-                        try:
-                            await safe_send(
-                                ch,
-                                f"✅ Автопривязка при входе: {member.mention} → `{steam_id}` "
-                                f"(ник на cs2red: {c_nick})")
-                        except Exception as e:
-                            log(f"⚠️ on_member_join лог: {e}")
-                return
-
-        # Неоднозначный или нулевой результат — пропуск.
-        log(f"🐣 on_member_join {member.display_name} ({nick}): "
-            f"найдено {len(users)} игроков — пропуск автопривязки")
+        log(f"✅ Автопривязка при входе: {member.display_name} (@{username}) "
+            f"→ `{steam_id}`")
+        if LOG_CHANNEL_ID:
+            ch = bot.get_channel(LOG_CHANNEL_ID)
+            if ch is not None:
+                try:
+                    await safe_send(
+                        ch,
+                        f"✅ Автопривязка при входе: {member.mention} "
+                        f"(@{username}) → `{steam_id}`")
+                except Exception as e:
+                    log(f"⚠️ on_member_join лог: {e}")
     except Exception as e:
         # Никогда не роняем обработчик из-за единичной ошибки.
         log(f"⚠️ on_member_join: {type(e).__name__}: {e}")
+
+
+# Выдача роли — повод привязать сразу, а не ждать фонового обхода раз в
+# 3 часа: участник с ролью TALENT, «девушка» или любой другой получал
+# привязку только на следующем прогоне, а при частых перезапусках
+# хостинга — вообще никогда.
+AUTO_LINK_ON_ROLE_COOLDOWN = env_int(
+    "AUTO_LINK_ON_ROLE_COOLDOWN_SECONDS", 3600)
+_AUTO_LINK_ON_ROLE_LAST: dict = {}
+
+
+def _auto_link_role_cooldown_ok(member_id) -> bool:
+    """Не чаще раза в AUTO_LINK_ON_ROLE_COOLDOWN секунд на участника."""
+    now = time.time()
+    last = _AUTO_LINK_ON_ROLE_LAST.get(member_id, 0.0)
+    if now - last < AUTO_LINK_ON_ROLE_COOLDOWN:
+        return False
+    _AUTO_LINK_ON_ROLE_LAST[member_id] = now
+    if len(_AUTO_LINK_ON_ROLE_LAST) > 2000:
+        cutoff = now - AUTO_LINK_ON_ROLE_COOLDOWN
+        for uid in [u for u, ts in _AUTO_LINK_ON_ROLE_LAST.items()
+                    if ts < cutoff]:
+            _AUTO_LINK_ON_ROLE_LAST.pop(uid, None)
+    return True
+
+
+@bot.event
+async def on_member_update(before, after):
+    """Участнику выдали роль — сразу пробуем привязать Discord↔Steam.
+
+    Привязка нужна всем, у кого есть роль (TALENT, «девушка», любая
+    другая), а не только клановая: без неё /check_all, /activity и
+    синхронизация ролей участника не видят. Ключ поиска прежний —
+    Discord username со строгим совпадением, поэтому смена отображаемого
+    ника привязку к чужому Steam не даёт.
+    """
+    try:
+        if getattr(after, "bot", False):
+            return
+        added = [r for r in getattr(after, "roles", [])
+                 if r not in getattr(before, "roles", [])]
+        if not added:
+            return
+        if not CS2RED_COOKIES or api.is_blocked():
+            return
+        if await links_repo.get_link(after.id):
+            return
+        if not _auto_link_role_cooldown_ok(after.id):
+            return
+        await api._acquire_rate_slot()
+        steam, err = await _auto_link_member(after, quiet=True)
+        if not steam:
+            log(f"🔗 {after.display_name}: роль выдана, привязка не удалась — "
+                f"{err}")
+            return
+        log(f"✅ Привязка по выдаче роли: {after.display_name} → `{steam}`")
+        await log_to_channel(
+            bot,
+            f"🔗 {after.mention}: привязан по Discord username после выдачи "
+            f"роли → `{steam}`")
+    except Exception as e:
+        # Обработчик не должен ронять выдачу ролей из-за единичной ошибки.
+        log(f"⚠️ on_member_update: {type(e).__name__}: {e}")
 
 
 def admin_only(i):
@@ -4752,7 +4796,7 @@ def _unlinked_members(guild, links) -> list:
             if not m.bot and str(m.id) not in linked_ids]
 
 
-@bot.tree.command(name="auto_link", description="Авто-привязка по никам через админ-панель cs2red (админ)")
+@bot.tree.command(name="auto_link", description="Авто-привязка по Discord username через админ-панель cs2red (админ)")
 @app_commands.default_permissions(administrator=True)
 @single_flight("auto_link", "⏳ Авто-привязка уже выполняется. Подождите.")
 async def auto_link(i):
@@ -4763,8 +4807,8 @@ async def auto_link(i):
 
 
 async def run_auto_link(i, ephemeral: bool = False):
-    """Полная логика авто-привязки по никам (используется командой /auto_link
-    и кнопкой «Привязать всех» в панели). Ожидает, что defer уже вызван."""
+    """Полная логика авто-привязки по Discord username (используется /auto_link
+    и кнопкой «Привязать всех»). Ожидает, что defer уже вызван."""
     # Проверяем, что куки вообще заданы.
     if not CS2RED_COOKIES:
         await safe_send(i.followup,
@@ -4818,7 +4862,7 @@ async def run_auto_link(i, ephemeral: bool = False):
         def _progress_embed(processed_: int, total_: int, added_: int) -> discord.Embed:
             pct = int((processed_ / total_) * 100) if total_ else 0
             e = discord.Embed(
-                title="🔗 Авто-привязка по никам",
+                title="🔗 Авто-привязка по Discord username",
                 color=0x000000,
                 timestamp=now_utc(),
             )
@@ -4835,13 +4879,13 @@ async def run_auto_link(i, ephemeral: bool = False):
 
         for m in unlinked:
             processed += 1
-            nick = (m.display_name or "").strip()
-            if not nick:
-                skipped_none.append(f"{m.display_name}: пустой ник")
+            username = _discord_username(m)
+            if not username:
+                skipped_none.append(f"{m.display_name}: пустой Discord username")
                 continue
 
             try:
-                users = await api.cs2red_search_by_nick(nick)
+                users = await api.cs2red_search_by_nick(username)
                 if users is None:
                     reason = api.blocked_reason
                     if reason == "403" or getattr(api, "last_status", None) == 403:
@@ -4871,17 +4915,30 @@ async def run_auto_link(i, ephemeral: bool = False):
                     errors.append(f"{m.display_name}: cs2red не ответил")
                     continue
 
-                matched = _pick_nick_match(users, nick)
+                matched = _pick_nick_match(users, username)
                 steam_id = api.extract_steam64(matched) if matched else None
 
                 if steam_id is None:
-                    skipped_ambigu.append(
-                        f"{m.display_name} ({nick}: найдено {len(users)})")
+                    if not users:
+                        skipped_none.append(
+                            f"{m.display_name} (@{username}: не найден)")
+                    elif len(users) > 1:
+                        skipped_ambigu.append(
+                            f"{m.display_name} (@{username}: найдено {len(users)})")
+                    else:
+                        errors.append(
+                            f"{m.display_name} (@{username}): у профиля нет SteamID")
                 else:
-                    await links_repo.add_link(m.id, steam_id)
-                    added.append(f"{m.display_name} → `{steam_id}`")
+                    owner = await links_repo.get_owner_of(steam_id)
+                    if owner and str(owner) != str(m.id):
+                        errors.append(
+                            f"{m.display_name} (@{username}): SteamID уже "
+                            f"привязан к другому Discord")
+                    else:
+                        await links_repo.add_link(m.id, steam_id)
+                        added.append(f"{m.display_name} (@{username}) → `{steam_id}`")
             except Exception as e:
-                errors.append(f"{m.display_name}: {e}")
+                errors.append(f"{m.display_name} (@{username}): {e}")
 
             # задержка, чтобы не забанили за флуд запросами
             await asyncio.sleep(api.RATE_LIMIT_SECONDS)
@@ -4898,7 +4955,7 @@ async def run_auto_link(i, ephemeral: bool = False):
 
         # --- Финальный отчёт ---
         embed = discord.Embed(
-            title="🔗 Авто-привязка по никам",
+            title="🔗 Авто-привязка по Discord username",
             color=0x000000,
             timestamp=now_utc(),
         )
@@ -6115,7 +6172,7 @@ def _member_clan_roles(guild, member, known_names: set) -> list:
 
 
 async def _relink_role_members(members: list) -> tuple[int, list]:
-    """Пытается привязать по нику участников с ролью клана без /link.
+    """Пытается привязать по Discord username участников с ролью без /link.
 
     Возвращает (сколько привязано, список неудач). Ограничено
     CHECK_CLAN_RELINK_LIMIT, чтобы проверка не висела бесконечно и не
@@ -6214,7 +6271,7 @@ def _build_check_clan_embed(issues: dict, total: int, relinked: int = 0) -> disc
     embed.add_field(name="⚠️ Проблем", value=str(len(extra) + len(missing)
                                                   + len(wrong)), inline=True)
     if relinked:
-        embed.add_field(name="➕ Привязано по никам", value=str(relinked),
+        embed.add_field(name="➕ Привязано по username", value=str(relinked),
                         inline=True)
 
     def fmt(rows, tail="") -> str:
@@ -6362,7 +6419,7 @@ class CheckClanView(discord.ui.View):
 
 @bot.tree.command(
     name="check_clan",
-    description="Проверить роли клана, восстановить привязки и привязать по никам")
+    description="Проверить роли клана, восстановить привязки и привязать по username")
 @single_flight("check_clan", "⏳ /check_clan уже выполняется. Подождите.")
 async def check_clan(i):
     """Ищет лишние и устаревшие роли клана, а также отсутствующие.
@@ -6380,7 +6437,7 @@ async def check_clan(i):
                             ephemeral=True)
             return
         # Сначала восстанавливаем потерянные links из базы игроков, затем
-        # пробуем привязать по никам тех, у кого есть роль, но нет /link.
+        # пробуем привязать по username тех, у кого есть роль, но нет /link.
         await _reconcile_links_from_players(guild)
         members = await _clan_sync_members(guild)
         if not members:
@@ -6526,7 +6583,7 @@ HELP_DESCRIPTIONS = {
     "agent_idea": "идея по улучшению кода прямо сейчас",
     "ai_status": "какие ИИ-провайдеры настроены и что с лимитами",
     "sync_all": "синхронизировать роли всех привязанных",
-    "auto_link": "авто-привязка по никам",
+    "auto_link": "авто-привязка по Discord username",
     "link_all": "массовая привязка из базы",
     "export_members": "выгрузить привязки в mass_links.json",
     "admlink": "привязать SteamID другому игроку",
@@ -8676,19 +8733,21 @@ async def before_hourly_clan_sync():
 # Запускают те же функции, что /auto_link и /sync_all: логика одна,
 # меняется только источник «интеракции» — фоновый контекст.
 AUTO_LINK_INTERVAL_HOURS = env_int("AUTO_LINK_INTERVAL_HOURS", 3)
-# Привязка по никам прямо в /check_clan для участников с ролью без /link.
+# Привязка по Discord username прямо в /check_clan для участников с ролью без /link.
 CHECK_CLAN_AUTO_LINK = env_int("CHECK_CLAN_AUTO_LINK", 1)
 CHECK_CLAN_RELINK_LIMIT = env_int("CHECK_CLAN_RELINK_LIMIT", 25)
 SYNC_ALL_INTERVAL_MINUTES = env_int("SYNC_ALL_INTERVAL_MINUTES", 120)
 
 
 def _auto_link_first_delay() -> int:
-    """Первый автозапуск — через 10–20 минут после старта.
+    """Первый автозапуск — через 2–5 минут после старта.
 
-    Раньше ждали полный интервал (3 ч), но хостинг перезапускается чаще,
-    и авто-привязка не успевала выполниться ни разу.
+    Раньше ждали полный интервал (3 ч), потом 10–20 минут, но хостинг
+    перезапускается чаще: обход непривязанных не успевал пройти ни разу.
+    Остальные тяжёлые задачи стартуют примерно в те же секунды, однако
+    запросы к cs2red всё равно идут через общий лимитер.
     """
-    return random.randint(600, 1200)
+    return random.randint(120, 300)
 
 
 def _sync_all_first_delay() -> int:
@@ -9484,15 +9543,15 @@ def _role_panel_embed() -> discord.Embed:
     e = discord.Embed(
         title=ROLE_PANEL_TITLE,
         color=0x000000,
-        description=("Нажми кнопку — бот найдёт тебя на cs2red по нику, "
-                     "привяжет SteamID и выдаст роль сайта и роль клана."),
+        description=("Нажми кнопку — бот найдёт тебя на cs2red по Discord "
+                     "username, привяжет SteamID и выдаст роль сайта и роль клана."),
     )
     e.add_field(name="Уже привязан?",
                 value="Кнопка просто обновит роли.", inline=False)
     e.add_field(name="Не находит?",
                 value="Привяжи вручную через `/link` или напиши модератору.",
                 inline=False)
-    e.set_footer(text="Quantum • роли с cs2red")
+    e.set_footer(text="роли с cs2red")
     return e
 
 
@@ -9501,59 +9560,51 @@ def _norm_nick(value) -> str:
     return " ".join(str(value or "").casefold().split())
 
 
+def _discord_username(member) -> str:
+    """Discord username (``member.name``), а не display_name."""
+    return " ".join(str(getattr(member, "name", "") or "").split())
+
+
 def _nick_variants(member) -> list[str]:
-    """Варианты ника участника: display_name, global_name, username."""
-    out: list[str] = []
-    for value in (getattr(member, "display_name", ""),
-                  getattr(member, "global_name", ""),
-                  getattr(member, "name", "")):
-        text = " ".join(str(value or "").split())
-        if not text:
-            continue
-        for variant in (text, text.strip("[](){}<>|_-*~. ")):
-            if variant and variant not in out:
-                out.append(variant)
-    return out[:4]
+    """Единственный ключ поиска — Discord username."""
+    username = _discord_username(member)
+    return [username] if username else []
 
 
-def _pick_nick_match(users: list, wanted: str):
-    """Один точный игрок из результатов поиска (None — неоднозначно)."""
-    if not users:
+def _pick_nick_match(users: list, wanted: str = ""):
+    """Ровно один результат. 0 или 2+ — не привязываем."""
+    if not users or len(users) != 1:
         return None
-    if len(users) == 1:
-        return users[0]
-    exact = [u for u in users
-             if isinstance(u, dict) and _norm_nick(u.get("nick")) == _norm_nick(wanted)]
-    return exact[0] if len(exact) == 1 else None
+    return users[0]
 
 
 async def _auto_link_member(member, quiet: bool = False):
-    """Привязывает участника по нику. Возвращает (steam_id, текст ошибки)."""
+    """Привязывает по Discord username. Возвращает (steam_id, ошибка).
+
+    Правило строгое: в админ-поиске cs2red должен быть ровно один профиль.
+    Если найдено 0 или 2+, участник не привязывается — пусть уточнит /link.
+    """
     variants = _nick_variants(member)
     if not variants:
-        return None, "❌ Не вижу твой ник — привяжи SteamID через `/link`."
-    matched, tried, last_users = None, [], []
-    for nick in variants:
-        tried.append(nick)
-        users = await api.cs2red_search_by_nick(nick)
-        last_users = users or []
-        if users is None:
-            reason = getattr(api, "blocked_reason", "")
-            if reason == "403":
-                return None, "❌ Ошибка авторизации на cs2red — сообщи админу."
-            if reason == "429":
-                return None, ("⏳ cs2red временно ограничил запросы — "
-                              "попробуй через 5 минут.")
-            return None, "❌ cs2red не ответил. Попробуй позже."
-        matched = _pick_nick_match(users, nick)
-        if matched is not None:
-            break
-    if matched is None:
-        if len(last_users) > 1:
-            return None, (f"⚠️ Нашёл профилей: {len(last_users)}. "
-                          "Привяжи точно через `/link`.")
-        return None, (f"⚠️ Не нашёл профиль по нику "
-                      f"({', '.join(tried)}). Привяжи через `/link`.")
+        return None, "❌ Не вижу Discord username — привяжи SteamID через `/link`."
+    username = variants[0]
+    users = await api.cs2red_search_by_nick(username)
+    if users is None:
+        reason = getattr(api, "blocked_reason", "")
+        if reason == "403":
+            return None, "❌ Ошибка авторизации на cs2red — сообщи админу."
+        if reason == "429":
+            return None, ("⏳ cs2red временно ограничил запросы — "
+                          "попробуй через 5 минут.")
+        return None, "❌ cs2red не ответил. Попробуй позже."
+    if len(users) != 1:
+        if len(users) > 1:
+            return None, (f"⚠️ По username @{username} найдено профилей: "
+                          f"{len(users)}. Привязка не выполнена — уточни "
+                          "SteamID через `/link`.")
+        return None, (f"⚠️ Не нашёл профиль по username @{username}. "
+                      "Привяжи SteamID через `/link`.")
+    matched = users[0]
     steam = api.extract_steam64(matched)
     if not steam:
         return None, "⚠️ Не смог определить SteamID — привяжи через `/link`."
@@ -9563,7 +9614,8 @@ async def _auto_link_member(member, quiet: bool = False):
     await links_repo.add_link(member.id, steam)
     if not quiet:
         await log_to_channel(
-            bot, f"🎭 Роль: {member.mention} привязан по нику → `{steam}`")
+            bot, f"🎭 Роль: {member.mention} привязан по username "
+                 f"@{username} → `{steam}`")
     return steam, None
 
 
