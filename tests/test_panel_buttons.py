@@ -32,11 +32,11 @@ class _Followup:
 
 
 class _Interaction:
-    def __init__(self):
+    def __init__(self, admin=True):
         self.response = _Response()
         self.followup = _Followup()
         self.user = SimpleNamespace(
-            id=1, guild_permissions=SimpleNamespace(administrator=True))
+            id=1, guild_permissions=SimpleNamespace(administrator=admin))
         self.guild = None
 
 
@@ -49,7 +49,7 @@ def _allow(monkeypatch):
     async def allow(_interaction):
         return True
 
-    monkeypatch.setattr(botmod, "_panel_guard", allow)
+    monkeypatch.setattr(botmod, "_panel_admin_guard", allow)
     # Локи создаются в своём event loop — для каждого теста чистые.
     monkeypatch.setattr(botmod, "_heavy_locks", {})
 
@@ -67,7 +67,7 @@ def test_button_without_rights_does_nothing(monkeypatch):
     async def deny(_interaction):
         return False
 
-    monkeypatch.setattr(botmod, "_panel_guard", deny)
+    monkeypatch.setattr(botmod, "_panel_admin_guard", deny)
     called = []
 
     async def record(*a, **kw):
@@ -83,6 +83,32 @@ def test_button_without_rights_does_nothing(monkeypatch):
     assert called == [], "без прав ничего не запускается"
     assert i.response.deferred is False
     print("  ok: без прав кнопки не работают")
+
+
+def test_moderator_cannot_use_panel_buttons(monkeypatch):
+    """Модератор не должен запускать админские кнопки PanelView."""
+    async def moderator(_user_id, _guild):
+        return True
+
+    monkeypatch.setattr(botmod, "is_moderator", moderator)
+    called = []
+
+    async def record(*a, **kw):
+        called.append(1)
+
+    monkeypatch.setattr(botmod, "run_auto_link", record)
+    monkeypatch.setattr(botmod, "run_sync_all", record)
+
+    for custom_id in ("panel_link_all", "panel_sync",
+                      "panel_rules", "panel_health"):
+        i = _Interaction(admin=False)
+        asyncio.run(_item(custom_id).callback(i))
+
+        assert i.response.denied is True, custom_id
+        assert i.response.deferred is False, custom_id
+
+    assert called == [], "модератор не должен запускать админские действия"
+    print("  ok: модератору кнопки PanelView закрыты")
 
 
 def test_link_all_button_runs_auto_link(monkeypatch):

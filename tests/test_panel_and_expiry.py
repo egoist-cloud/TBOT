@@ -157,12 +157,12 @@ def test_refresh_panel_replaces_message():
 
             sent = channel.sent[0]
             kwargs = sent["kwargs"]
-            # Панель теперь уходит контейнером Components V2 (без embed).
-            assert isinstance(kwargs.get("view"), discord.ui.LayoutView)
-            texts = " ".join(
-                item.content for item in kwargs["view"].walk_children()
-                if isinstance(item, discord.ui.TextDisplay))
-            assert "Официальные условия" in texts
+            # Панель — классический embed, компоненты идут под ним.
+            assert isinstance(kwargs.get("embed"), discord.Embed)
+            assert isinstance(kwargs.get("view"), botmod.ClanView)
+            assert kwargs["embed"].title == botmod.CLAN_PANEL_TITLE
+            assert any(isinstance(item, discord.ui.Select)
+                       for item in kwargs["view"].children)
 
             assert await seen_repo.get_flag("clan_panel_message") == \
                 str(sent["message"].id)
@@ -521,6 +521,35 @@ def test_panel_task_skips_fresh_panel(monkeypatch):
 
     asyncio.run(scenario())
     print("  ok: свежая панель не пересоздаётся")
+
+
+def test_panel_task_removes_duplicates_of_fresh_panel(monkeypatch):
+    """Свежая панель на месте, но дубль рядом — ежечасная задача удаляет его."""
+    async def scenario():
+        await init_db()
+        try:
+            first = _OldPanelMessage(701)
+            duplicate = _OldPanelMessage(702)
+            channel = _HistoryChannel(
+                botmod.CLAN_PANEL_CHANNEL_ID,
+                messages=[first, duplicate], old_message=first)
+            monkeypatch.setattr(botmod, "bot", _FakeBot(channel))
+            await _reset_panel_flags()
+            await seen_repo.set_flag("clan_panel_channel", str(channel.id))
+            await seen_repo.set_flag("clan_panel_message", "701")
+            await seen_repo.set_flag("clan_panel_at", str(botmod.time.time()))
+
+            await botmod.clan_panel_refresh.coro()
+
+            assert first.deleted is False, "рабочую панель не трогаем"
+            assert duplicate.deleted is True, "дубль удалён"
+            assert channel.sent == [], "новую панель не публикуем"
+        finally:
+            await _reset_panel_flags()
+            await close_db()
+
+    asyncio.run(scenario())
+    print("  ok: дубли свежей панели удаляются ежечасной задачей")
 
 
 def test_panel_task_republishes_missing_panel(monkeypatch):

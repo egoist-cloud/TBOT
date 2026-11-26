@@ -5,6 +5,7 @@
 ним — выпадающий список кланов, который открывает модальное окно заявки.
 """
 import asyncio
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -77,34 +78,43 @@ def test_setup_clan_is_admin_only():
     print("  ok: команда доступна только администраторам")
 
 
-def test_conditions_embed_content():
-    """Embed содержит все официальные условия вступления."""
+def test_conditions_embed_content(monkeypatch):
+    """Embed содержит условия, пинг пользователя и дату без бренда."""
+    monkeypatch.setattr(botmod, "CLAN_QUESTIONS_USER_ID", 1113899288192356402)
+    monkeypatch.setattr(botmod, "CLAN_QUESTIONS_ROLE_ID", 0)
     embed = botmod._build_clan_conditions_embed()
     assert embed.color.value == 0, "embed должен быть чёрным"
     assert embed.title == "Официальные условия вступления в клан.", embed.title
 
     fields = {f.name: f.value for f in embed.fields}
-    general = fields["📋 Общие требования"]
-    assert "Отсутствие VAC-банов в Steam и блокировок на cs2red.ru." in general
-    assert "Отсутствие членства в других кланах." in general
-    assert "Возраст — от 12 лет." in general
+    general = fields["Общие требования"]
+    assert "VAC-банов" in general
+    assert "cs2red.ru" in general
+    assert "членства в других кланах" in general
+    assert "от **12 лет**" in general
 
-    clan = fields[f"🎯 Требования для {botmod.CLAN_NAME}"]
-    assert "Рейтинг — от 1.000 ммр." in clan
-    assert "Онлайн — не менее 3 часов в день." in clan
+    clan = fields[f"Требования для {botmod.CLAN_NAME}"]
+    assert "1000 MMR" in clan
+    assert "3 часов" in clan
 
-    form = fields["📝 Что указать в заявке"]
-    assert "Steam-профиль (ссылка или SteamID64)" in form
+    form = fields["Что указать в заявке"]
+    assert "Игровой никнейм" in form
+    assert "SteamID64" in form
 
-    important = fields["⚠️ Важно!"]
-    assert "в течение 7 дней" in important
-    assert "2 дня на вступление" in important
+    important = fields["Важно"]
+    assert f"**{botmod.APPLICATION_TTL_DAYS} дн.**" in important
+    assert "**2 дня** на вступление" in important
+    if botmod.APPLICATION_REJECT_COOLDOWN_DAYS > 0:
+        assert "повторная заявка" in important
 
-    questions = fields["💬 По вопросам вступления"]
-    assert f"<@&{botmod.CLAN_QUESTIONS_ROLE_ID}>" in questions, questions
+    questions = fields["По вопросам вступления"]
+    assert f"<@{botmod.CLAN_QUESTIONS_USER_ID}>" in questions, questions
     assert "администрации" not in questions
     assert "Перед подачей заявки" in embed.description
-    assert embed.footer.text.startswith("Quantum •"), embed.footer.text
+    assert "Выберите клан" in embed.description, embed.description
+    assert "Quantum" not in embed.footer.text, embed.footer.text
+    assert re.fullmatch(r"\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}",
+                        embed.footer.text), embed.footer.text
     print("  ok: embed содержит все условия вступления")
 
 
@@ -179,27 +189,14 @@ def test_clan_panel_accent_is_black():
     assert int(container.accent_colour) == 0x000000, container.accent_colour
 
 
-def test_clan_panel_allowed_mentions_only_role():
-    """Пинг разрешён только роли вопросов, не @everyone/@here."""
-    mentions = botmod._clan_panel_mentions()
-
-    assert mentions is not None
-    assert [r.id for r in mentions.roles] == [botmod.CLAN_QUESTIONS_ROLE_ID]
-    assert mentions.everyone is False
-
 
 def _questions_text(embed) -> str:
-    return {f.name: f.value for f in embed.fields}["💬 По вопросам вступления"]
-
-
-def test_clan_panel_defaults_are_role_and_38_hours():
-    """Контакт — настоящая роль, а панель пересоздаётся раз в 38 часов."""
-    assert botmod.CLAN_QUESTIONS_ROLE_ID == 1396606001188175922
-    assert botmod.CLAN_PANEL_REFRESH_HOURS == 38
+    return {f.name: f.value for f in embed.fields}["По вопросам вступления"]
 
 
 def test_conditions_embed_mentions_existing_questions_role(monkeypatch):
     """Роль вопросов есть на сервере — в панели её упоминание."""
+    monkeypatch.setattr(botmod, "CLAN_QUESTIONS_USER_ID", 0)
     monkeypatch.setattr(botmod, "CLAN_QUESTIONS_ROLE_ID", 1396606001188175922)
     role = SimpleNamespace(id=1396606001188175922, name="Куратор")
     guild = SimpleNamespace(
@@ -213,6 +210,7 @@ def test_conditions_embed_mentions_existing_questions_role(monkeypatch):
 
 def test_conditions_embed_hides_missing_questions_role(monkeypatch):
     """Роли нет на сервере — вместо «Неизвестная роль» обычный текст."""
+    monkeypatch.setattr(botmod, "CLAN_QUESTIONS_USER_ID", 0)
     monkeypatch.setattr(botmod, "CLAN_QUESTIONS_ROLE_ID", 1396606001188175922)
     guild = SimpleNamespace(get_role=lambda _rid: None)
     client = SimpleNamespace(get_guild=lambda _gid: guild)
@@ -222,3 +220,31 @@ def test_conditions_embed_hides_missing_questions_role(monkeypatch):
     questions = _questions_text(embed)
     assert "<@&" not in questions, questions
     assert "администрации" in questions
+
+
+def test_clan_panel_refresh_default_is_38_hours():
+    """Панель заявки пересоздаётся примерно раз в 38 часов."""
+    assert botmod.CLAN_PANEL_REFRESH_HOURS == 38
+
+
+def test_clan_panel_allowed_mentions_only_user(monkeypatch):
+    """Пинг разрешён только пользователю вопросов, не @everyone/@here."""
+    monkeypatch.setattr(botmod, "CLAN_QUESTIONS_USER_ID", 1113899288192356402)
+    monkeypatch.setattr(botmod, "CLAN_QUESTIONS_ROLE_ID", 0)
+    mentions = botmod._clan_panel_mentions()
+
+    assert mentions is not None
+    assert [u.id for u in mentions.users] == [botmod.CLAN_QUESTIONS_USER_ID]
+    assert mentions.roles is False
+    assert mentions.everyone is False
+
+
+def test_clan_panel_allowed_mentions_role_fallback(monkeypatch):
+    """Старая настройка роли продолжает работать, если пользователь не задан."""
+    monkeypatch.setattr(botmod, "CLAN_QUESTIONS_USER_ID", 0)
+    monkeypatch.setattr(botmod, "CLAN_QUESTIONS_ROLE_ID", 123456789)
+    mentions = botmod._clan_panel_mentions()
+
+    assert mentions is not None
+    assert [r.id for r in mentions.roles] == [123456789]
+    assert mentions.users is False
